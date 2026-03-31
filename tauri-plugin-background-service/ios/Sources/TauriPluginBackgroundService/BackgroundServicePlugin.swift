@@ -101,13 +101,9 @@ import WebKit
 
     // MARK: - waitForCancel (C1: Pending Invoke pattern)
     @objc public func waitForCancel(_ invoke: Invoke) {
-        // Store invoke without resolving (blocks Rust thread)
-        // If no active BGTask, resolve immediately (service not running)
-        if currentTask == nil {
-            invoke.resolve()
-        } else {
-            pendingCancelInvoke = invoke
-        }
+        // Always store invoke — it will be resolved by expiration/completion
+        // or rejected by stopKeepalive, regardless of BGTask state.
+        pendingCancelInvoke = invoke
     }
 
     // MARK: - completeBgTask (C1: Rust→Swift completion signal)
@@ -147,14 +143,15 @@ import WebKit
         // Cancel any pending schedule
         BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: taskId)
 
+        // Reject pending cancel invoke unconditionally (unblocks Rust thread)
+        // This must happen even when no BGTask is active (foreground stop).
+        if let cancelInvoke = pendingCancelInvoke {
+            cancelInvoke.reject(error: nil)
+            pendingCancelInvoke = nil
+        }
+
         // If a BGTask is active, complete it and clean up
         if currentTask != nil {
-            // Reject pending cancel invoke (unblocks Rust thread)
-            if let cancelInvoke = pendingCancelInvoke {
-                cancelInvoke.reject(error: nil)
-                pendingCancelInvoke = nil
-            }
-
             // Complete active task with failure
             currentTask?.setTaskCompleted(success: false)
 
