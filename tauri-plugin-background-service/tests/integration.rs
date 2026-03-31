@@ -218,6 +218,20 @@ impl<R: Runtime> BackgroundService<R> for ImmediateErrorService {
     }
 }
 
+/// Service that fails during init() - used to test init failure callback behavior.
+struct FailingInitService;
+
+#[async_trait]
+impl<R: Runtime> BackgroundService<R> for FailingInitService {
+    async fn init(&mut self, _ctx: &ServiceContext<R>) -> Result<(), ServiceError> {
+        Err(ServiceError::Runtime("Init failed".into()))
+    }
+
+    async fn run(&mut self, _ctx: &ServiceContext<R>) -> Result<(), ServiceError> {
+        unreachable!("run should not be called after init failure")
+    }
+}
+
 /// Service that waits for cancellation, tracking how many times run() completed.
 struct TrackedCallbackService {
     run_started: Arc<AtomicBool>,
@@ -328,6 +342,35 @@ async fn on_complete_none_no_panic() {
 }
 
 #[tokio::test]
+async fn on_complete_fires_on_init_failure() {
+    let app = tauri::test::mock_app();
+    let runner = ServiceRunner::new();
+
+    let callback_val = Arc::new(AtomicU8::new(255)); // 255 = not called yet
+    let callback_clone = callback_val.clone();
+    runner.set_on_complete(Box::new(move |success| {
+        callback_clone.store(if success { 0 } else { 1 }, Ordering::SeqCst);
+    }));
+
+    runner
+        .start(
+            app.handle().clone(),
+            FailingInitService,
+            StartConfig::default(),
+        )
+        .expect("start should succeed");
+
+    // Wait for the spawned task to complete
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        callback_val.load(Ordering::SeqCst),
+        1,
+        "callback should be called with false on init failure"
+    );
+}
+
+#[tokio::test]
 async fn on_complete_generation_guarded() {
     let app = tauri::test::mock_app();
     let runner = ServiceRunner::new();
@@ -371,5 +414,68 @@ async fn on_complete_generation_guarded() {
         callback_b_val.load(Ordering::SeqCst),
         0,
         "new callback B should NOT have been called by old task"
+    );
+}
+
+#[tokio::test]
+async fn init_failure_preserves_generation_guard() {
+    let app = tauri::test::mock_app();
+    let runner = ServiceRunner::new();
+
+    // First start: service that fails in init
+    let first_callback_val = Arc::new(AtomicU8::new(255)); // 255 = not called yet
+    let first_clone = first_callback_val.clone();
+    runner.set_on_complete(Box::new(move |success| {
+        first_clone.store(if success { 1 } else { 0 }, Ordering::SeqCst);
+    }));
+
+    runner
+        .start(
+            app.handle().clone(),
+            FailingInitService,
+            StartConfig::default(),
+        )
+        .expect("first start should succeed");
+
+    // Wait for first task to complete (init failure + cleanup)
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        first_callback_val.load(Ordering::SeqCst),
+        0,
+        "first callback should be called with false on init failure"
+    );
+    assert!(
+        !runner.is_running(),
+        "should not be running after init failure"
+    );
+
+    // Second start: service that succeeds — proves first task's cleanup
+    // didn't clear the second task's token (generation guard works).
+    let second_callback_val = Arc::new(AtomicU8::new(255)); // 255 = not called yet
+    let second_clone = second_callback_val.clone();
+    runner.set_on_complete(Box::new(move |success| {
+        second_clone.store(if success { 1 } else { 0 }, Ordering::SeqCst);
+    }));
+
+    runner
+        .start(
+            app.handle().clone(),
+            ImmediateSuccessService,
+            StartConfig::default(),
+        )
+        .expect("second start should succeed");
+
+    // Wait for second task to complete
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        second_callback_val.load(Ordering::SeqCst),
+        1,
+        "second callback should be called with true on success"
+    );
+    assert!(
+        !runner.is_running(),
+        "should not be running after both tasks complete"
     );
 }

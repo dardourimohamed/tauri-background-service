@@ -120,6 +120,10 @@ impl ServiceRunner {
                 if gen_ref.load(Ordering::SeqCst) == my_gen {
                     token_ref.lock().unwrap().take();
                 }
+                // Fire callback with false on init failure (generation-guarded capture)
+                if let Some(cb) = captured_callback {
+                    cb(false);
+                }
                 return;
             }
 
