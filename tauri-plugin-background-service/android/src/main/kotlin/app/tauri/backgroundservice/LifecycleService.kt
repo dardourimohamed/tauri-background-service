@@ -4,6 +4,7 @@ import android.app.*
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 
@@ -40,7 +41,7 @@ class LifecycleService : Service() {
         // Normal start
         val label = intent.getStringExtra(EXTRA_LABEL) ?: "Service running"
         createChannel()
-        startForeground(NOTIF_ID, buildNotification(label))
+        startForegroundTyped(NOTIF_ID, buildNotification(label), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         isRunning = true
 
         return START_STICKY
@@ -77,7 +78,7 @@ class LifecycleService : Service() {
 
         // Must call startForeground immediately (Android 12+ requirement)
         createChannel()
-        startForeground(NOTIF_ID, buildNotification("Restarting..."))
+        startForegroundTyped(NOTIF_ID, buildNotification("Restarting..."), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         autoRestarting = true
 
         // Launch Activity to reinitialize Tauri runtime
@@ -87,6 +88,14 @@ class LifecycleService : Service() {
         }
 
         return START_STICKY
+    }
+
+    private fun startForegroundTyped(notifId: Int, notification: Notification, serviceType: Int) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(notifId, notification, serviceType)
+        } else {
+            startForeground(notifId, notification)
+        }
     }
 
     private fun buildNotification(label: String): Notification {
