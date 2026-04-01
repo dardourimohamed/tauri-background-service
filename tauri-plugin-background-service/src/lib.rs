@@ -63,7 +63,7 @@ impl<R: Runtime> ServiceRunnerHolder<R> {
 async fn start<R: Runtime>(app: AppHandle<R>, config: StartConfig) -> Result<(), String> {
     #[cfg(mobile)]
     app.state::<MobileLifecycle<R>>()
-        .start_keepalive(&config.service_label)
+        .start_keepalive(&config.service_label, &config.foreground_service_type)
         .map_err(|e| e.to_string())?;
 
     // iOS: wire on_complete callback BEFORE starting the service.
@@ -181,7 +181,7 @@ where
                 let mobile = app.state::<MobileLifecycle<R>>();
                 if let Ok(Some(config)) = mobile.get_auto_start_config() {
                     let _ = mobile.clear_auto_start_config();
-                    let _ = mobile.start_keepalive(&config.service_label);
+                    let _ = mobile.start_keepalive(&config.service_label, &config.foreground_service_type);
                     let holder = app.state::<Arc<ServiceRunnerHolder<R>>>();
                     let _ = holder.start(app.clone(), config);
                     let _ = mobile.move_task_to_background();

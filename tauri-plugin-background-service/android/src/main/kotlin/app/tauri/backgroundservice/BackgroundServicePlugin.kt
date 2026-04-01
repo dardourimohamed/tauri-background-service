@@ -10,7 +10,10 @@ import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.Plugin
 
-@InvokeArg class StartKeepaliveArgs { var label: String = "Service running" }
+@InvokeArg class StartKeepaliveArgs {
+    var label: String = "Service running"
+    var foregroundServiceType: String = "dataSync"
+}
 
 @InvokeArg
 class GetAutoStartConfigResult {
@@ -42,6 +45,7 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
         val intent = Intent(activity, LifecycleService::class.java).apply {
             action = LifecycleService.ACTION_START
             putExtra(LifecycleService.EXTRA_LABEL, args.label)
+            putExtra(LifecycleService.EXTRA_SERVICE_TYPE, args.foregroundServiceType)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
             activity.startForegroundService(intent)

@@ -19,6 +19,7 @@ pub struct MobileLifecycle<R: Runtime> {
 #[serde(rename_all = "camelCase")]
 struct StartKeepaliveArgs<'a> {
     label: &'a str,
+    foreground_service_type: &'a str,
 }
 
 impl<R: Runtime> MobileLifecycle<R> {
@@ -26,9 +27,9 @@ impl<R: Runtime> MobileLifecycle<R> {
     ///
     /// - Android: starts a Foreground Service with `label` as notification text.
     /// - iOS: schedules a `BGAppRefreshTask`.
-    pub fn start_keepalive(&self, label: &str) -> Result<(), tauri::Error> {
+    pub fn start_keepalive(&self, label: &str, foreground_service_type: &str) -> Result<(), tauri::Error> {
         self.handle
-            .run_mobile_plugin::<()>("startKeepalive", StartKeepaliveArgs { label })?;
+            .run_mobile_plugin::<()>("startKeepalive", StartKeepaliveArgs { label, foreground_service_type })?;
         Ok(())
     }
 

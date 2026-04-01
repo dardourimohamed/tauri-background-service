@@ -14,6 +14,7 @@ class LifecycleService : Service() {
         const val CHANNEL_ID   = "bg_keepalive"
         const val NOTIF_ID     = 9001
         const val EXTRA_LABEL  = "label"
+        const val EXTRA_SERVICE_TYPE = "foregroundServiceType"
         const val ACTION_START = "START"
         const val ACTION_STOP  = "STOP"
 
@@ -41,8 +42,9 @@ class LifecycleService : Service() {
 
         // Normal start
         val label = intent.getStringExtra(EXTRA_LABEL) ?: "Service running"
+        val serviceType = intent.getStringExtra(EXTRA_SERVICE_TYPE) ?: "dataSync"
         createChannel()
-        startForegroundTyped(NOTIF_ID, buildNotification(label), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        startForegroundTyped(NOTIF_ID, buildNotification(label), mapServiceType(serviceType))
         isRunning = true
 
         return START_STICKY
@@ -96,6 +98,13 @@ class LifecycleService : Service() {
             startForeground(notifId, notification, serviceType)
         } else {
             startForeground(notifId, notification)
+        }
+    }
+
+    private fun mapServiceType(type: String): Int {
+        return when (type) {
+            "specialUse" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            else -> ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
         }
     }
 
