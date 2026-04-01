@@ -24,16 +24,25 @@ pub struct StartConfig {
     /// Text shown in the Android persistent foreground notification.
     #[serde(default = "default_label")]
     pub service_label: String,
+
+    /// Android foreground service type (e.g. "dataSync", "specialUse").
+    #[serde(default = "default_foreground_service_type")]
+    pub foreground_service_type: String,
 }
 
 fn default_label() -> String {
     "Service running".into()
 }
 
+fn default_foreground_service_type() -> String {
+    "dataSync".into()
+}
+
 impl Default for StartConfig {
     fn default() -> Self {
         Self {
             service_label: default_label(),
+            foreground_service_type: default_foreground_service_type(),
         }
     }
 }
@@ -68,6 +77,7 @@ impl AutoStartConfig {
         if self.pending {
             self.label.map(|label| StartConfig {
                 service_label: label,
+                foreground_service_type: default_foreground_service_type(),
             })
         } else {
             None
@@ -91,6 +101,7 @@ mod tests {
     fn start_config_custom_label() {
         let config = StartConfig {
             service_label: "Syncing data".into(),
+            ..Default::default()
         };
         assert_eq!(config.service_label, "Syncing data");
     }
@@ -107,6 +118,7 @@ mod tests {
     fn start_config_serde_roundtrip_custom() {
         let config = StartConfig {
             service_label: "My service".into(),
+            ..Default::default()
         };
         let json = serde_json::to_string(&config).unwrap();
         let de: StartConfig = serde_json::from_str(&json).unwrap();
@@ -125,6 +137,7 @@ mod tests {
     fn start_config_json_key_is_camel_case() {
         let config = StartConfig {
             service_label: "test".into(),
+            ..Default::default()
         };
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("serviceLabel"), "JSON should use camelCase: {json}");
@@ -191,6 +204,68 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"type\":\"error\""), "Tag: {json}");
         assert!(json.contains("\"message\":\"oops\""), "Message: {json}");
+    }
+
+    // --- StartConfig foreground_service_type tests ---
+
+    #[test]
+    fn start_config_default_service_type() {
+        let config = StartConfig::default();
+        assert_eq!(config.foreground_service_type, "dataSync");
+    }
+
+    #[test]
+    fn start_config_custom_service_type() {
+        let config = StartConfig {
+            service_label: "test".into(),
+            foreground_service_type: "specialUse".into(),
+        };
+        assert_eq!(config.foreground_service_type, "specialUse");
+    }
+
+    #[test]
+    fn start_config_serde_roundtrip_service_type() {
+        let config = StartConfig {
+            service_label: "test".into(),
+            foreground_service_type: "specialUse".into(),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: StartConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.foreground_service_type, "specialUse");
+    }
+
+    #[test]
+    fn start_config_deserialize_missing_service_type() {
+        let json = r#"{"serviceLabel":"test"}"#;
+        let de: StartConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(de.foreground_service_type, "dataSync");
+    }
+
+    #[test]
+    fn start_config_deserialize_special_use() {
+        let json = r#"{"serviceLabel":"test","foregroundServiceType":"specialUse"}"#;
+        let de: StartConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(de.foreground_service_type, "specialUse");
+    }
+
+    #[test]
+    fn start_config_unrecognized_type_passes_through() {
+        let json = r#"{"serviceLabel":"test","foregroundServiceType":"customType"}"#;
+        let de: StartConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(de.foreground_service_type, "customType");
+    }
+
+    #[test]
+    fn start_config_json_key_is_camel_case_service_type() {
+        let config = StartConfig {
+            service_label: "test".into(),
+            foreground_service_type: "specialUse".into(),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("foregroundServiceType"),
+            "JSON should use camelCase: {json}"
+        );
     }
 
     // --- AutoStartConfig tests ---
