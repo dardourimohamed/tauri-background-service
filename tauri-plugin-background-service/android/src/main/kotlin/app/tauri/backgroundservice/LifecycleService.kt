@@ -3,6 +3,7 @@ package app.tauri.backgroundservice
 import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 
@@ -49,6 +50,11 @@ class LifecycleService : Service() {
         isRunning = false
         autoRestarting = false
         super.onDestroy()
+    }
+
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
     }
 
     override fun onBind(i: Intent?) = null
