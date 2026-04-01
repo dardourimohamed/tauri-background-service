@@ -29,6 +29,7 @@ class LifecycleService : Service() {
                 .remove("bg_auto_start_pending")
                 .remove("bg_auto_start_label")
                 .apply()
+            stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
         }
