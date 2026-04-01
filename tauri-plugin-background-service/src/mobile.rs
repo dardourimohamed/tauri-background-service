@@ -4,6 +4,8 @@ use tauri::{
     AppHandle, Runtime,
 };
 
+use crate::models::{AutoStartConfig, StartConfig};
+
 /// Rust-side bridge to native mobile keepalive code.
 ///
 /// Only compiled on mobile targets (`#[cfg(mobile)]` in lib.rs).
@@ -55,6 +57,35 @@ impl<R: Runtime> MobileLifecycle<R> {
     /// When the expiration handler fires, it resolves the Invoke, unblocking this call.
     pub fn wait_for_cancel(&self) -> Result<(), tauri::Error> {
         self.handle.run_mobile_plugin::<()>("waitForCancel", ())?;
+        Ok(())
+    }
+
+    /// Check if the service was auto-started by OS restart.
+    ///
+    /// Reads auto-start config from SharedPreferences via the Kotlin bridge.
+    /// Returns `Some(StartConfig)` if auto-start is pending and a label is available.
+    pub fn get_auto_start_config(&self) -> Result<Option<StartConfig>, tauri::Error> {
+        let config: AutoStartConfig = self
+            .handle
+            .run_mobile_plugin("getAutoStartConfig", ())?;
+        Ok(config.into_start_config())
+    }
+
+    /// Clear the auto-start flag after processing.
+    ///
+    /// Called from the plugin setup closure after auto-start has been handled.
+    pub fn clear_auto_start_config(&self) -> Result<(), tauri::Error> {
+        self.handle
+            .run_mobile_plugin::<()>("clearAutoStartConfig", ())?;
+        Ok(())
+    }
+
+    /// Move the Activity to background after auto-start.
+    ///
+    /// Hides the briefly-visible Activity that was launched by the OS restart.
+    pub fn move_task_to_background(&self) -> Result<(), tauri::Error> {
+        self.handle
+            .run_mobile_plugin::<()>("moveTaskToBackground", ())?;
         Ok(())
     }
 }

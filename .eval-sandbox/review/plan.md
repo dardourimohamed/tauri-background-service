@@ -6,14 +6,13 @@
 - Identify highest-risk areas
 - Write initial findings
 
-## Step 2: Deep Analysis — iOS BGTask Lifecycle
-Trace all state transitions in `BackgroundServicePlugin.swift` under adversarial timing scenarios:
-1. Map every (state, trigger) pair in the Swift state machine
-2. Verify no double `setTaskCompleted` calls possible
-3. Verify no orphaned `pendingCancelInvoke` possible
-4. Verify safety timer is properly cancelled in all exit paths
-5. Trace Rust ↔ Swift interaction: what happens if `completeBgTask` fires while `waitForCancel` hasn't been called yet?
-6. Verify thread safety of `MobileLifecycle` handle sharing (one for on_complete, one for spawn_blocking)
+## Step 2: Deep Analysis — Android Foreground Service Compatibility
+Verify Android 14+ foreground service type requirements:
+1. Check AndroidManifest.xml for proper `foregroundServiceType` declaration
+2. Verify `startForeground()` call includes the service type parameter
+3. Verify `stopForeground()` is called in all stop paths
+4. Research best practices for Android 14+ foreground service API changes
+5. Verify notification channel creation is idempotent
 
 ## Step 3: Deep Analysis — Runner Race Conditions (if needed)
 Verify generation counter correctness under rapid stop→start→stop→start:

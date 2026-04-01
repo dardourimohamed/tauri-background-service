@@ -107,7 +107,12 @@ impl ServiceRunner {
             shutdown,
         };
 
-        tokio::spawn(async move {
+        // Use tauri::async_runtime::spawn() instead of tokio::spawn() because
+        // the plugin setup closure may run before a Tokio runtime context is
+        // entered on the current thread (e.g. Android auto-start in setup).
+        // tauri::async_runtime::spawn() uses the global runtime handle that
+        // Tauri creates during App::new(), which is always available.
+        tauri::async_runtime::spawn(async move {
             // Phase 1: init
             if let Err(e) = service.init(&ctx).await {
                 let _ = app.emit(

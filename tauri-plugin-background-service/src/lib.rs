@@ -10,7 +10,7 @@ pub mod mobile;
 // ─── Public API Surface ──────────────────────────────────────────────────────
 
 pub use error::ServiceError;
-pub use models::{PluginEvent, ServiceContext, StartConfig};
+pub use models::{AutoStartConfig, PluginEvent, ServiceContext, StartConfig};
 pub use notifier::Notifier;
 pub use runner::ServiceRunner;
 pub use service_trait::BackgroundService;
@@ -170,6 +170,22 @@ where
             {
                 let lifecycle = mobile::init(app, _api)?;
                 app.manage(lifecycle);
+            }
+
+            // Android: auto-start detection after OS-initiated service restart.
+            // When LifecycleService is restarted by START_STICKY, it sets an
+            // auto-start flag in SharedPreferences and launches the Activity.
+            // This block detects that flag, clears it, and starts the service.
+            #[cfg(target_os = "android")]
+            {
+                let mobile = app.state::<MobileLifecycle<R>>();
+                if let Ok(Some(config)) = mobile.get_auto_start_config() {
+                    let _ = mobile.clear_auto_start_config();
+                    let _ = mobile.start_keepalive(&config.service_label);
+                    let holder = app.state::<Arc<ServiceRunnerHolder<R>>>();
+                    let _ = holder.start(app.clone(), config);
+                    let _ = mobile.move_task_to_background();
+                }
             }
 
             Ok(())

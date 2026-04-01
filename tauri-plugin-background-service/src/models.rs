@@ -51,6 +51,30 @@ pub enum PluginEvent {
     Error { message: String },
 }
 
+/// Auto-start config returned by the Kotlin bridge.
+///
+/// Deserialized from SharedPreferences values read by `getAutoStartConfig`.
+/// Only used on Android (the iOS path doesn't have auto-start).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoStartConfig {
+    pub pending: bool,
+    pub label: Option<String>,
+}
+
+impl AutoStartConfig {
+    /// Convert to `StartConfig` if auto-start is pending and label is available.
+    pub fn into_start_config(self) -> Option<StartConfig> {
+        if self.pending {
+            self.label.map(|label| StartConfig {
+                service_label: label,
+            })
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +191,32 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"type\":\"error\""), "Tag: {json}");
         assert!(json.contains("\"message\":\"oops\""), "Message: {json}");
+    }
+
+    // --- AutoStartConfig tests ---
+
+    #[test]
+    fn auto_start_config_pending_with_label_returns_start_config() {
+        let json = r#"{"pending": true, "label": "Syncing"}"#;
+        let config: AutoStartConfig = serde_json::from_str(json).unwrap();
+        let result = config.into_start_config();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().service_label, "Syncing");
+    }
+
+    #[test]
+    fn auto_start_config_not_pending_returns_none() {
+        let json = r#"{"pending": false, "label": null}"#;
+        let config: AutoStartConfig = serde_json::from_str(json).unwrap();
+        let result = config.into_start_config();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn auto_start_config_pending_no_label_returns_none() {
+        let json = r#"{"pending": true, "label": null}"#;
+        let config: AutoStartConfig = serde_json::from_str(json).unwrap();
+        let result = config.into_start_config();
+        assert!(result.is_none());
     }
 }
