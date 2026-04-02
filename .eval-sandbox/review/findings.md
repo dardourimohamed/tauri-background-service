@@ -1,133 +1,135 @@
-# Code Review: tauri-plugin-background-service (Fresh Full Review)
+# Code Review: Runtime Verification via AutoGLM/Waydroid
 
 ## Files Reviewed
-- [x] tauri-plugin-background-service/src/lib.rs
 - [x] tauri-plugin-background-service/src/runner.rs
 - [x] tauri-plugin-background-service/src/models.rs
-- [x] tauri-plugin-background-service/src/error.rs
-- [x] tauri-plugin-background-service/src/mobile.rs
-- [x] tauri-plugin-background-service/src/notifier.rs
-- [x] tauri-plugin-background-service/src/service_trait.rs
-- [x] tauri-plugin-background-service/build.rs
-- [x] tauri-plugin-background-service/Cargo.toml
-- [x] tauri-plugin-background-service/ios/Sources/TauriPluginBackgroundService/BackgroundServicePlugin.swift
-- [x] tauri-plugin-background-service/android/src/main/kotlin/app/tauri/backgroundservice/BackgroundServicePlugin.kt
+- [x] tauri-plugin-background-service/src/lib.rs
 - [x] tauri-plugin-background-service/android/src/main/kotlin/app/tauri/backgroundservice/LifecycleService.kt
-- [x] tauri-plugin-background-service/android/src/main/AndroidManifest.xml
-- [x] tauri-plugin-background-service/permissions/default.toml
-- [x] tauri-plugin-background-service/tests/integration.rs
-- [x] tauri-plugin-background-service/examples/basic_service.rs
-- [x] tauri-plugin-background-service/guest-js/index.ts
-- [x] tauri-plugin-background-service/guest-js/dist-js/index.d.ts
+- [x] tauri-plugin-background-service/android/src/main/kotlin/app/tauri/backgroundservice/BackgroundServicePlugin.kt
+- [x] test-app/run-tests.py
+- [x] test-app/index.html
 - [x] test-app/src-tauri/src/lib.rs
 
-## Test Results
-- **Unit tests:** 42/42 passed
-- **Integration tests:** 12/12 passed
-- **Clippy:** Clean (only example dead_code warnings)
-
 ## Summary
-APPROVE with suggestions. All previously identified critical/high bugs have been fixed. The codebase is well-structured with comprehensive test coverage. Two medium-severity issues remain.
+APPROVE with one significant concern requiring deep analysis.
 
-## Previously Fixed Issues (Verified)
-- ✅ iOS `waitForCancel` now stores invoke unconditionally (was: resolved immediately when no BGTask)
-- ✅ `onTimeout()` override added for Android 15+ (was: missing, caused ANR)
-- ✅ `startForegroundTyped()` with API-level branching (was: 2-param overload)
-- ✅ `stopForeground(STOP_FOREGROUND_REMOVE)` before `stopSelf()` in ACTION_STOP (was: notification linger)
-- ✅ Swift force-cast replaced with `if let` guard (was: potential crash)
-- ✅ `isRunning` set during OS restart (was: false during restart)
-- ✅ `Acquire/Release` ordering on generation counter (was: SeqCst)
+## Test Results (2026-04-02T18:04:35Z)
 
-## Remaining Issues
+| Tier | Passed | Total |
+|------|--------|-------|
+| Core (must pass) | 5/5 | 5 |
+| Lifecycle (should pass) | 2/2 | 2 |
+| Edge (informational) | -- | 3 |
 
-### MEDIUM: Guest JS `StartConfig` missing `foregroundServiceType`
-**Location:** `guest-js/index.ts:5-8` and `guest-js/dist-js/index.d.ts:2-5`
+### Per-Test Breakdown
+| ID | Tier | Result | Notes |
+|----|------|--------|-------|
+| T1 | core | PASS | App opens, shows Stopped state |
+| T2 | core | PASS | Start Service works, status Running, tick count > 0 |
+| T3 | core | PASS | Check Status confirms Running |
+| T4 | core | PASS | Event log shows tick events with timestamps |
+| T5 | core | PASS | Stop Service works, status Stopped |
+| T6 | lifecycle | PASS | Double-stop: no crash, remains Stopped |
+| T7 | lifecycle | PASS | Double-start: no crash, remains Running |
+| T8 | edge | INFO | Force-stop + reopen: verification inconclusive |
+| T9 | edge | INFO | Max steps reached (KDE Connect dialogs interfere) |
+| T10 | edge | INFO | 5 ticks in 15s run, clean stop confirmed |
 
-The TypeScript interface is:
-```typescript
-export interface StartConfig {
-  serviceLabel?: string;
-}
+### Manual Verification
+- Rapid stop->start race condition: PASS (generation counter fix works)
+- Foreground service notification: NOT VERIFIED (see Critical Finding #1)
+
+## Critical Issues (Must Investigate)
+
+### 1. LifecycleService not visible in dumpsys activity services
+**Severity:** High
+**Evidence:** After starting the service (green Running status, tick count incrementing), `dumpsys activity services` does NOT list `app.tauri.backgroundservice.LifecycleService`. Only the WebView sandboxed process is listed.
+**Impact:** If the foreground service is not actually running, the Android OS can kill the process at any time, and the auto-restart (START_STICKY) mechanism will not work. The Rust Tokio task works fine, but the OS-level protection is missing.
+**Possible Causes:**
+- Waydroid does not fully track foreground services in dumpsys
+- The service starts but immediately stops (startForeground() not called in time)
+- The Intent is malformed or the service crashes silently
+**Confidence:** 50 (could be a Waydroid artifact)
+
+## Suggestions (Should Consider)
+
+### 1. Add logging to LifecycleService
+The LifecycleService has almost no logging (only a Log.w in mapServiceType for unrecognized types). Adding Log.d calls in onStartCommand, handleOsRestart, and startForegroundTyped would make debugging much easier.
+
+### 2. T9 test harness needs Waydroid-specific handling
+The KDE Connect dialog keeps popping up in Waydroid and confuses the AutoGLM agent.
+
+### 3. Test coverage gap: actual foreground service behavior
+No test verifies that the foreground notification actually appears or that the OS keeps the service alive when the app is backgrounded.
+
+## Deep Analysis: Foreground Service Lifecycle (2026-04-02T19:30Z)
+
+### Verdict: FALSE ALARM — Foreground service works correctly in Waydroid
+
+The primary review finding that "LifecycleService not visible in dumpsys" was a **timing artifact**: the service had already been stopped before the dumpsys check was performed. Deep analysis with live testing confirms the foreground service lifecycle is fully functional.
+
+### Evidence
+
+#### 1. Service IS visible in dumpsys when running
+After starting the service via the app UI and checking dumpsys immediately:
+```
+ServiceRecord{48d8217 u0 com.test.backgroundservice/app.tauri.backgroundservice.LifecycleService}
+  app=ProcessRecord{fc7963e 10236:com.test.backgroundservice/u0a159}
+  startForegroundCount=1
+  isForeground=true foregroundId=9001
+  foregroundNoti=Notification(channel=bg_keepalive ...)
+  createTime=-2s39ms
 ```
 
-But Rust accepts `foregroundServiceType` and Kotlin uses it. JS users cannot configure the Android foreground service type from the frontend. The value silently defaults to `"dataSync"`.
-
-### MEDIUM: Android OS restart loses foreground service type
-**Location:** `BackgroundServicePlugin.kt:54-57` + `LifecycleService.kt:82-84`
-
-`startKeepalive` only persists `bg_service_label` to SharedPreferences, NOT the foreground service type. After OS restart, `handleOsRestart()` calls `startForegroundTyped` with hardcoded `FOREGROUND_SERVICE_TYPE_DATA_SYNC`, and the Rust auto-start path also defaults to `"dataSync"`. Users who configured `"specialUse"` will lose their setting after OS restart.
-
-### LOW: Example dead_code warnings
-**Location:** `examples/basic_service.rs:19,24`
-
-Clippy warns about unused `ExampleService` struct and `new()` method. Expected for an example binary.
-
-## Deep Analysis: foregroundServiceType Gap (Step 2)
-
-### MEDIUM: Android OS restart silently downgrades foreground service type (confirmed)
-
-Full root-cause chain traced across 4 layers:
-
-1. **Kotlin `startKeepalive()`** (`BackgroundServicePlugin.kt:54-56`): Persists `bg_service_label` to SharedPreferences but does NOT persist `foregroundServiceType`. The `EXTRA_SERVICE_TYPE` is passed via Intent to LifecycleService but never written to durable storage.
-
-2. **Kotlin `handleOsRestart()`** (`LifecycleService.kt:84`): Hardcodes `ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC` for the initial `startForeground` call. No way to know what was originally configured.
-
-3. **Kotlin `getAutoStartConfig()`** (`BackgroundServicePlugin.kt:73-79`): `GetAutoStartConfigResult` only carries `pending` and `label` — no service type field.
-
-4. **Rust `AutoStartConfig::into_start_config()`** (`models.rs:78-80`): Always calls `default_foreground_service_type()` (returns `"dataSync"`), regardless of what was originally configured.
-
-**Adversarial scenario:**
-- App configures `specialUse` for Google Play policy compliance (e.g., for a feature that doesn't fit other service types).
-- OS kills service due to memory pressure or battery optimization.
-- `handleOsRestart` starts with `DATA_SYNC` immediately (Android 12+ requirement).
-- Activity relaunches → Rust auto-start reads `AutoStartConfig` → always gets `"dataSync"`.
-- `startKeepalive` sends `"dataSync"` to LifecycleService → `onStartCommand` uses `DATA_SYNC` again.
-- Service now runs permanently with wrong type. User never notified.
-
-**Impact:** Google Play policy violation if `specialUse` was required. The manifest declares both types so no crash, but functional and compliance risk.
-
-**Fix:** Persist `bg_service_type` alongside `bg_service_label` in SharedPreferences. Thread it through `GetAutoStartConfigResult`, `AutoStartConfig`, and `handleOsRestart`.
-
-### MEDIUM: TypeScript StartConfig missing foregroundServiceType (confirmed, lower runtime impact)
-
-The Rust `StartConfig` (`models.rs:23-31`) accepts `foregroundServiceType` via `#[serde(rename_all = "camelCase")]`. The Kotlin bridge and mobile.rs pass it through correctly. But:
-
-- `guest-js/index.ts:5-8`: Interface only has `serviceLabel`
-- `guest-js/dist-js/index.d.ts:2-5`: Generated types mirror the gap
-
-**Runtime behavior:** The field DOES work if passed manually:
-```typescript
-startService({ serviceLabel: "test", foregroundServiceType: "specialUse" } as any);
+#### 2. Historical FOREGROUND_SERVICE_START/STOP events confirm lifecycle
 ```
-The `invoke` call passes the full object through; serde deserializes it correctly. The gap is purely TypeScript ergonomics (no autocomplete, type error without `as any`).
-
-**iOS note:** Not affected — iOS uses `BGAppRefreshTask` which has no foreground service type concept.
-
-### LOW (new): mapServiceType silently swallows invalid values
-
-`LifecycleService.kt:105-110`:
-```kotlin
-private fun mapServiceType(type: String): Int {
-    return when (type) {
-        "specialUse" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-        else -> ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-    }
-}
+time="2026-04-02 18:52:47" type=FOREGROUND_SERVICE_START ... LifecycleService
+time="2026-04-02 18:54:12" type=FOREGROUND_SERVICE_STOP  ... LifecycleService
+time="2026-04-02 18:55:01" type=FOREGROUND_SERVICE_START ... LifecycleService
+time="2026-04-02 18:55:28" type=FOREGROUND_SERVICE_STOP  ... LifecycleService
+time="2026-04-02 19:04:00" type=FOREGROUND_SERVICE_START ... LifecycleService
+time="2026-04-02 19:04:25" type=FOREGROUND_SERVICE_STOP  ... LifecycleService
 ```
-Typos like `"special_use"`, `"SPECIALUSE"`, or `"location"` silently default to `DATA_SYNC` instead of failing fast. No logging, no error. Since both types are declared in the manifest, this won't crash, but it masks configuration errors.
 
-**Recommendation:** Consider logging a warning via `Log.w()` for unrecognized service type strings, or returning an error to the caller.
+#### 3. Notification channel confirms foreground notification was posted
+```
+NotificationChannel{mId='bg_keepalive', ..., mFgServiceShown=true, ...}
+```
 
-### Deep Analysis Conclusion
+#### 4. Service stats show consistent running across time windows
+```
+Svc app.tauri.backgroundservice.LifecycleService:
+  Running count 3 / time 5.9%   (last 3 hours)
+  Running count 9 / time 43%    (last 24 hours)
+  Running count 4 / time 81%    (since boot)
+```
 
-The two medium issues are confirmed and traced end-to-end. Neither causes crashes (manifest declares both types). The primary risk is configuration integrity after OS restart — a user's `specialUse` choice is silently lost. The JS API gap is a discoverability issue with a trivial runtime workaround. One new low-severity finding added (silent type fallback).
+### Adversarial Tests — All Passed
+
+| Test | Result | Evidence |
+|------|--------|----------|
+| Fresh start → dumpsys check | PASS | `isForeground=true`, `startForegroundCount=1`, prompt `createTime` |
+| Background app → service survival | PASS | Tick count continued 6→22 after HOME key press |
+| Rapid stop→start race | PASS | Service restarted cleanly, tick count reset to 3, no errors |
+| OOM priority | PASS | `oom_adj=0`, `oom_score_adj=0` (foreground priority) |
+| START_STICKY flag | PASS | `stopIfKilled=false`, `callStart=true` in ServiceRecord |
+
+### Code Review: No Issues Found
+
+- `onStartCommand`: Correctly handles ACTION_STOP, null intent (OS restart), and normal start
+- `startForegroundTyped`: Properly handles API level Q+ vs older
+- `handleOsRestart`: Saves auto-start prefs, calls startForeground within 5s, re-launches Activity
+- `onDestroy`: Resets `isRunning` and `autoRestarting` flags
+- `onTimeout` (Android 14+): Stops foreground gracefully
+- `buildNotification`: Creates proper ongoing notification with PendingIntent
+
+### Root Cause of Original Finding
+The primary reviewer checked `dumpsys activity services app.tauri.backgroundservice` **after the service had already been stopped**. When the service IS running, it appears correctly in dumpsys with all expected foreground service attributes. This is not a Waydroid limitation — it's expected behavior (stopped services don't appear in active services).
 
 ## Positive Notes
-- Generation counter pattern is elegant and well-tested
-- Callback capture-at-spawn-time with generation guard is a solid pattern
-- Main-queue serialization in Swift eliminates data races
-- All 4 BGTask completion paths are nil-guarded and call cleanup()
-- Android manifest correctly declares both dataSync and specialUse types
-- Comprehensive test coverage (54 tests) including adversarial cases
-- Clean module separation: runner, models, notifier, service_trait, mobile
-- Guest-js properly builds CJS+ESM+types with rollup
+- Generation counter in runner.rs correctly prevents stop->start race conditions
+- Token cleanup is generation-guarded to avoid clearing the new service token
+- on_complete callback is captured at spawn time, preventing stale callback issues
+- init() failure path correctly fires callback with false and clears token
+- Serde models have comprehensive unit test coverage
+- AutoStartConfig correctly handles null/missing fields with Option<String>
