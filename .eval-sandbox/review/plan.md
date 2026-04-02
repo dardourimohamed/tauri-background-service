@@ -1,25 +1,22 @@
-# Review Plan: Background Service Plugin Runtime Verification
+# Review Plan: Code Quality Review
 
 ## Step 1: Primary Pass (CURRENT — COMPLETED)
-- Rebuild APK with latest code (13 commits since last test)
-- Deploy to Waydroid
-- Run full 10-test AutoGLM suite
-- Manual verification of race condition, notification
-- Result: 5/5 core PASS, 2/2 lifecycle PASS, 3 edge INFO
-- Key finding: LifecycleService not visible in dumpsys
+- Read all Rust, Kotlin, Swift, and TypeScript source files
+- Run all unit + integration tests (57/57 PASS)
+- Identify highest-risk area: start command ordering in lib.rs
+- Findings written to findings.md
 
-## Step 2: Deep Analysis — Foreground Service Lifecycle (NEXT)
-Investigate why LifecycleService does not appear in dumpsys:
-1. Check if Waydroid suppresses foreground service dumpsys output
-2. Add temporary logging to LifecycleService and rebuild
-3. Start service, check logcat for onStartCommand execution
-4. Verify startForeground() is called within the 5-second window
-5. Check if the notification channel is created and notification posted
-6. Test OS kill resilience: background the app and check if service survives
-7. Document whether this is a real bug or Waydroid testing limitation
+## Step 2: Deep Analysis — start command ordering (NEXT)
+Investigate the start command calling start_keepalive before AlreadyRunning check:
+1. Trace exact code path when service is already running and user calls start again
+2. Verify Android behavior: does LifecycleService re-enter onStartCommand correctly?
+3. Verify iOS behavior: does the orphaned callback cause any issues?
+4. Check if the test app or any real usage would trigger this path
+5. Propose fix: move is_running check before start_keepalive call
+6. Document whether this is a real bug or acceptable behavior
 
 ## Final Step: Synthesis and Completion
 - Consolidate findings from Steps 1-2
 - Produce final review report with verdict
-- If foreground service issue is confirmed: REQUEST_CHANGES
-- If foreground service issue is Waydroid-only: APPROVE with documented caveat
+- If ordering bug is confirmed harmful: REQUEST_CHANGES
+- If ordering bug is acceptable with documented caveat: APPROVE
