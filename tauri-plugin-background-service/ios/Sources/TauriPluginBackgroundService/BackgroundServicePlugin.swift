@@ -25,7 +25,11 @@ import WebKit
         // Register background task handler before the app finishes launching.
         BGTaskScheduler.shared.register(forTaskWithIdentifier: taskId, using: .main) {
             [weak self] task in
-            self?.handleBackgroundTask(task as! BGAppRefreshTask)
+            if let bgTask = task as? BGAppRefreshTask {
+                self?.handleBackgroundTask(bgTask)
+            } else {
+                (task as? BGTask)?.setTaskCompleted(success: false)
+            }
         }
     }
 
