@@ -201,7 +201,6 @@ tauri-plugin-background-service/
 │   ├── error.rs            ServiceError enum
 │   ├── models.rs           ServiceContext, StartConfig, PluginEvent
 │   ├── service_trait.rs    BackgroundService trait
-│   ├── runner.rs           ServiceRunner, task spawn, lifecycle
 │   ├── notifier.rs         Notifier (wraps tauri-plugin-notification)
 │   └── mobile.rs           MobileLifecycle bridge (mobile only)
 ├── android/src/main/

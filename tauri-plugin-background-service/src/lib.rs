@@ -2,7 +2,6 @@ pub mod error;
 pub mod manager;
 pub mod models;
 pub mod notifier;
-pub mod runner;
 pub mod service_trait;
 
 #[cfg(mobile)]
@@ -11,10 +10,9 @@ pub mod mobile;
 // ─── Public API Surface ──────────────────────────────────────────────────────
 
 pub use error::ServiceError;
-pub use manager::ServiceManagerHandle;
-pub use models::{AutoStartConfig, PluginEvent, ServiceContext, StartConfig};
+pub use manager::{manager_loop, OnCompleteCallback, ServiceFactory, ServiceManagerHandle};
+pub use models::{AutoStartConfig, PluginConfig, PluginEvent, ServiceContext, StartConfig};
 pub use notifier::Notifier;
-pub use runner::ServiceRunner;
 pub use service_trait::BackgroundService;
 
 // ─── Internal Imports ────────────────────────────────────────────────────────
@@ -24,7 +22,7 @@ use tauri::{
     AppHandle, Manager, Runtime,
 };
 
-use crate::manager::{ManagerCommand, ServiceFactory, manager_loop};
+use crate::manager::ManagerCommand;
 
 #[cfg(mobile)]
 use crate::manager::MobileKeepalive;
@@ -75,7 +73,7 @@ async fn ios_set_on_complete_callback<R: Runtime>(_app: &AppHandle<R>) -> Result
 /// Must be called **after** `Start` succeeds so the service is running when the
 /// cancel listener begins waiting. Sends `Stop` to the actor when cancelled.
 #[cfg(target_os = "ios")]
-fn ios_spawn_cancel_listener<R: Runtime>(app: &AppHandle<R>) {
+fn ios_spawn_cancel_listener<R: Runtime>(app: &AppHandle<R>, timeout_secs: u64) {
     let mobile = app.state::<Arc<MobileLifecycle<R>>>();
     let mobile_handle = mobile.handle.clone();
     let manager = app.state::<ServiceManagerHandle<R>>();
@@ -88,9 +86,9 @@ fn ios_spawn_cancel_listener<R: Runtime>(app: &AppHandle<R>) {
             };
             mob.wait_for_cancel()
         });
-        // 24-hour safety timeout prevents indefinite thread leaks if iOS
+        // Safety timeout prevents indefinite thread leaks if iOS
         // invoke is never resolved (e.g., iOS kills the app).
-        let result = tokio::time::timeout(std::time::Duration::from_secs(86400), handle).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), handle).await;
         if let Ok(Ok(Ok(()))) = result {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let _ = cmd_tx.send(ManagerCommand::Stop { reply: tx }).await;
@@ -100,7 +98,7 @@ fn ios_spawn_cancel_listener<R: Runtime>(app: &AppHandle<R>) {
 }
 
 #[cfg(not(target_os = "ios"))]
-fn ios_spawn_cancel_listener<R: Runtime>(_app: &AppHandle<R>) {}
+fn ios_spawn_cancel_listener<R: Runtime>(_app: &AppHandle<R>, _timeout_secs: u64) {}
 
 // ─── Tauri Commands ──────────────────────────────────────────────────────────
 
@@ -127,7 +125,8 @@ async fn start<R: Runtime>(app: AppHandle<R>, config: StartConfig) -> Result<(),
     rx.await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
 
     // iOS: spawn cancel listener after Start succeeds.
-    ios_spawn_cancel_listener(&app);
+    let plugin_config = app.state::<PluginConfig>();
+    ios_spawn_cancel_listener(&app, plugin_config.ios_cancel_listener_timeout_secs);
 
     Ok(())
 }
@@ -169,7 +168,7 @@ async fn is_running<R: Runtime>(app: AppHandle<R>) -> bool {
 /// tauri::Builder::default()
 ///     .plugin(tauri_plugin_background_service::init_with_service(|| MyService::new()))
 /// ```
-pub fn init_with_service<R, S, F>(factory: F) -> TauriPlugin<R>
+pub fn init_with_service<R, S, F>(factory: F) -> TauriPlugin<R, PluginConfig>
 where
     R: Runtime,
     S: BackgroundService<R>,
@@ -177,21 +176,24 @@ where
 {
     let boxed_factory: ServiceFactory<R> = Box::new(move || Box::new(factory()));
 
-    Builder::new("background-service")
+    Builder::<R, PluginConfig>::new("background-service")
         .invoke_handler(tauri::generate_handler![start, stop, is_running])
-        .setup(move |app, _api| {
+        .setup(move |app, api| {
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
             let handle = ServiceManagerHandle::new(cmd_tx);
             app.manage(handle);
 
-            let ios_safety_timeout_secs = 28.0; // TODO: read from PluginConfig
+            let config = api.config().clone();
+            app.manage(config.clone());
+
+            let ios_safety_timeout_secs = config.ios_safety_timeout_secs;
 
             let factory = boxed_factory;
             tauri::async_runtime::spawn(manager_loop(cmd_rx, factory, ios_safety_timeout_secs));
 
             #[cfg(mobile)]
             {
-                let lifecycle = mobile::init(app, _api)?;
+                let lifecycle = mobile::init(app, api)?;
                 let lifecycle_arc = std::sync::Arc::new(lifecycle);
 
                 // Send SetMobile to actor so keepalive is managed by the actor.
@@ -306,7 +308,7 @@ mod tests {
 
     /// Verify `init_with_service` returns `TauriPlugin<R>`.
     #[allow(dead_code)]
-    fn init_with_service_returns_tauri_plugin<R: Runtime, S, F>(factory: F) -> TauriPlugin<R>
+    fn init_with_service_returns_tauri_plugin<R: Runtime, S, F>(factory: F) -> TauriPlugin<R, PluginConfig>
     where
         S: BackgroundService<R>,
         F: Fn() -> S + Send + Sync + 'static,

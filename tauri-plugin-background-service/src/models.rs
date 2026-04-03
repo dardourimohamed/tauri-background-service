@@ -54,10 +54,19 @@ pub struct PluginConfig {
     /// Default: 28.0 (Apple recommends keeping BG tasks under ~30s).
     #[serde(default = "default_ios_safety_timeout")]
     pub ios_safety_timeout_secs: f64,
+
+    /// iOS cancel listener timeout in seconds.
+    /// Default: 14400 (4 hours). Balances leak risk vs. service lifetime.
+    #[serde(default = "default_ios_cancel_listener_timeout_secs")]
+    pub ios_cancel_listener_timeout_secs: u64,
 }
 
 fn default_ios_safety_timeout() -> f64 {
     28.0
+}
+
+fn default_ios_cancel_listener_timeout_secs() -> u64 {
+    14400
 }
 
 impl Default for StartConfig {
@@ -86,6 +95,7 @@ impl Default for PluginConfig {
     fn default() -> Self {
         Self {
             ios_safety_timeout_secs: default_ios_safety_timeout(),
+            ios_cancel_listener_timeout_secs: default_ios_cancel_listener_timeout_secs(),
         }
     }
 }
@@ -95,6 +105,7 @@ impl Default for PluginConfig {
 /// Lives in `models.rs` (not `mobile.rs`) so serde tests run on all platforms.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub(crate) struct StartKeepaliveArgs<'a> {
     pub label: &'a str,
     pub foreground_service_type: &'a str,
@@ -394,6 +405,7 @@ mod tests {
     fn plugin_config_serde_roundtrip_preserves_value() {
         let config = PluginConfig {
             ios_safety_timeout_secs: 30.0,
+            ios_cancel_listener_timeout_secs: 14400,
         };
         let json = serde_json::to_string(&config).unwrap();
         let de: PluginConfig = serde_json::from_str(&json).unwrap();
@@ -404,6 +416,31 @@ mod tests {
     fn plugin_config_default_impl() {
         let config = PluginConfig::default();
         assert_eq!(config.ios_safety_timeout_secs, 28.0);
+    }
+
+    #[test]
+    fn plugin_config_default_cancel_timeout() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.ios_cancel_listener_timeout_secs, 14400);
+    }
+
+    #[test]
+    fn plugin_config_custom_cancel_timeout() {
+        let json = r#"{"iosCancelListenerTimeoutSecs":7200}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.ios_cancel_listener_timeout_secs, 7200);
+    }
+
+    #[test]
+    fn plugin_config_cancel_timeout_serde_roundtrip() {
+        let config = PluginConfig {
+            ios_safety_timeout_secs: 28.0,
+            ios_cancel_listener_timeout_secs: 3600,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.ios_cancel_listener_timeout_secs, 3600);
     }
 
     // --- StartKeepaliveArgs tests ---

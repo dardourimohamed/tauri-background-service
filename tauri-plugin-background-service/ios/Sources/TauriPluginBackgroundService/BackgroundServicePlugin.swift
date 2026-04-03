@@ -12,9 +12,6 @@ import WebKit
     // MARK: - State for C1: BGTask lifecycle management
     private var currentTask: BGAppRefreshTask?
     private var pendingCancelInvoke: Invoke?
-    /// Configurable safety timeout from Rust (PluginConfig). Default: 28.0s.
-    /// Apple recommends keeping BG tasks under ~30s.
-    private var safetyTimeout: TimeInterval = 28.0
     private var safetyTimer: Timer?
     /// iOS safety timeout (default: 28.0s, Apple recommends keeping BG tasks under ~30s).
     /// Set via `startKeepalive` args from Rust (PluginConfig).

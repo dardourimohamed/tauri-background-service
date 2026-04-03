@@ -11,7 +11,7 @@ use crate::notifier::Notifier;
 use crate::service_trait::BackgroundService;
 
 /// Callback fired when the service task completes. Receives `true` on success.
-type CompletionCallback = Box<dyn Fn(bool) + Send + Sync>;
+pub type OnCompleteCallback = Box<dyn Fn(bool) + Send + Sync>;
 
 /// Abstraction over mobile keepalive operations.
 ///
@@ -26,13 +26,17 @@ pub(crate) trait MobileKeepalive: Send + Sync {
 }
 
 /// Type-erased factory: produces a fresh `Box<dyn BackgroundService<R>>` on demand.
-pub(crate) type ServiceFactory<R> =
+pub type ServiceFactory<R> =
     Box<dyn Fn() -> Box<dyn BackgroundService<R>> + Send + Sync>;
 
 // ─── Commands ───────────────────────────────────────────────────────────
 
 /// Commands sent to the service manager actor.
-pub(crate) enum ManagerCommand<R: Runtime> {
+///
+/// This enum is `#[non_exhaustive]` to prevent external construction.
+/// Use [`ServiceManagerHandle`] methods instead.
+#[non_exhaustive]
+pub enum ManagerCommand<R: Runtime> {
     Start {
         config: StartConfig,
         reply: oneshot::Sender<Result<(), ServiceError>>,
@@ -45,8 +49,9 @@ pub(crate) enum ManagerCommand<R: Runtime> {
         reply: oneshot::Sender<bool>,
     },
     SetOnComplete {
-        callback: CompletionCallback,
+        callback: OnCompleteCallback,
     },
+    #[allow(dead_code, private_interfaces)]
     SetMobile {
         mobile: Arc<dyn MobileKeepalive>,
     },
@@ -65,8 +70,69 @@ pub struct ServiceManagerHandle<R: Runtime> {
 
 impl<R: Runtime> ServiceManagerHandle<R> {
     /// Create a new handle backed by the given channel sender.
-    pub(crate) fn new(cmd_tx: mpsc::Sender<ManagerCommand<R>>) -> Self {
+    pub fn new(cmd_tx: mpsc::Sender<ManagerCommand<R>>) -> Self {
         Self { cmd_tx }
+    }
+
+    /// Start a background service.
+    ///
+    /// Sends a `Start` command to the actor. Returns `AlreadyRunning` if a
+    /// service is already active.
+    pub async fn start(
+        &self,
+        app: AppHandle<R>,
+        config: StartConfig,
+    ) -> Result<(), ServiceError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ManagerCommand::Start {
+                config,
+                reply,
+                app,
+            })
+            .await
+            .map_err(|_| ServiceError::Runtime("manager actor shut down".into()))?;
+        rx.await
+            .map_err(|_| ServiceError::Runtime("manager actor dropped reply".into()))?
+    }
+
+    /// Stop the running background service.
+    ///
+    /// Sends a `Stop` command to the actor. Returns `NotRunning` if no
+    /// service is active.
+    pub async fn stop(&self) -> Result<(), ServiceError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ManagerCommand::Stop { reply })
+            .await
+            .map_err(|_| ServiceError::Runtime("manager actor shut down".into()))?;
+        rx.await
+            .map_err(|_| ServiceError::Runtime("manager actor dropped reply".into()))?
+    }
+
+    /// Check whether a background service is currently running.
+    pub async fn is_running(&self) -> bool {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(ManagerCommand::IsRunning { reply })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.unwrap_or(false)
+    }
+
+    /// Set the callback fired when the service task completes.
+    ///
+    /// The callback is captured at spawn time (generation-guarded), so calling
+    /// this while a service is running will only affect the *next* start.
+    pub async fn set_on_complete(&self, callback: OnCompleteCallback) {
+        let _ = self
+            .cmd_tx
+            .send(ManagerCommand::SetOnComplete { callback })
+            .await;
     }
 }
 
@@ -84,7 +150,7 @@ struct ServiceState<R: Runtime> {
     /// Callback fired once when the service task completes.
     /// Captured via `take()` at spawn time so a new callback can be set
     /// for the next start.
-    on_complete: Option<CompletionCallback>,
+    on_complete: Option<OnCompleteCallback>,
     /// Factory that creates fresh service instances.
     factory: ServiceFactory<R>,
     /// Mobile keepalive handle. Set via `SetMobile` command on mobile platforms.
@@ -100,7 +166,7 @@ struct ServiceState<R: Runtime> {
 ///
 /// Runs as a spawned Tokio task. The loop exits when all `Sender` halves
 /// are dropped (i.e., the handle is dropped).
-pub(crate) async fn manager_loop<R: Runtime>(
+pub async fn manager_loop<R: Runtime>(
     mut rx: mpsc::Receiver<ManagerCommand<R>>,
     factory: ServiceFactory<R>,
     // iOS safety timeout in seconds. From PluginConfig.
@@ -271,7 +337,9 @@ fn handle_stop<R: Runtime>(state: &mut ServiceState<R>) -> Result<(), ServiceErr
             drop(guard);
             // Stop mobile keepalive after token cancellation.
             if let Some(ref mobile) = state.mobile {
-                mobile.stop_keepalive()?;
+                if let Err(e) = mobile.stop_keepalive() {
+                    log::warn!("stop_keepalive failed (service already cancelled): {e}");
+                }
             }
             Ok(())
         }
@@ -571,7 +639,7 @@ mod tests {
 
     async fn send_set_on_complete(
         handle: &ServiceManagerHandle<tauri::test::MockRuntime>,
-        callback: CompletionCallback,
+        callback: OnCompleteCallback,
     ) {
         handle
             .cmd_tx
@@ -903,6 +971,38 @@ mod tests {
             mock.stop_called.load(Ordering::Acquire),
             1,
             "stop_keepalive should be called once after stop"
+        );
+    }
+
+    // ── stop_keepalive failure does not propagate ──────────────────────────
+
+    /// Mock mobile where `stop_keepalive` always fails.
+    struct MockMobileFailingStop;
+
+    impl MobileKeepalive for MockMobileFailingStop {
+        fn start_keepalive(&self, _label: &str, _foreground_service_type: &str, _ios_safety_timeout_secs: Option<f64>) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn stop_keepalive(&self) -> Result<(), ServiceError> {
+            Err(ServiceError::Platform("mock stop failure".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_keepalive_failure_does_not_propagate() {
+        let handle = setup_manager();
+        let app = tauri::test::mock_app();
+
+        send_set_mobile(&handle, Arc::new(MockMobileFailingStop)).await;
+        send_start(&handle, app.handle().clone()).await.unwrap();
+
+        let result = send_stop(&handle).await;
+        assert!(result.is_ok(), "stop should succeed even when stop_keepalive fails");
+
+        assert!(
+            !send_is_running(&handle).await,
+            "service should not be running after stop"
         );
     }
 
