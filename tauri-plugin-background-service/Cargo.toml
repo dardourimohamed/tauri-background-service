@@ -1,6 +1,6 @@
 [package]
 name = "tauri-plugin-background-service"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 links = "tauri-plugin-background-service"
 description = "Background service lifecycle plugin for Tauri v2 — run long-lived tasks on Android, iOS, and desktop"
