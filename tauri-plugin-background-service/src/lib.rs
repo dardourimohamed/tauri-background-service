@@ -89,6 +89,9 @@ use crate::manager::MobileKeepalive;
 #[cfg(mobile)]
 use mobile::MobileLifecycle;
 
+#[cfg(mobile)]
+use std::sync::Arc;
+
 // ─── iOS Plugin Binding ──────────────────────────────────────────────────────
 // Must be at module level. Referenced by mobile::init() when registering
 // the iOS plugin. Only compiled when targeting iOS.
@@ -301,6 +304,8 @@ where
         ])
         .setup(move |app, api| {
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+            #[cfg(mobile)]
+            let mobile_cmd_tx = cmd_tx.clone();
             let handle = ServiceManagerHandle::new(cmd_tx);
             app.manage(handle);
 
@@ -349,11 +354,13 @@ where
             #[cfg(mobile)]
             {
                 let lifecycle = mobile::init(app, api)?;
-                let lifecycle_arc = std::sync::Arc::new(lifecycle);
+                let lifecycle_arc = Arc::new(lifecycle);
 
                 // Send SetMobile to actor so keepalive is managed by the actor.
                 let mobile_trait: Arc<dyn MobileKeepalive> = lifecycle_arc.clone();
-                let _ = cmd_tx.try_send(ManagerCommand::SetMobile { mobile: mobile_trait });
+                if let Err(e) = mobile_cmd_tx.try_send(ManagerCommand::SetMobile { mobile: mobile_trait }) {
+                    log::error!("Failed to send SetMobile command: {e}");
+                }
 
                 // Store for iOS callbacks and Android auto-start helpers.
                 app.manage(lifecycle_arc);
@@ -375,7 +382,7 @@ where
 
                     let manager = app.state::<ServiceManagerHandle<R>>();
                     let cmd_tx = manager.cmd_tx.clone();
-                    let app_clone = app.handle().clone();
+                    let app_clone = app.app_handle().clone();
 
                     tauri::async_runtime::spawn(async move {
                         let (tx, rx) = tokio::sync::oneshot::channel();
