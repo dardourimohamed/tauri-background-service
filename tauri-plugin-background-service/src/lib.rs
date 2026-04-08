@@ -163,13 +163,10 @@ fn ios_spawn_cancel_listener<R: Runtime>(_app: &AppHandle<R>, _timeout_secs: u64
 
 #[tauri::command]
 async fn start<R: Runtime>(app: AppHandle<R>, config: StartConfig) -> Result<(), String> {
-    // OS service mode: route through IPC sidecar.
+    // OS service mode: route through persistent IPC client.
     #[cfg(feature = "desktop-service")]
     if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
-        let mut client = desktop::ipc_client::IpcClient::connect(ipc_state.socket_path.clone())
-            .await
-            .map_err(|e| e.to_string())?;
-        return client.start(config).await.map_err(|e| e.to_string());
+        return ipc_state.client.start(config).await.map_err(|e| e.to_string());
     }
 
     // In-process mode (default).
@@ -202,13 +199,10 @@ async fn start<R: Runtime>(app: AppHandle<R>, config: StartConfig) -> Result<(),
 
 #[tauri::command]
 async fn stop<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    // OS service mode: route through IPC sidecar.
+    // OS service mode: route through persistent IPC client.
     #[cfg(feature = "desktop-service")]
     if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
-        let mut client = desktop::ipc_client::IpcClient::connect(ipc_state.socket_path.clone())
-            .await
-            .map_err(|e| e.to_string())?;
-        return client.stop().await.map_err(|e| e.to_string());
+        return ipc_state.client.stop().await.map_err(|e| e.to_string());
     }
 
     // In-process mode (default).
@@ -225,14 +219,10 @@ async fn stop<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
 
 #[tauri::command]
 async fn is_running<R: Runtime>(app: AppHandle<R>) -> bool {
-    // OS service mode: route through IPC sidecar.
+    // OS service mode: route through persistent IPC client.
     #[cfg(feature = "desktop-service")]
     if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
-        let client = desktop::ipc_client::IpcClient::connect(ipc_state.socket_path.clone()).await;
-        return match client {
-            Ok(mut c) => c.is_running().await.unwrap_or(false),
-            Err(_) => false,
-        };
+        return ipc_state.client.is_running().await.unwrap_or(false);
     }
 
     // In-process mode (default).
@@ -254,11 +244,10 @@ async fn is_running<R: Runtime>(app: AppHandle<R>) -> bool {
 /// Managed state indicating OS service mode via IPC.
 ///
 /// When present as managed state, the `start`/`stop`/`is_running` commands
-/// route through [`IpcClient`](desktop::ipc_client::IpcClient) instead of the
-/// in-process actor loop.
+/// route through the persistent IPC client instead of the in-process actor loop.
 #[cfg(feature = "desktop-service")]
 struct DesktopIpcState {
-    socket_path: std::path::PathBuf,
+    client: desktop::ipc_client::PersistentIpcClientHandle,
 }
 
 #[cfg(feature = "desktop-service")]
@@ -281,17 +270,6 @@ async fn uninstall_service<R: Runtime>(app: AppHandle<R>) -> Result<(), String> 
     let exec_path = std::env::current_exe().map_err(|e| e.to_string())?;
     let mgr = DesktopServiceManager::new(&label, exec_path).map_err(|e| e.to_string())?;
     mgr.uninstall().map_err(|e| e.to_string())
-}
-
-#[cfg(feature = "desktop-service")]
-#[tauri::command]
-async fn service_status<R: Runtime>(app: AppHandle<R>) -> Result<String, String> {
-    use desktop::service_manager::{derive_service_label, DesktopServiceManager};
-    let plugin_config = app.state::<PluginConfig>();
-    let label = derive_service_label(&app, plugin_config.desktop_service_label.as_deref());
-    let exec_path = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mgr = DesktopServiceManager::new(&label, exec_path).map_err(|e| e.to_string())?;
-    mgr.status().map_err(|e| e.to_string())
 }
 
 // ─── Plugin Builder ──────────────────────────────────────────────────────────
@@ -320,8 +298,6 @@ where
             install_service,
             #[cfg(feature = "desktop-service")]
             uninstall_service,
-            #[cfg(feature = "desktop-service")]
-            service_status,
         ])
         .setup(move |app, api| {
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
@@ -337,13 +313,17 @@ where
             // Mode dispatch: spawn in-process actor or configure IPC for OS service.
             #[cfg(feature = "desktop-service")]
             if config.desktop_service_mode == "osService" {
-                // OS service mode: no actor loop, store IPC socket path.
+                // OS service mode: spawn persistent IPC client.
                 let label = desktop::service_manager::derive_service_label(
                     app,
                     config.desktop_service_label.as_deref(),
                 );
                 let socket_path = desktop::ipc::socket_path(&label);
-                app.manage(DesktopIpcState { socket_path });
+                let client = desktop::ipc_client::PersistentIpcClientHandle::spawn(
+                    socket_path,
+                    app.app_handle().clone(),
+                );
+                app.manage(DesktopIpcState { client });
             } else {
                 // In-process mode (default): spawn the actor loop.
                 let factory = boxed_factory;
@@ -514,17 +494,17 @@ mod tests {
 
     // ── Desktop IPC State Tests ─────────────────────────────────────────
 
-    /// Verify DesktopIpcState can be constructed with a socket path.
+    /// Verify PersistentIpcClientHandle can be constructed.
     #[cfg(feature = "desktop-service")]
-    #[test]
-    fn desktop_ipc_state_stores_socket_path() {
-        let state = DesktopIpcState {
-            socket_path: std::path::PathBuf::from("/tmp/test-service.sock"),
-        };
-        assert_eq!(
-            state.socket_path,
-            std::path::PathBuf::from("/tmp/test-service.sock")
-        );
+    #[tokio::test]
+    async fn desktop_ipc_state_with_persistent_client() {
+        use desktop::ipc_client::PersistentIpcClientHandle;
+        let app = tauri::test::mock_app();
+        let path = std::path::PathBuf::from("/tmp/test-persistent-client.sock");
+        let client = PersistentIpcClientHandle::spawn(path, app.handle().clone());
+        // The client is spawned but may not be connected yet — that's fine.
+        // Just verify we can construct the state.
+        let _state = DesktopIpcState { client };
     }
 
     // ── Desktop Command Compile-time Tests ────────────────────────────────
@@ -547,12 +527,4 @@ mod tests {
         uninstall_service(app).await
     }
 
-    /// Verify `service_status` command signature is generic over `R: Runtime`.
-    #[cfg(feature = "desktop-service")]
-    #[allow(dead_code)]
-    async fn service_status_command_signature<R: Runtime>(
-        app: AppHandle<R>,
-    ) -> Result<String, String> {
-        service_status(app).await
-    }
 }

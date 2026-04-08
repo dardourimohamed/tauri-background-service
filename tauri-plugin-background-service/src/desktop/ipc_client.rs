@@ -137,7 +137,7 @@ impl IpcClient {
     }
 
     async fn send_request(&mut self, request: &IpcRequest) -> Result<(), ServiceError> {
-        let frame = encode_frame(request);
+        let frame = encode_frame(request).map_err(|e| ServiceError::Ipc(format!("encode: {e}")))?;
         self.stream
             .write_all(&frame)
             .await
@@ -183,87 +183,312 @@ pub fn ipc_event_to_plugin_event(event: IpcEvent) -> PluginEvent {
     }
 }
 
+// ─── Persistent IPC Client ────────────────────────────────────────────────────
+
+/// Internal command sent from the handle to the background connection task.
+enum IpcCommand {
+    Start {
+        config: StartConfig,
+        reply: tokio::sync::oneshot::Sender<Result<(), ServiceError>>,
+    },
+    Stop {
+        reply: tokio::sync::oneshot::Sender<Result<(), ServiceError>>,
+    },
+    IsRunning {
+        reply: tokio::sync::oneshot::Sender<Result<bool, ServiceError>>,
+    },
+}
+
+/// Handle to a persistent IPC client that maintains a long-lived connection
+/// to the headless sidecar.
+///
+/// The background task automatically:
+/// - Relays [`IpcEvent`] frames to `app.emit("background-service://event", ...)`
+/// - Reconnects on connection failure with a 1-second delay
+/// - Forwards commands (start/stop/is_running) over the same connection
+pub struct PersistentIpcClientHandle {
+    cmd_tx: tokio::sync::mpsc::Sender<IpcCommand>,
+}
+
+impl PersistentIpcClientHandle {
+    /// Spawn the persistent IPC client background task.
+    ///
+    /// The task immediately begins trying to connect to the socket at
+    /// `socket_path`. Events are relayed to the Tauri event system via
+    /// `app.emit()`.
+    pub fn spawn<R: Runtime>(socket_path: PathBuf, app: tauri::AppHandle<R>) -> Self {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+
+        tokio::spawn(persistent_client_loop(socket_path, app, cmd_rx));
+
+        Self { cmd_tx }
+    }
+
+    /// Send a Start command through the persistent connection.
+    pub async fn start(&self, config: StartConfig) -> Result<(), ServiceError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(IpcCommand::Start {
+                config,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ServiceError::Ipc("persistent client shut down".into()))?;
+        reply_rx.await.map_err(|_| ServiceError::Ipc("command dropped".into()))?
+    }
+
+    /// Send a Stop command through the persistent connection.
+    pub async fn stop(&self) -> Result<(), ServiceError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(IpcCommand::Stop { reply: reply_tx })
+            .await
+            .map_err(|_| ServiceError::Ipc("persistent client shut down".into()))?;
+        reply_rx.await.map_err(|_| ServiceError::Ipc("command dropped".into()))?
+    }
+
+    /// Query whether the service is running through the persistent connection.
+    pub async fn is_running(&self) -> Result<bool, ServiceError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(IpcCommand::IsRunning { reply: reply_tx })
+            .await
+            .map_err(|_| ServiceError::Ipc("persistent client shut down".into()))?;
+        reply_rx.await.map_err(|_| ServiceError::Ipc("command dropped".into()))?
+    }
+}
+
+/// Background task: maintain a persistent connection with reconnection.
+async fn persistent_client_loop<R: Runtime>(
+    socket_path: PathBuf,
+    app: tauri::AppHandle<R>,
+    mut cmd_rx: tokio::sync::mpsc::Receiver<IpcCommand>,
+) {
+    loop {
+        match UnixStream::connect(&socket_path).await {
+            Ok(stream) => {
+                log::info!("Persistent IPC client connected");
+                if run_persistent_connection(stream, &app, &mut cmd_rx).await.is_err() {
+                    log::info!("Persistent IPC connection lost, reconnecting...");
+                }
+            }
+            Err(_) => {
+                log::debug!("Persistent IPC client: connection failed, retrying...");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+/// Run a single persistent connection until it fails.
+///
+/// Splits the stream into read/write halves:
+/// - A reader task continuously reads frames and relays events to `app.emit()`.
+///   When a response frame arrives, it forwards it via a shared oneshot channel.
+/// - The main loop receives commands from `cmd_rx` and sends requests.
+async fn run_persistent_connection<R: Runtime>(
+    stream: UnixStream,
+    app: &tauri::AppHandle<R>,
+    cmd_rx: &mut tokio::sync::mpsc::Receiver<IpcCommand>,
+) -> Result<(), ServiceError> {
+    let (read_half, mut write_half) = stream.into_split();
+
+    // Shared slot for the reader task to deliver response frames.
+    let response_slot: std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<IpcResponse>>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(None));
+
+    let slot_writer = response_slot.clone();
+    let app_clone = app.clone();
+
+    // Reader task: reads frames and either relays events or delivers responses.
+    let reader_handle = tokio::spawn(async move {
+        let mut read_half = read_half;
+        loop {
+            let frame = match read_frame_from(&mut read_half).await {
+                Ok(Some(f)) => f,
+                Ok(None) => break, // Connection closed
+                Err(_) => break,
+            };
+
+            // Try to decode as IpcResponse first (command reply)
+            if let Ok(resp) = decode_frame::<IpcResponse>(&frame) {
+                let mut slot = slot_writer.lock().await;
+                if let Some(sender) = slot.take() {
+                    let _ = sender.send(resp);
+                }
+                continue;
+            }
+
+            // Try to decode as IpcEvent
+            if let Ok(event) = decode_frame::<IpcEvent>(&frame) {
+                let plugin_event = ipc_event_to_plugin_event(event);
+                let _ = app_clone.emit("background-service://event", plugin_event);
+                continue;
+            }
+
+            // Unknown frame type — skip
+        }
+    });
+
+    // Main loop: receive commands, send requests, wait for responses.
+    let result = loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                let cmd = match cmd {
+                    Some(c) => c,
+                    None => break Err(ServiceError::Ipc("command channel closed".into())),
+                };
+
+                match cmd {
+                    IpcCommand::Start { config, reply } => {
+                        let request = IpcRequest::Start { config };
+                        let rx = prepare_response_slot(&response_slot).await;
+                        if let Err(e) = send_request_to(&mut write_half, &request).await {
+                            let _ = reply.send(Err(e));
+                            break Err(ServiceError::Ipc("send failed".into()));
+                        }
+                        let response = await_response(rx).await;
+                        let result = match response {
+                            Ok(resp) if resp.ok => Ok(()),
+                            Ok(resp) => Err(ServiceError::Ipc(
+                                resp.error.unwrap_or_else(|| "unknown error".into()),
+                            )),
+                            Err(e) => Err(e),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    IpcCommand::Stop { reply } => {
+                        let rx = prepare_response_slot(&response_slot).await;
+                        if let Err(e) = send_request_to(&mut write_half, &IpcRequest::Stop).await {
+                            let _ = reply.send(Err(e));
+                            break Err(ServiceError::Ipc("send failed".into()));
+                        }
+                        let response = await_response(rx).await;
+                        let result = match response {
+                            Ok(resp) if resp.ok => Ok(()),
+                            Ok(resp) => Err(ServiceError::Ipc(
+                                resp.error.unwrap_or_else(|| "unknown error".into()),
+                            )),
+                            Err(e) => Err(e),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    IpcCommand::IsRunning { reply } => {
+                        let rx = prepare_response_slot(&response_slot).await;
+                        if let Err(e) = send_request_to(&mut write_half, &IpcRequest::IsRunning).await {
+                            let _ = reply.send(Err(e));
+                            break Err(ServiceError::Ipc("send failed".into()));
+                        }
+                        let response = await_response(rx).await;
+                        let result = match response {
+                            Ok(resp) if resp.ok => Ok(resp
+                                .data
+                                .and_then(|d| d.get("running").and_then(|v| v.as_bool()))
+                                .unwrap_or(false)),
+                            Ok(resp) => Err(ServiceError::Ipc(
+                                resp.error.unwrap_or_else(|| "unknown error".into()),
+                            )),
+                            Err(e) => Err(e),
+                        };
+                        let _ = reply.send(result);
+                    }
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                // Timeout — check if reader is still alive
+                if reader_handle.is_finished() {
+                    break Err(ServiceError::Ipc("reader task died".into()));
+                }
+            }
+        }
+    };
+
+    reader_handle.abort();
+    result
+}
+
+/// Send an IPC request frame through a write half.
+async fn send_request_to(
+    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    request: &IpcRequest,
+) -> Result<(), ServiceError> {
+    let frame = encode_frame(request).map_err(|e| ServiceError::Ipc(format!("encode: {e}")))?;
+    write_half
+        .write_all(&frame)
+        .await
+        .map_err(|e| ServiceError::Ipc(format!("send: {e}")))?;
+    Ok(())
+}
+
+/// Prepare the shared response slot for an upcoming request.
+///
+/// Creates a oneshot channel and stores the sender in `slot` so the reader
+/// task can deliver the next response. Returns the receiver end.
+///
+/// Must be called **before** sending the request to prevent losing fast
+/// responses that arrive before the slot is set.
+async fn prepare_response_slot(
+    slot: &std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<IpcResponse>>>>,
+) -> tokio::sync::oneshot::Receiver<IpcResponse> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    *slot.lock().await = Some(tx);
+    rx
+}
+
+/// Await a response from the reader task with a timeout.
+///
+/// Returns `Err` if the response doesn't arrive within 10 seconds, preventing
+/// permanent hangs when the connection drops during command processing.
+async fn await_response(
+    rx: tokio::sync::oneshot::Receiver<IpcResponse>,
+) -> Result<IpcResponse, ServiceError> {
+    tokio::select! {
+        response = rx => {
+            response.map_err(|_| ServiceError::Ipc("response channel closed".into()))
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+            Err(ServiceError::Ipc("response timeout".into()))
+        }
+    }
+}
+
+/// Read a single length-prefixed frame from a read half.
+async fn read_frame_from(
+    read_half: &mut tokio::net::unix::OwnedReadHalf,
+) -> Result<Option<Vec<u8>>, ServiceError> {
+    let mut len_buf = [0u8; 4];
+    match read_half.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(ServiceError::Ipc(format!("read frame: {e}"))),
+    }
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_SIZE {
+        return Err(ServiceError::Ipc(format!("frame too large: {len}")));
+    }
+    if len == 0 {
+        return Ok(None);
+    }
+    let mut payload = vec![0u8; len];
+    read_half
+        .read_exact(&mut payload)
+        .await
+        .map_err(|e| ServiceError::Ipc(format!("read payload: {e}")))?;
+    let mut frame = Vec::with_capacity(4 + len);
+    frame.extend_from_slice(&len_buf);
+    frame.extend_from_slice(&payload);
+    Ok(Some(frame))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::desktop::ipc_server::IpcServer;
-    use crate::manager::{manager_loop, ServiceFactory};
-    use crate::models::ServiceContext;
-    use crate::service_trait::BackgroundService;
-    use async_trait::async_trait;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::desktop::test_helpers::{
+        setup_server, setup_server_with_factory, BlockingService, ImmediateSuccessService,
+    };
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
     use tauri::Listener;
-
-    static TEST_ID: AtomicU64 = AtomicU64::new(0);
-
-    fn unique_socket_path() -> PathBuf {
-        let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "ipc-client-test-{}-{id}.sock",
-            std::process::id()
-        ))
-    }
-
-    /// Service that blocks in run() until cancelled.
-    struct BlockingService;
-
-    #[async_trait]
-    impl BackgroundService<tauri::test::MockRuntime> for BlockingService {
-        async fn init(
-            &mut self,
-            _ctx: &ServiceContext<tauri::test::MockRuntime>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-
-        async fn run(
-            &mut self,
-            ctx: &ServiceContext<tauri::test::MockRuntime>,
-        ) -> Result<(), ServiceError> {
-            ctx.shutdown.cancelled().await;
-            Ok(())
-        }
-    }
-
-    /// Service that completes immediately.
-    struct ImmediateSuccessService;
-
-    #[async_trait]
-    impl BackgroundService<tauri::test::MockRuntime> for ImmediateSuccessService {
-        async fn init(
-            &mut self,
-            _ctx: &ServiceContext<tauri::test::MockRuntime>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-
-        async fn run(
-            &mut self,
-            _ctx: &ServiceContext<tauri::test::MockRuntime>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-    }
-
-    fn setup_server_with_factory(
-        factory: ServiceFactory<tauri::test::MockRuntime>,
-    ) -> (PathBuf, tokio_util::sync::CancellationToken) {
-        let path = unique_socket_path();
-        let app = tauri::test::mock_app();
-        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
-        tokio::spawn(manager_loop(cmd_rx, factory, 28.0, 0.0));
-        let server =
-            IpcServer::bind(path.clone(), cmd_tx, app.handle().clone()).unwrap();
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        let s = shutdown.clone();
-        tokio::spawn(async move { server.run(s).await });
-        (path, shutdown)
-    }
-
-    fn setup_server() -> (PathBuf, tokio_util::sync::CancellationToken) {
-        setup_server_with_factory(Box::new(|| Box::new(BlockingService)))
-    }
 
     // -- AC1: Client connects ---------------------------------------------------
 
@@ -564,7 +789,7 @@ mod tests {
     /// Simulates the server side closing the socket mid-connection.
     #[tokio::test]
     async fn ipc_loopback_connection_drop_returns_error() {
-        let path = unique_socket_path();
+        let path = crate::desktop::test_helpers::unique_socket_path();
 
         // Create a minimal "server" that accepts one connection then drops it.
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
@@ -610,5 +835,208 @@ mod tests {
         );
 
         shutdown.cancel();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  PERSISTENT IPC CLIENT TESTS (Step 12)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // -- AC1: Persistent client connects and maintains connection --
+
+    /// Verify the persistent client connects to a running server and can
+    /// forward commands through the persistent connection.
+    #[tokio::test]
+    async fn persistent_client_connects() {
+        let (path, shutdown) = setup_server();
+        let app = tauri::test::mock_app();
+
+        let handle = PersistentIpcClientHandle::spawn(path, app.handle().clone());
+
+        // Give the background task time to connect.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Send a command through the persistent connection.
+        let running = handle.is_running().await;
+        assert!(
+            running.is_ok(),
+            "should get response via persistent connection: {:?}",
+            running.err()
+        );
+        assert!(!running.unwrap(), "should not be running initially");
+
+        shutdown.cancel();
+    }
+
+    // -- AC3: Auto-reconnect --
+
+    /// Verify the persistent client reconnects after the server restarts.
+    #[tokio::test]
+    async fn persistent_client_reconnects() {
+        use crate::desktop::ipc_server::IpcServer;
+        use crate::manager::{manager_loop, ServiceFactory};
+        use tokio_util::sync::CancellationToken;
+
+        // First server
+        let (path, shutdown1) = setup_server();
+        let app = tauri::test::mock_app();
+
+        let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+
+        // Verify connected to first server.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let result = handle.is_running().await;
+        assert!(
+            result.is_ok(),
+            "should connect to first server: {:?}",
+            result.err()
+        );
+
+        // Kill first server and wait for socket cleanup.
+        shutdown1.cancel();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Start second server at the same path.
+        let (cmd_tx2, cmd_rx2) = tokio::sync::mpsc::channel(16);
+        let factory: ServiceFactory<tauri::test::MockRuntime> =
+            Box::new(|| Box::new(BlockingService));
+        tokio::spawn(manager_loop(cmd_rx2, factory, 0.0, 0.0));
+        let server2 = IpcServer::bind(path.clone(), cmd_tx2, app.handle().clone()).unwrap();
+        let shutdown2 = CancellationToken::new();
+        let s2 = shutdown2.clone();
+        tokio::spawn(async move { server2.run(s2).await });
+
+        // Wait for the client to reconnect (1s reconnect delay + margin).
+        let reconnected = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if handle.is_running().await.is_ok() {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            reconnected.is_ok(),
+            "persistent client should reconnect to second server"
+        );
+
+        shutdown2.cancel();
+    }
+
+    // -- AC2: Event relay via app.emit() --
+
+    /// Verify events from the server are relayed to `app.emit()` by the
+    /// persistent client's background reader task.
+    #[tokio::test]
+    async fn event_relay() {
+        let (path, shutdown) =
+            setup_server_with_factory(Box::new(|| Box::new(ImmediateSuccessService)));
+        let app = tauri::test::mock_app();
+
+        let received = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let received_clone = received.clone();
+        app.listen("background-service://event", move |_event| {
+            received_clone.store(true, Ordering::SeqCst);
+        });
+
+        let handle = PersistentIpcClientHandle::spawn(path, app.handle().clone());
+
+        // Start the service — the reader task should relay the Started event.
+        let result = handle.start(StartConfig::default()).await;
+        assert!(result.is_ok(), "start should succeed: {:?}", result.err());
+
+        // Wait for the event to be relayed via app.emit().
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while !received.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for event relay via app.emit()");
+
+        assert!(
+            received.load(Ordering::SeqCst),
+            "event should be relayed through app.emit()"
+        );
+
+        shutdown.cancel();
+    }
+
+    // -- AC4: Start/Stop lifecycle through persistent client --
+
+    /// Verify the full start → running → stop → not-running lifecycle works
+    /// through the persistent IPC client.
+    #[tokio::test]
+    async fn start_stop_lifecycle() {
+        let (path, shutdown) = setup_server();
+        let app = tauri::test::mock_app();
+
+        let handle = PersistentIpcClientHandle::spawn(path, app.handle().clone());
+
+        // Initially not running.
+        let running = handle.is_running().await.unwrap();
+        assert!(!running, "should not be running initially");
+
+        // Start.
+        handle
+            .start(StartConfig::default())
+            .await
+            .expect("start should succeed");
+        let running = handle.is_running().await.unwrap();
+        assert!(running, "should be running after start");
+
+        // Stop.
+        handle.stop().await.expect("stop should succeed");
+        let running = handle.is_running().await.unwrap();
+        assert!(!running, "should not be running after stop");
+
+        shutdown.cancel();
+    }
+
+    // -- Fix: Timeout prevents permanent hang on unresponsive server --
+
+    /// Verify the persistent client returns an error (not hang) when the
+    /// server accepts a connection but never responds to a command.
+    ///
+    /// This is a regression test for the critical bug where `wait_for_response`
+    /// had no timeout — a dropped connection during command processing caused
+    /// both the reconnect loop and the caller to hang permanently.
+    #[tokio::test]
+    async fn persistent_client_timeout_on_unresponsive_server() {
+        let path = crate::desktop::test_helpers::unique_socket_path();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+        // Server that accepts the connection but never responds.
+        let server_handle = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            // Hold connection open — never send a response.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let app = tauri::test::mock_app();
+        let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+
+        // Give the background task time to connect.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Start should timeout and return an error, not hang forever.
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            handle.start(StartConfig::default()),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "start should not hang — expected error, got outer timeout"
+        );
+        let inner = result.unwrap();
+        assert!(
+            inner.is_err(),
+            "start should return error when server is unresponsive"
+        );
+
+        server_handle.abort();
+        let _ = std::fs::remove_file(&path);
     }
 }

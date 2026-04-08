@@ -11,3 +11,6 @@ pub mod ipc;
 pub mod ipc_client;
 pub mod ipc_server;
 pub mod service_manager;
+
+#[cfg(test)]
+pub mod test_helpers;

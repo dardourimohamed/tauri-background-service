@@ -110,14 +110,20 @@ import WebKit
             pendingCancelInvoke = nil
         }
 
-        // Complete whichever task is active with failure
-        currentRefreshTask?.setTaskCompleted(success: false)
-        currentProcessingTask?.setTaskCompleted(success: false)
+        // Complete whichever task is active — nil out BEFORE completing
+        // to prevent double-completion if completeBgTask races in.
+        if let task = currentRefreshTask {
+            currentRefreshTask = nil
+            task.setTaskCompleted(success: false)
+        } else if let task = currentProcessingTask {
+            currentProcessingTask = nil
+            task.setTaskCompleted(success: false)
+        }
 
         // Schedule next tasks
         scheduleNext()
 
-        // Clear all state
+        // Clear remaining state
         cleanup()
     }
 
@@ -139,14 +145,19 @@ import WebKit
                 pendingCancelInvoke = nil
             }
 
-            // Complete whichever task is active with failure
-            currentRefreshTask?.setTaskCompleted(success: false)
-            currentProcessingTask?.setTaskCompleted(success: false)
+            // Complete whichever task is active — nil out BEFORE completing
+            if let task = currentRefreshTask {
+                currentRefreshTask = nil
+                task.setTaskCompleted(success: false)
+            } else if let task = currentProcessingTask {
+                currentProcessingTask = nil
+                task.setTaskCompleted(success: false)
+            }
 
             // Schedule next tasks
             scheduleNext()
 
-            // Clear all state
+            // Clear remaining state
             cleanup()
         }
     }
@@ -175,11 +186,13 @@ import WebKit
         // Extract success value from invoke arguments
         let success = invoke.args(as: [String: Bool].self)?["success"] ?? true
 
-        // Complete whichever task is active
+        // Complete whichever task is active — nil out BEFORE completing
+        // to prevent double-completion. At most one BGTask is active at a time.
         if let task = currentRefreshTask {
+            currentRefreshTask = nil
             task.setTaskCompleted(success: success)
-        }
-        if let task = currentProcessingTask {
+        } else if let task = currentProcessingTask {
+            currentProcessingTask = nil
             task.setTaskCompleted(success: success)
         }
 
@@ -192,7 +205,7 @@ import WebKit
         // Schedule next tasks
         scheduleNext()
 
-        // Clear all state
+        // Clear remaining state
         cleanup()
 
         // Resolve this invoke
@@ -230,15 +243,18 @@ import WebKit
             pendingCancelInvoke = nil
         }
 
-        // If a BGTask is active, complete it and clean up
-        if currentRefreshTask != nil {
-            currentRefreshTask?.setTaskCompleted(success: false)
+        // If a BGTask is active, nil out and complete it — prevents
+        // completeBgTask from double-completing if it races in.
+        if let task = currentRefreshTask {
+            currentRefreshTask = nil
+            task.setTaskCompleted(success: false)
         }
-        if currentProcessingTask != nil {
-            currentProcessingTask?.setTaskCompleted(success: false)
+        if let task = currentProcessingTask {
+            currentProcessingTask = nil
+            task.setTaskCompleted(success: false)
         }
 
-        // Clear all state
+        // Clear remaining state
         cleanup()
 
         invoke.resolve()

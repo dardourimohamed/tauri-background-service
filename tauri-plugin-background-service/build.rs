@@ -1,7 +1,7 @@
 const COMMANDS: &[&str] = &["start", "stop", "is_running"];
 
 #[cfg(feature = "desktop-service")]
-const DESKTOP_COMMANDS: &[&str] = &["install_service", "uninstall_service", "service_status"];
+const DESKTOP_COMMANDS: &[&str] = &["install_service", "uninstall_service"];
 
 fn main() {
     #[allow(unused_mut)]

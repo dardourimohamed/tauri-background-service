@@ -21,10 +21,10 @@ use crate::error::ServiceError;
 use crate::manager::ManagerCommand;
 
 /// Error type for reading IPC frames from a stream.
-#[allow(dead_code)]
+#[non_exhaustive]
 enum ReadError {
     /// An I/O error (connection lost, etc.).
-    Io(std::io::Error),
+    Io(#[allow(dead_code)] std::io::Error),
     /// The JSON payload could not be deserialized as a valid [`IpcRequest`].
     Json(String),
     /// The frame payload exceeded [`MAX_FRAME_SIZE`].
@@ -55,21 +55,36 @@ pub(crate) struct IpcServer<R: Runtime> {
     cmd_tx: mpsc::Sender<ManagerCommand<R>>,
     app: AppHandle<R>,
     event_tx: broadcast::Sender<IpcEvent>,
+    socket_path: PathBuf,
 }
 
-#[allow(dead_code)]
 impl<R: Runtime> IpcServer<R> {
     /// Bind to the given socket path and return a new [`IpcServer`].
     ///
     /// Removes any stale socket file at the given path before binding.
+    /// Refuses to bind if the path is a symlink (prevents symlink race attacks).
     pub fn bind(
         path: PathBuf,
         cmd_tx: mpsc::Sender<ManagerCommand<R>>,
         app: AppHandle<R>,
     ) -> Result<Self, ServiceError> {
-        // Remove stale socket file from a previous run.
-        if path.exists() {
-            std::fs::remove_file(&path).ok();
+        // Check for symlinks (including dangling ones) and remove stale sockets.
+        // Use symlink_metadata directly — do NOT gate on path.exists(), which
+        // follows symlinks and returns false for dangling ones.
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(ServiceError::Ipc(
+                        "refusing to bind: socket path is a symlink".into(),
+                    ));
+                }
+                // Remove stale socket file from a previous run.
+                std::fs::remove_file(&path)
+                    .map_err(|e| ServiceError::Ipc(format!("remove stale socket: {e}")))?;
+            }
+            Err(_) => {
+                // Path does not exist — proceed to bind.
+            }
         }
         let listener = UnixListener::bind(&path)
             .map_err(|e| ServiceError::Ipc(format!("bind failed: {e}")))?;
@@ -79,6 +94,7 @@ impl<R: Runtime> IpcServer<R> {
             cmd_tx,
             app,
             event_tx,
+            socket_path: path,
         })
     }
 
@@ -87,7 +103,10 @@ impl<R: Runtime> IpcServer<R> {
     /// This method consumes `self` and runs until either:
     /// - The `shutdown` token is cancelled (graceful shutdown)
     /// - The listener encounters a fatal error
+    ///
+    /// On exit, the socket file is removed from disk.
     pub async fn run(self, shutdown: CancellationToken) {
+        let socket_path = self.socket_path.clone();
         loop {
             tokio::select! {
                 accept_result = self.listener.accept() => {
@@ -110,6 +129,8 @@ impl<R: Runtime> IpcServer<R> {
                 }
             }
         }
+        // Clean up socket file on shutdown.
+        let _ = std::fs::remove_file(&socket_path);
     }
 }
 
@@ -146,13 +167,47 @@ async fn request_reader(
 /// [`IpcRequest`] frames through an mpsc channel. The main loop uses
 /// `tokio::select!` to handle both incoming requests and broadcast events,
 /// relaying events to the connected client.
-#[allow(dead_code)]
 async fn handle_connection<R: Runtime>(
     stream: tokio::net::UnixStream,
     cmd_tx: mpsc::Sender<ManagerCommand<R>>,
     app: AppHandle<R>,
     event_tx: broadcast::Sender<IpcEvent>,
 ) {
+    // Peer credential check: only same-user connections are allowed.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let peer_uid = unsafe {
+            // SAFETY: getsockopt(SO_PEERCRED) on a connected Unix domain socket
+            // is well-defined POSIX behavior. The fd is valid (just accepted),
+            // the output buffer is a properly aligned &mut libc::ucred, and the
+            // len parameter is initialized to the struct size.
+            let mut creds: libc::ucred = std::mem::zeroed();
+            let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+            let ret = libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut creds as *mut _ as *mut _,
+                &mut len,
+            );
+            if ret == -1 {
+                log::warn!("IPC: failed to get peer credentials, rejecting connection");
+                return;
+            }
+            creds.uid
+        };
+        // SAFETY: getuid() never fails and has no side effects — it returns
+        // the real UID of the calling process per POSIX.
+        let my_uid = unsafe { libc::getuid() };
+        if peer_uid != my_uid {
+            log::warn!(
+                "IPC connection rejected: uid mismatch ({peer_uid} != {my_uid})"
+            );
+            return;
+        }
+    }
+
     let mut event_rx = event_tx.subscribe();
     let (stream_read, mut stream_write) = stream.into_split();
     let (incoming_tx, mut incoming_rx) = mpsc::channel::<Incoming>(16);
@@ -168,7 +223,13 @@ async fn handle_connection<R: Runtime>(
                             request, &cmd_tx, &app,
                         )
                         .await;
-                        let resp_frame = encode_frame(&response);
+                        let resp_frame = match encode_frame(&response) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                log::warn!("IPC encode response error: {e}");
+                                break;
+                            }
+                        };
                         if stream_write.write_all(&resp_frame).await.is_err() {
                             break;
                         }
@@ -182,7 +243,13 @@ async fn handle_connection<R: Runtime>(
                             data: None,
                             error: Some(msg),
                         };
-                        let frame = encode_frame(&resp);
+                        let frame = match encode_frame(&resp) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                log::warn!("IPC encode error response: {e}");
+                                break;
+                            }
+                        };
                         if stream_write.write_all(&frame).await.is_err() {
                             break;
                         }
@@ -193,7 +260,13 @@ async fn handle_connection<R: Runtime>(
             event_result = event_rx.recv() => {
                 match event_result {
                     Ok(event) => {
-                        let frame = encode_frame(&event);
+                        let frame = match encode_frame(&event) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                log::warn!("IPC encode event error: {e}");
+                                break;
+                            }
+                        };
                         if stream_write.write_all(&frame).await.is_err() {
                             break;
                         }
@@ -211,7 +284,6 @@ async fn handle_connection<R: Runtime>(
 }
 
 /// Read a length-prefixed [`IpcRequest`] from the stream.
-#[allow(dead_code)]
 async fn read_request<R: tokio::io::AsyncRead + Unpin>(
     stream: &mut R,
 ) -> Result<IpcRequest, ReadError> {
@@ -233,7 +305,6 @@ async fn read_request<R: tokio::io::AsyncRead + Unpin>(
 }
 
 /// Forward an [`IpcRequest`] to the actor and return the response + optional event.
-#[allow(dead_code)]
 async fn handle_request_with_event<R: Runtime>(
     request: IpcRequest,
     cmd_tx: &mpsc::Sender<ManagerCommand<R>>,
@@ -329,7 +400,6 @@ async fn handle_request_with_event<R: Runtime>(
 }
 
 /// Helper to build an error-only response tuple.
-#[allow(dead_code)]
 fn error_response(msg: &str) -> (IpcResponse, Option<IpcEvent>) {
     (
         IpcResponse {
@@ -344,107 +414,21 @@ fn error_response(msg: &str) -> (IpcResponse, Option<IpcEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manager::{manager_loop, ServiceFactory};
-    use crate::models::ServiceContext;
-    use crate::service_trait::BackgroundService;
-    use async_trait::async_trait;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::desktop::test_helpers::{
+        unique_socket_path, BlockingService, ImmediateSuccessService,
+        setup_server_raw, connect, send_request, read_response, read_event,
+    };
     use std::time::Duration;
     use tokio::net::UnixStream;
 
-    static TEST_ID: AtomicU64 = AtomicU64::new(0);
-
-    fn unique_socket_path() -> PathBuf {
-        let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "ipc-server-test-{}-{id}.sock",
-            std::process::id()
-        ))
-    }
-
-    /// Service that blocks in run() until cancelled.
-    struct BlockingService;
-
-    #[async_trait]
-    impl BackgroundService<tauri::test::MockRuntime> for BlockingService {
-        async fn init(
-            &mut self,
-            _ctx: &ServiceContext<tauri::test::MockRuntime>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-
-        async fn run(
-            &mut self,
-            ctx: &ServiceContext<tauri::test::MockRuntime>,
-        ) -> Result<(), ServiceError> {
-            ctx.shutdown.cancelled().await;
-            Ok(())
-        }
-    }
-
-    /// Service that completes immediately.
-    struct ImmediateSuccessService;
-
-    #[async_trait]
-    impl BackgroundService<tauri::test::MockRuntime> for ImmediateSuccessService {
-        async fn init(
-            &mut self,
-            _ctx: &ServiceContext<tauri::test::MockRuntime>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-
-        async fn run(
-            &mut self,
-            _ctx: &ServiceContext<tauri::test::MockRuntime>,
-        ) -> Result<(), ServiceError> {
-            Ok(())
-        }
-    }
-
     fn setup_server_with_factory(
-        factory: ServiceFactory<tauri::test::MockRuntime>,
+        factory: crate::manager::ServiceFactory<tauri::test::MockRuntime>,
     ) -> (IpcServer<tauri::test::MockRuntime>, PathBuf, CancellationToken) {
-        let path = unique_socket_path();
-        let app = tauri::test::mock_app();
-        let (cmd_tx, cmd_rx) = mpsc::channel(16);
-        tokio::spawn(manager_loop(cmd_rx, factory, 28.0, 0.0));
-        let server =
-            IpcServer::bind(path.clone(), cmd_tx, app.handle().clone()).unwrap();
-        let shutdown = CancellationToken::new();
-        (server, path, shutdown)
+        setup_server_raw(factory)
     }
 
     fn setup_server() -> (IpcServer<tauri::test::MockRuntime>, PathBuf, CancellationToken) {
-        setup_server_with_factory(Box::new(|| Box::new(BlockingService)))
-    }
-
-    async fn connect(path: &PathBuf) -> UnixStream {
-        UnixStream::connect(path).await.unwrap()
-    }
-
-    async fn send_request(stream: &mut UnixStream, request: &IpcRequest) {
-        let frame = encode_frame(request);
-        stream.write_all(&frame).await.unwrap();
-    }
-
-    async fn read_response(stream: &mut UnixStream) -> IpcResponse {
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await.unwrap();
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let mut payload = vec![0u8; len];
-        stream.read_exact(&mut payload).await.unwrap();
-        serde_json::from_slice(&payload).unwrap()
-    }
-
-    async fn read_event(stream: &mut UnixStream) -> IpcEvent {
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await.unwrap();
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let mut payload = vec![0u8; len];
-        stream.read_exact(&mut payload).await.unwrap();
-        serde_json::from_slice(&payload).unwrap()
+        setup_server_raw(Box::new(|| Box::new(BlockingService)))
     }
 
     // ── AC1: Server accepts connections ────────────────────────────────
@@ -765,12 +749,11 @@ mod tests {
         // run() should return cleanly
         let _ = handle.await;
 
-        // New connections should fail (socket is closed)
+        // Socket file should be cleaned up
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let result = UnixStream::connect(&path).await;
         assert!(
-            result.is_err(),
-            "should not connect after graceful shutdown"
+            !path.exists(),
+            "socket file should be removed after graceful shutdown"
         );
     }
 
@@ -827,6 +810,72 @@ mod tests {
         let _ = handle.await;
     }
 
+    // ── Additional: No duplicate events ────────────────────────────────
+
+    /// Verify that the requesting client receives each event exactly once.
+    /// The event is broadcast after the response, and the requesting client
+    /// receives it via the broadcast echo — not duplicated.
+    #[tokio::test]
+    async fn ipc_server_no_duplicate_events() {
+        let (server, path, shutdown) = setup_server();
+        let s = shutdown.clone();
+        let handle = tokio::spawn(async move { server.run(s).await });
+
+        let mut stream = connect(&path).await;
+
+        // Start — response + Started event
+        send_request(
+            &mut stream,
+            &IpcRequest::Start {
+                config: crate::models::StartConfig::default(),
+            },
+        )
+        .await;
+        let resp = read_response(&mut stream).await;
+        assert!(resp.ok);
+
+        // Read the Started event (broadcast echo)
+        let event = tokio::time::timeout(Duration::from_millis(500), read_event(&mut stream))
+            .await
+            .expect("timed out waiting for Started event");
+        assert!(matches!(event, IpcEvent::Started));
+
+        // Verify NO second event arrives (would indicate duplication)
+        let result = tokio::time::timeout(Duration::from_millis(100), read_event(&mut stream)).await;
+        assert!(
+            result.is_err(),
+            "should not receive a duplicate Started event"
+        );
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    // ── Step 7: Peer credential check (same-UID) ────────────────────
+
+    /// Verify that a same-user connection passes the SO_PEERCRED check.
+    /// On Linux this exercises the getsockopt(SO_PEERCRED) path; on other
+    /// platforms the peer-cred block is compiled out so the test just
+    /// confirms the connection works.
+    #[tokio::test]
+    async fn peer_cred_check() {
+        let (server, path, shutdown) = setup_server();
+        let s = shutdown.clone();
+        let handle = tokio::spawn(async move { server.run(s).await });
+
+        // Connect as the same user the server is running as.
+        let mut stream = connect(&path).await;
+
+        // Send a simple IsRunning request — if the peer-cred check rejected
+        // us, the server would have closed the stream and this read would fail.
+        send_request(&mut stream, &IpcRequest::IsRunning).await;
+        let resp = read_response(&mut stream).await;
+        assert!(resp.ok, "same-UID connection should pass peer-cred check");
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
     // ── Additional: Bind removes stale socket ──────────────────────────
 
     #[tokio::test]
@@ -845,5 +894,57 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ── Additional: Bind rejects symlink ────────────────────────────────
+
+    #[tokio::test]
+    async fn ipc_server_bind_rejects_symlink() {
+        let target = unique_socket_path();
+        let link = unique_socket_path();
+
+        // Create a regular file and a symlink pointing to it
+        std::fs::write(&target, b"target").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let app = tauri::test::mock_app();
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+
+        let result = IpcServer::bind(link.clone(), cmd_tx, app.handle().clone());
+        assert!(result.is_err(), "bind should reject symlink");
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("symlink"),
+            "Error should mention symlink: {err}"
+        );
+
+        // Clean up
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&target);
+    }
+
+    #[tokio::test]
+    async fn ipc_server_bind_rejects_dangling_symlink() {
+        let link = unique_socket_path();
+
+        // Create a symlink pointing to a non-existent target (dangling)
+        let target = unique_socket_path();
+        assert!(!target.exists(), "target must not exist for dangling test");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!link.exists(), "dangling symlink must report !exists()");
+
+        let app = tauri::test::mock_app();
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+
+        let result = IpcServer::bind(link.clone(), cmd_tx, app.handle().clone());
+        assert!(result.is_err(), "bind should reject dangling symlink");
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("symlink"),
+            "Error should mention symlink: {err}"
+        );
+
+        // Clean up
+        let _ = std::fs::remove_file(&link);
     }
 }

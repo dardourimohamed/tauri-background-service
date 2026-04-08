@@ -55,13 +55,13 @@ pub enum IpcEvent {
 /// Encode a message into a length-prefixed JSON frame.
 ///
 /// Frame format: `[4-byte big-endian u32 length][JSON payload]`
-pub fn encode_frame<T: Serialize>(msg: &T) -> Vec<u8> {
-    let json = serde_json::to_vec(msg).expect("serialization should not fail");
+pub fn encode_frame<T: Serialize>(msg: &T) -> Result<Vec<u8>, serde_json::Error> {
+    let json = serde_json::to_vec(msg)?;
     let len = json.len() as u32;
     let mut buf = Vec::with_capacity(4 + json.len());
     buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(&json);
-    buf
+    Ok(buf)
 }
 
 /// Decode a length-prefixed JSON frame.
@@ -108,10 +108,23 @@ pub enum FrameError {
 
 /// Derive the IPC socket path for a given service label.
 ///
-/// - Linux/macOS: `/tmp/{label}.sock`
+/// - Linux: `$XDG_RUNTIME_DIR/{label}.sock` (fallback: `/run/user/{uid}/{label}.sock`)
+/// - macOS: `/tmp/{label}.sock`
 /// - Windows: `\\.\pipe\{label}`
+///
+/// # Panics
+///
+/// Panics if the label contains path separators (`/`, `\`) or `..` components,
+/// which could be used for path traversal attacks.
 pub fn socket_path(label: &str) -> std::path::PathBuf {
-    #[cfg(unix)]
+    sanitize_label(label);
+    #[cfg(target_os = "linux")]
+    {
+        let dir = std::env::var("XDG_RUNTIME_DIR")
+            .unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
+        std::path::PathBuf::from(format!("{dir}/{label}.sock"))
+    }
+    #[cfg(target_os = "macos")]
     {
         std::path::PathBuf::from(format!("/tmp/{label}.sock"))
     }
@@ -119,10 +132,26 @@ pub fn socket_path(label: &str) -> std::path::PathBuf {
     {
         std::path::PathBuf::from(format!(r"\\.\pipe\{label}"))
     }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         std::path::PathBuf::from(format!("/tmp/{label}.sock"))
     }
+}
+
+/// Validate that a service label does not contain path traversal characters.
+fn sanitize_label(label: &str) {
+    assert!(
+        !label.is_empty(),
+        "service label must not be empty"
+    );
+    assert!(
+        !label.contains('/') && !label.contains('\\'),
+        "service label must not contain path separators: {label}"
+    );
+    assert!(
+        !label.contains(".."),
+        "service label must not contain '..': {label}"
+    );
 }
 
 #[cfg(test)]
@@ -321,7 +350,7 @@ mod tests {
         let req = IpcRequest::Start {
             config: crate::models::StartConfig::default(),
         };
-        let encoded = encode_frame(&req);
+        let encoded = encode_frame(&req).unwrap();
         let decoded: IpcRequest = decode_frame(&encoded).unwrap();
         match decoded {
             IpcRequest::Start { config } => {
@@ -338,7 +367,7 @@ mod tests {
             data: Some(serde_json::json!(42)),
             error: None,
         };
-        let encoded = encode_frame(&resp);
+        let encoded = encode_frame(&resp).unwrap();
         let decoded: IpcResponse = decode_frame(&encoded).unwrap();
         assert!(decoded.ok);
         assert_eq!(decoded.data.unwrap(), 42);
@@ -349,7 +378,7 @@ mod tests {
         let event = IpcEvent::Stopped {
             reason: "done".into(),
         };
-        let encoded = encode_frame(&event);
+        let encoded = encode_frame(&event).unwrap();
         let decoded: IpcEvent = decode_frame(&encoded).unwrap();
         match decoded {
             IpcEvent::Stopped { reason } => assert_eq!(reason, "done"),
@@ -360,7 +389,7 @@ mod tests {
     #[test]
     fn ipc_frame_length_prefix_is_big_endian() {
         let req = IpcRequest::Stop;
-        let encoded = encode_frame(&req);
+        let encoded = encode_frame(&req).unwrap();
         // First 4 bytes are the length of the JSON payload
         let len = u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
         assert_eq!(len as usize, encoded.len() - 4);
@@ -431,7 +460,27 @@ mod tests {
     #[test]
     fn socket_path_unix_format() {
         let path = socket_path("com.example.svc");
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
+        {
+            // Should be under XDG_RUNTIME_DIR or /run/user/{uid}
+            let path_str = path.to_str().unwrap();
+            assert!(
+                path_str.ends_with("/com.example.svc.sock"),
+                "Expected path ending with /com.example.svc.sock, got: {path_str}"
+            );
+            if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+                assert!(
+                    path_str.starts_with(&xdg),
+                    "Expected path under XDG_RUNTIME_DIR ({xdg}), got: {path_str}"
+                );
+            } else {
+                assert!(
+                    path_str.contains("/run/user/"),
+                    "Expected fallback /run/user/ path, got: {path_str}"
+                );
+            }
+        }
+        #[cfg(target_os = "macos")]
         {
             assert_eq!(path.to_str().unwrap(), "/tmp/com.example.svc.sock");
         }
@@ -442,7 +491,35 @@ mod tests {
         let path = socket_path("my-app");
         #[cfg(unix)]
         {
-            assert!(path.to_str().unwrap().ends_with("my-app.sock"));
+            assert!(
+                path.to_str().unwrap().ends_with("my-app.sock"),
+                "Expected path ending with my-app.sock, got: {:?}",
+                path
+            );
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "path separators")]
+    fn socket_path_rejects_slash_in_label() {
+        let _ = socket_path("../etc/passwd");
+    }
+
+    #[test]
+    #[should_panic(expected = "must not contain '..'")]
+    fn socket_path_rejects_dotdot_in_label() {
+        let _ = socket_path("..");
+    }
+
+    #[test]
+    #[should_panic(expected = "path separators")]
+    fn socket_path_rejects_backslash_in_label() {
+        let _ = socket_path("foo\\bar");
+    }
+
+    #[test]
+    #[should_panic(expected = "empty")]
+    fn socket_path_rejects_empty_label() {
+        let _ = socket_path("");
     }
 }

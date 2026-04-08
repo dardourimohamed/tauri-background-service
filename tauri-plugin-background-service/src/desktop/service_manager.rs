@@ -8,7 +8,6 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
 use service_manager::{
     ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager, ServiceStartCtx,
     ServiceStopCtx, ServiceUninstallCtx,
@@ -16,29 +15,6 @@ use service_manager::{
 use tauri::AppHandle;
 
 use crate::error::ServiceError;
-
-/// Service execution mode on desktop platforms.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(rename_all = "camelCase")]
-#[non_exhaustive]
-pub enum DesktopServiceMode {
-    /// Run the background service in the GUI process (default).
-    #[default]
-    InProcess,
-    /// Run the background service as an OS-level service in a headless process.
-    OsService,
-}
-
-/// Parse a service mode string into a `DesktopServiceMode`.
-///
-/// Returns `InProcess` for any unrecognized value.
-pub fn parse_desktop_service_mode(s: &str) -> DesktopServiceMode {
-    match s {
-        "inProcess" => DesktopServiceMode::InProcess,
-        "osService" => DesktopServiceMode::OsService,
-        _ => DesktopServiceMode::InProcess,
-    }
-}
 
 /// Derive the service label from the app identifier.
 ///
@@ -58,14 +34,12 @@ pub fn derive_service_label<R: tauri::Runtime>(
 /// Manages an OS-level service lifecycle using the `service-manager` crate.
 ///
 /// Used in later steps to install/uninstall/start/stop OS-level services.
-#[allow(dead_code)]
 pub(crate) struct DesktopServiceManager {
     label: ServiceLabel,
     manager: Box<dyn ServiceManager>,
     exec_path: PathBuf,
 }
 
-#[allow(dead_code)]
 impl DesktopServiceManager {
     /// Create a new `DesktopServiceManager` for the given label and executable.
     pub fn new(label: &str, exec_path: PathBuf) -> Result<Self, ServiceError> {
@@ -113,6 +87,7 @@ impl DesktopServiceManager {
     }
 
     /// Start the OS service.
+    #[allow(dead_code)]
     pub fn start(&self) -> Result<(), ServiceError> {
         self.manager
             .start(ServiceStartCtx {
@@ -122,6 +97,7 @@ impl DesktopServiceManager {
     }
 
     /// Stop the OS service.
+    #[allow(dead_code)]
     pub fn stop(&self) -> Result<(), ServiceError> {
         self.manager
             .stop(ServiceStopCtx {
@@ -130,75 +106,11 @@ impl DesktopServiceManager {
             .map_err(|e| ServiceError::Platform(e.to_string()))
     }
 
-    /// Check the OS service status.
-    ///
-    /// Returns a human-readable status string. Since the `service-manager`
-    /// crate does not expose a status query, this checks whether the
-    /// native service manager is available on the system.
-    pub fn status(&self) -> Result<String, ServiceError> {
-        let available = self
-            .manager
-            .available()
-            .map_err(|e| ServiceError::Platform(e.to_string()))?;
-        Ok(if available {
-            "available".to_string()
-        } else {
-            "unavailable".to_string()
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // --- DesktopServiceMode parsing tests ---
-
-    #[test]
-    fn desktop_service_mode_parse_in_process() {
-        assert_eq!(
-            parse_desktop_service_mode("inProcess"),
-            DesktopServiceMode::InProcess
-        );
-    }
-
-    #[test]
-    fn desktop_service_mode_parse_os_service() {
-        assert_eq!(
-            parse_desktop_service_mode("osService"),
-            DesktopServiceMode::OsService
-        );
-    }
-
-    #[test]
-    fn desktop_service_mode_parse_invalid_falls_back() {
-        assert_eq!(
-            parse_desktop_service_mode("garbage"),
-            DesktopServiceMode::InProcess
-        );
-    }
-
-    #[test]
-    fn desktop_service_mode_parse_empty_falls_back() {
-        assert_eq!(
-            parse_desktop_service_mode(""),
-            DesktopServiceMode::InProcess
-        );
-    }
-
-    #[test]
-    fn desktop_service_mode_default_is_in_process() {
-        assert_eq!(DesktopServiceMode::default(), DesktopServiceMode::InProcess);
-    }
-
-    #[test]
-    fn desktop_service_mode_serde_roundtrip() {
-        let mode = DesktopServiceMode::OsService;
-        let json = serde_json::to_string(&mode).unwrap();
-        assert!(json.contains("\"osService\""), "JSON: {json}");
-        let de: DesktopServiceMode = serde_json::from_str(&json).unwrap();
-        assert_eq!(de, DesktopServiceMode::OsService);
-    }
 
     // --- derive_service_label tests ---
 

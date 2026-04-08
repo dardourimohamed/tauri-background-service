@@ -33,6 +33,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "1"
 log = "0.4"
 async-trait = "0.1"
+libc = "0.2"
 service-manager = { version = "0.7", optional = true }
 
 [build-dependencies]

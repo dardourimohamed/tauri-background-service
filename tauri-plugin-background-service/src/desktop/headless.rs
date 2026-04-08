@@ -80,14 +80,9 @@ where
         std::process::exit(1);
     });
 
-    let rt = tokio::runtime::Runtime::new().unwrap_or_else(|e| {
-        eprintln!("error: failed to create tokio runtime: {e}");
-        std::process::exit(1);
-    });
-
-    rt.block_on(async move {
+    tauri::async_runtime::block_on(async move {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
-        tokio::spawn(manager_loop(cmd_rx, Box::new(factory), 28.0, 0.0));
+        tauri::async_runtime::spawn(manager_loop(cmd_rx, Box::new(factory), 0.0, 0.0));
 
         let path = socket_path(&label);
         let server = match IpcServer::bind(path, cmd_tx, app) {

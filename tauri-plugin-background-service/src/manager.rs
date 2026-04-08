@@ -320,11 +320,6 @@ fn handle_start<R: Runtime>(
         // Phase 2: run
         let result = service.run(&ctx).await;
 
-        // Clear token only if generation hasn't advanced.
-        if gen_ref.load(Ordering::Acquire) == my_gen {
-            token_ref.lock().unwrap().take();
-        }
-
         // Emit terminal event.
         match result {
             Ok(()) => {
@@ -346,8 +341,15 @@ fn handle_start<R: Runtime>(
         }
 
         // Fire on_complete callback (captured at spawn time).
+        // MUST fire before clearing the token so that
+        // `wait_until_stopped` only returns after the callback ran.
         if let Some(cb) = captured_callback {
             cb(result.is_ok());
+        }
+
+        // Clear token only if generation hasn't advanced.
+        if gen_ref.load(Ordering::Acquire) == my_gen {
+            token_ref.lock().unwrap().take();
         }
     });
 
