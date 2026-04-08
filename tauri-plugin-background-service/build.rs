@@ -9,20 +9,20 @@ fn main() {
     #[cfg(feature = "desktop-service")]
     all_commands.extend_from_slice(DESKTOP_COMMANDS);
 
-    let result = tauri_plugin::Builder::new(&all_commands)
-        .android_path("android")
-        .ios_path("ios")
-        .try_build();
+    let mut builder = tauri_plugin::Builder::new(&all_commands);
 
-    // Gracefully handle build failures in CI environments (e.g. missing iOS SDK
-    // during cross-compilation checks) without blocking the rest of the build.
-    if let Err(e) = result {
-        // Only fail hard if this looks like a real build (not a bare cargo check in CI).
-        let target = std::env::var("TARGET").unwrap_or_default();
-        let is_ios_ci = target.contains("apple-ios") && std::env::var("CI").is_ok();
-        if !is_ios_ci {
-            panic!("{e:#}");
-        }
-        println!("cargo:warning=tauri-plugin build skipped for CI cross-check: {e:#}");
+    // Only register mobile paths when building through the Tauri CLI, which sets
+    // TAURI_ANDROID_PROJECT_PATH / TAURI_IOS_PROJECT_PATH. Bare cargo invocations
+    // (e.g. `cargo check --target aarch64-apple-ios` in CI) would otherwise trigger
+    // xcodebuild via tauri_utils::build::link_apple_library and panic.
+    if std::env::var("TAURI_ANDROID_PROJECT_PATH").is_ok() {
+        builder = builder.android_path("android");
+    }
+    if std::env::var("TAURI_IOS_PROJECT_PATH").is_ok() {
+        builder = builder.ios_path("ios");
+    }
+
+    if let Err(e) = builder.try_build() {
+        panic!("{e:#}");
     }
 }
