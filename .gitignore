@@ -26,3 +26,5 @@ Thumbs.db
 .ralph/
 .worktrees/
 .eval-sandbox/
+
+test-app/.env

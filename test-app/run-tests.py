@@ -13,6 +13,7 @@ import subprocess
 import sys
 import os
 import json
+from pathlib import Path
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
 
@@ -319,10 +320,22 @@ def main():
             print(f"No matching tests found for: {args.tests}")
             sys.exit(1)
 
+    # Load API key from .env file
+    env_path = Path(__file__).parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+    api_key = os.environ.get("Z_AI_KEY")
+    if not api_key:
+        print("Error: Z_AI_KEY not set. Create test-app/.env with Z_AI_KEY=<key>")
+        sys.exit(1)
+
     # Configure PhoneAgent — CRITICAL: lang="en" on BOTH configs
     model_config = ModelConfig(
         base_url="https://api.z.ai/api/coding/paas/v4",
-        api_key="0441f05e897f433f9ec2a2a1f5886084.5hvbXankfZlgcPTt",
+        api_key=api_key,
         model_name="autoglm-phone-multilingual",
         lang="en",
     )
