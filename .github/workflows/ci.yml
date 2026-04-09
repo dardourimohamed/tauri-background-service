@@ -32,6 +32,17 @@ jobs:
       - run: cargo check --target aarch64-linux-android
         working-directory: tauri-plugin-background-service
 
+  check-ios:
+    name: cargo check (iOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - run: cargo check --target aarch64-apple-ios
+        working-directory: tauri-plugin-background-service
+
   check-desktop-service:
     name: cargo check (desktop-service)
     runs-on: ubuntu-latest
