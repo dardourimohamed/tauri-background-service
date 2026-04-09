@@ -27,6 +27,11 @@ pub enum ServiceError {
     #[error("Platform error: {0}")]
     Platform(String),
 
+    /// A plugin invoke error from `run_mobile_plugin` (mobile only).
+    #[cfg(mobile)]
+    #[error("Plugin invoke error: {0}")]
+    PluginInvoke(String),
+
     /// Failed to install the OS service (desktop only).
     #[cfg(feature = "desktop-service")]
     #[error("Service installation failed: {0}")]

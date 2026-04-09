@@ -34,14 +34,15 @@ impl<R: Runtime> MobileLifecycle<R> {
     ///
     /// `ios_processing_safety_timeout_secs` caps the processing task duration on iOS.
     /// When `None`, the processing task has no safety cap.
-    pub fn start_keepalive(&self, label: &str, foreground_service_type: &str, ios_safety_timeout_secs: Option<f64>, ios_processing_safety_timeout_secs: Option<f64>) -> Result<(), tauri::Error> {
+    pub fn start_keepalive(&self, label: &str, foreground_service_type: &str, ios_safety_timeout_secs: Option<f64>, ios_processing_safety_timeout_secs: Option<f64>) -> Result<(), ServiceError> {
         self.handle
             .run_mobile_plugin::<()>("startKeepalive", StartKeepaliveArgs {
                 label,
                 foreground_service_type,
                 ios_safety_timeout_secs,
                 ios_processing_safety_timeout_secs,
-            })?;
+            })
+            .map_err(|e| ServiceError::PluginInvoke(e.to_string()))?;
         Ok(())
     }
 
@@ -49,17 +50,19 @@ impl<R: Runtime> MobileLifecycle<R> {
     ///
     /// - Android: stops the Foreground Service.
     /// - iOS: cancels the scheduled background task.
-    pub fn stop_keepalive(&self) -> Result<(), tauri::Error> {
-        self.handle.run_mobile_plugin::<()>("stopKeepalive", ())?;
+    pub fn stop_keepalive(&self) -> Result<(), ServiceError> {
+        self.handle.run_mobile_plugin::<()>("stopKeepalive", ())
+            .map_err(|e| ServiceError::PluginInvoke(e.to_string()))?;
         Ok(())
     }
 
     /// Notify the native layer that the background service's `run()` completed.
     ///
     /// - iOS: calls `setTaskCompleted` on the stored BGTask and schedules the next one.
-    pub fn complete_bg_task(&self, success: bool) -> Result<(), tauri::Error> {
+    pub fn complete_bg_task(&self, success: bool) -> Result<(), ServiceError> {
         self.handle
-            .run_mobile_plugin::<()>("completeBgTask", CompleteBgTaskArgs { success })?;
+            .run_mobile_plugin::<()>("completeBgTask", CompleteBgTaskArgs { success })
+            .map_err(|e| ServiceError::PluginInvoke(e.to_string()))?;
         Ok(())
     }
 
@@ -68,8 +71,9 @@ impl<R: Runtime> MobileLifecycle<R> {
     /// Uses the Pending Invoke pattern — the native side stores the Invoke without
     /// resolving it, which blocks this thread via `run_mobile_plugin`'s `rx.recv()`.
     /// When the expiration handler fires, it resolves the Invoke, unblocking this call.
-    pub fn wait_for_cancel(&self) -> Result<(), tauri::Error> {
-        self.handle.run_mobile_plugin::<()>("waitForCancel", ())?;
+    pub fn wait_for_cancel(&self) -> Result<(), ServiceError> {
+        self.handle.run_mobile_plugin::<()>("waitForCancel", ())
+            .map_err(|e| ServiceError::PluginInvoke(e.to_string()))?;
         Ok(())
     }
 
@@ -77,28 +81,31 @@ impl<R: Runtime> MobileLifecycle<R> {
     ///
     /// Reads auto-start config from SharedPreferences via the Kotlin bridge.
     /// Returns `Some(StartConfig)` if auto-start is pending and a label is available.
-    pub fn get_auto_start_config(&self) -> Result<Option<StartConfig>, tauri::Error> {
+    pub fn get_auto_start_config(&self) -> Result<Option<StartConfig>, ServiceError> {
         let config: AutoStartConfig = self
             .handle
-            .run_mobile_plugin("getAutoStartConfig", ())?;
+            .run_mobile_plugin("getAutoStartConfig", ())
+            .map_err(|e| ServiceError::PluginInvoke(e.to_string()))?;
         Ok(config.into_start_config())
     }
 
     /// Clear the auto-start flag after processing.
     ///
     /// Called from the plugin setup closure after auto-start has been handled.
-    pub fn clear_auto_start_config(&self) -> Result<(), tauri::Error> {
+    pub fn clear_auto_start_config(&self) -> Result<(), ServiceError> {
         self.handle
-            .run_mobile_plugin::<()>("clearAutoStartConfig", ())?;
+            .run_mobile_plugin::<()>("clearAutoStartConfig", ())
+            .map_err(|e| ServiceError::PluginInvoke(e.to_string()))?;
         Ok(())
     }
 
     /// Move the Activity to background after auto-start.
     ///
     /// Hides the briefly-visible Activity that was launched by the OS restart.
-    pub fn move_task_to_background(&self) -> Result<(), tauri::Error> {
+    pub fn move_task_to_background(&self) -> Result<(), ServiceError> {
         self.handle
-            .run_mobile_plugin::<()>("moveTaskToBackground", ())?;
+            .run_mobile_plugin::<()>("moveTaskToBackground", ())
+            .map_err(|e| ServiceError::PluginInvoke(e.to_string()))?;
         Ok(())
     }
 }
@@ -113,12 +120,10 @@ struct CompleteBgTaskArgs {
 impl<R: Runtime> MobileKeepalive for MobileLifecycle<R> {
     fn start_keepalive(&self, label: &str, foreground_service_type: &str, ios_safety_timeout_secs: Option<f64>, ios_processing_safety_timeout_secs: Option<f64>) -> Result<(), ServiceError> {
         self.start_keepalive(label, foreground_service_type, ios_safety_timeout_secs, ios_processing_safety_timeout_secs)
-            .map_err(|e| ServiceError::Platform(e.to_string()))
     }
 
     fn stop_keepalive(&self) -> Result<(), ServiceError> {
         self.stop_keepalive()
-            .map_err(|e| ServiceError::Platform(e.to_string()))
     }
 }
 
@@ -130,10 +135,12 @@ impl<R: Runtime> MobileKeepalive for MobileLifecycle<R> {
 pub fn init<R: Runtime, C: serde::de::DeserializeOwned>(
     _app: &AppHandle<R>,
     api: PluginApi<R, C>,
-) -> Result<MobileLifecycle<R>, tauri::Error> {
+) -> Result<MobileLifecycle<R>, ServiceError> {
     #[cfg(target_os = "android")]
-    let handle = api.register_android_plugin("app.tauri.backgroundservice", "BackgroundServicePlugin")?;
+    let handle = api.register_android_plugin("app.tauri.backgroundservice", "BackgroundServicePlugin")
+        .map_err(|e| ServiceError::PluginInvoke(e.to_string()))?;
     #[cfg(target_os = "ios")]
-    let handle = api.register_ios_plugin(init_plugin_background_service)?;
+    let handle = api.register_ios_plugin(crate::init_plugin_background_service)
+        .map_err(|e| ServiceError::PluginInvoke(e.to_string()))?;
     Ok(MobileLifecycle { handle })
 }
