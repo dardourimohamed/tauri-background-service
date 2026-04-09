@@ -191,10 +191,10 @@ pub fn init<R: Runtime, C: serde::de::DeserializeOwned>(
     #[cfg(target_os = "android")]
     let handle = api
         .register_android_plugin("app.tauri.backgroundservice", "BackgroundServicePlugin")
-        .map_err(Into::into)?;
+        .map_err(|e| ServiceError::Platform(e.to_string()))?;
     #[cfg(target_os = "ios")]
     let handle = api
         .register_ios_plugin(crate::init_plugin_background_service)
-        .map_err(Into::into)?;
+        .map_err(|e| ServiceError::Platform(e.to_string()))?;
     Ok(MobileLifecycle { handle })
 }
