@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::Runtime;
 use tauri_plugin_background_service::{
-    BackgroundService, ServiceContext, ServiceError, ServiceFactory,
-    ServiceManagerHandle, StartConfig, manager_loop,
+    manager_loop, BackgroundService, ServiceContext, ServiceError, ServiceFactory,
+    ServiceManagerHandle, StartConfig,
 };
 
 // ─── Test Services ─────────────────────────────────────────────────────
@@ -65,10 +65,7 @@ struct ContextInspectingService {
 }
 
 impl ContextInspectingService {
-    fn new(
-        label: Arc<Mutex<Option<String>>>,
-        fst: Arc<Mutex<Option<String>>>,
-    ) -> Self {
+    fn new(label: Arc<Mutex<Option<String>>>, fst: Arc<Mutex<Option<String>>>) -> Self {
         Self { label, fst }
     }
 }
@@ -92,7 +89,9 @@ fn setup_manager() -> ServiceManagerHandle<tauri::test::MockRuntime> {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
     let handle = ServiceManagerHandle::new(cmd_tx);
     let factory: ServiceFactory<tauri::test::MockRuntime> = Box::new(|| Box::new(BlockingService));
-    tokio::spawn(manager_loop(cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false));
+    tokio::spawn(manager_loop(
+        cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false,
+    ));
     handle
 }
 
@@ -101,7 +100,9 @@ fn setup_manager_with_factory(
 ) -> ServiceManagerHandle<tauri::test::MockRuntime> {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
     let handle = ServiceManagerHandle::new(cmd_tx);
-    tokio::spawn(manager_loop(cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false));
+    tokio::spawn(manager_loop(
+        cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false,
+    ));
     handle
 }
 
@@ -132,10 +133,7 @@ async fn start_from_idle_succeeds() {
         .await;
 
     assert!(result.is_ok(), "start should succeed from idle");
-    assert!(
-        handle.is_running().await,
-        "should be running after start"
-    );
+    assert!(handle.is_running().await, "should be running after start");
 }
 
 // ─── Test 2: Stop from running succeeds ──────────────────────────────
@@ -219,10 +217,7 @@ async fn start_stop_restart_cycle() {
         .await;
 
     assert!(result.is_ok(), "restart should succeed after stop");
-    assert!(
-        handle.is_running().await,
-        "should be running after restart"
-    );
+    assert!(handle.is_running().await, "should be running after restart");
 }
 
 // ─── Test 6: is_running reports correct state ────────────────────────
@@ -241,10 +236,7 @@ async fn is_running_reports_correct_state() {
         .start(app.handle().clone(), StartConfig::default())
         .await
         .unwrap();
-    assert!(
-        handle.is_running().await,
-        "should be running after start"
-    );
+    assert!(handle.is_running().await, "should be running after start");
 
     handle.stop().await.unwrap();
     assert!(
@@ -257,8 +249,7 @@ async fn is_running_reports_correct_state() {
 
 #[tokio::test]
 async fn callback_fires_on_success() {
-    let handle =
-        setup_manager_with_factory(Box::new(|| Box::new(ImmediateSuccessService)));
+    let handle = setup_manager_with_factory(Box::new(|| Box::new(ImmediateSuccessService)));
     let app = tauri::test::mock_app();
 
     let called = Arc::new(AtomicI8::new(-1));
@@ -286,8 +277,7 @@ async fn callback_fires_on_success() {
 
 #[tokio::test]
 async fn callback_fires_on_error() {
-    let handle =
-        setup_manager_with_factory(Box::new(|| Box::new(ImmediateErrorService)));
+    let handle = setup_manager_with_factory(Box::new(|| Box::new(ImmediateErrorService)));
     let app = tauri::test::mock_app();
 
     let called = Arc::new(AtomicI8::new(-1));

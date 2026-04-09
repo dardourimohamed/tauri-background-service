@@ -9,8 +9,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use service_manager::{
-    ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager,
-    ServiceUninstallCtx,
+    ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager, ServiceUninstallCtx,
 };
 use tauri::AppHandle;
 
@@ -85,7 +84,6 @@ impl DesktopServiceManager {
             })
             .map_err(|e| ServiceError::ServiceUninstall(e.to_string()))
     }
-
 }
 
 #[cfg(test)]

@@ -137,10 +137,7 @@ impl<R: Runtime> IpcServer<R> {
 /// Background task that reads [`IpcRequest`] frames from a stream and sends
 /// them through an [`mpsc`] channel. This isolates the non-cancel-safe read
 /// operations from the select loop in [`handle_connection`].
-async fn request_reader(
-    mut stream: tokio::net::unix::OwnedReadHalf,
-    tx: mpsc::Sender<Incoming>,
-) {
+async fn request_reader(mut stream: tokio::net::unix::OwnedReadHalf, tx: mpsc::Sender<Incoming>) {
     loop {
         match read_request(&mut stream).await {
             Ok(req) => {
@@ -201,9 +198,7 @@ async fn handle_connection<R: Runtime>(
         // the real UID of the calling process per POSIX.
         let my_uid = unsafe { libc::getuid() };
         if peer_uid != my_uid {
-            log::warn!(
-                "IPC connection rejected: uid mismatch ({peer_uid} != {my_uid})"
-            );
+            log::warn!("IPC connection rejected: uid mismatch ({peer_uid} != {my_uid})");
             return;
         }
     }
@@ -346,11 +341,7 @@ async fn handle_request_with_event<R: Runtime>(
         }
         IpcRequest::Stop => {
             let (reply, rx) = tokio::sync::oneshot::channel();
-            if cmd_tx
-                .send(ManagerCommand::Stop { reply })
-                .await
-                .is_err()
-            {
+            if cmd_tx.send(ManagerCommand::Stop { reply }).await.is_err() {
                 return error_response("manager shut down");
             }
             match rx.await {
@@ -415,19 +406,27 @@ fn error_response(msg: &str) -> (IpcResponse, Option<IpcEvent>) {
 mod tests {
     use super::*;
     use crate::desktop::test_helpers::{
-        unique_socket_path, BlockingService, ImmediateSuccessService,
-        setup_server_raw, connect, send_request, read_response, read_event,
+        connect, read_event, read_response, send_request, setup_server_raw, unique_socket_path,
+        BlockingService, ImmediateSuccessService,
     };
     use std::time::Duration;
     use tokio::net::UnixStream;
 
     fn setup_server_with_factory(
         factory: crate::manager::ServiceFactory<tauri::test::MockRuntime>,
-    ) -> (IpcServer<tauri::test::MockRuntime>, PathBuf, CancellationToken) {
+    ) -> (
+        IpcServer<tauri::test::MockRuntime>,
+        PathBuf,
+        CancellationToken,
+    ) {
         setup_server_raw(factory)
     }
 
-    fn setup_server() -> (IpcServer<tauri::test::MockRuntime>, PathBuf, CancellationToken) {
+    fn setup_server() -> (
+        IpcServer<tauri::test::MockRuntime>,
+        PathBuf,
+        CancellationToken,
+    ) {
         setup_server_raw(Box::new(|| Box::new(BlockingService)))
     }
 
@@ -525,12 +524,9 @@ mod tests {
         assert!(resp.ok);
 
         // Read event — should be Started (broadcast)
-        let event = tokio::time::timeout(
-            Duration::from_millis(500),
-            read_event(&mut stream),
-        )
-        .await
-        .expect("timed out waiting for Started event");
+        let event = tokio::time::timeout(Duration::from_millis(500), read_event(&mut stream))
+            .await
+            .expect("timed out waiting for Started event");
         assert!(
             matches!(event, IpcEvent::Started),
             "Expected Started event, got {:?}",
@@ -659,22 +655,15 @@ mod tests {
         let resp = read_response(&mut stream).await;
         assert!(resp.ok);
         // Consume the Started event (broadcast)
-        let _ = tokio::time::timeout(
-            Duration::from_millis(500),
-            read_event(&mut stream),
-        )
-        .await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), read_event(&mut stream)).await;
 
         // Stop
         send_request(&mut stream, &IpcRequest::Stop).await;
         let resp = read_response(&mut stream).await;
         assert!(resp.ok);
-        let event = tokio::time::timeout(
-            Duration::from_millis(500),
-            read_event(&mut stream),
-        )
-        .await
-        .expect("timed out waiting for Stopped event");
+        let event = tokio::time::timeout(Duration::from_millis(500), read_event(&mut stream))
+            .await
+            .expect("timed out waiting for Stopped event");
         assert!(
             matches!(event, IpcEvent::Stopped { .. }),
             "Expected Stopped event, got {:?}",
@@ -708,18 +697,10 @@ mod tests {
         assert!(resp1.ok);
 
         // Consume broadcast Started event on client 1
-        let _ = tokio::time::timeout(
-            Duration::from_millis(500),
-            read_event(&mut stream1),
-        )
-        .await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), read_event(&mut stream1)).await;
 
         // Client 2 also receives the broadcast Started event
-        let _ = tokio::time::timeout(
-            Duration::from_millis(500),
-            read_event(&mut stream2),
-        )
-        .await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), read_event(&mut stream2)).await;
 
         // Client 2 can query is_running
         send_request(&mut stream2, &IpcRequest::IsRunning).await;
@@ -781,12 +762,9 @@ mod tests {
         assert!(resp1.ok);
 
         // Client 1 should get Started event (broadcast)
-        let event1 = tokio::time::timeout(
-            Duration::from_millis(500),
-            read_event(&mut stream1),
-        )
-        .await
-        .expect("client 1 timed out waiting for Started event");
+        let event1 = tokio::time::timeout(Duration::from_millis(500), read_event(&mut stream1))
+            .await
+            .expect("client 1 timed out waiting for Started event");
         assert!(
             matches!(event1, IpcEvent::Started),
             "Client 1: expected Started, got {:?}",
@@ -794,12 +772,9 @@ mod tests {
         );
 
         // Client 2 should ALSO get Started event (broadcast)
-        let event2 = tokio::time::timeout(
-            Duration::from_millis(500),
-            read_event(&mut stream2),
-        )
-        .await
-        .expect("client 2 timed out waiting for broadcast Started event");
+        let event2 = tokio::time::timeout(Duration::from_millis(500), read_event(&mut stream2))
+            .await
+            .expect("client 2 timed out waiting for broadcast Started event");
         assert!(
             matches!(event2, IpcEvent::Started),
             "Client 2: expected broadcast Started, got {:?}",
@@ -841,7 +816,8 @@ mod tests {
         assert!(matches!(event, IpcEvent::Started));
 
         // Verify NO second event arrives (would indicate duplication)
-        let result = tokio::time::timeout(Duration::from_millis(100), read_event(&mut stream)).await;
+        let result =
+            tokio::time::timeout(Duration::from_millis(100), read_event(&mut stream)).await;
         assert!(
             result.is_err(),
             "should not receive a duplicate Started event"

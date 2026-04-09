@@ -114,10 +114,7 @@ impl IpcClient {
 
     // -- Private helpers -------------------------------------------------------
 
-    async fn send_and_read(
-        &mut self,
-        request: &IpcRequest,
-    ) -> Result<IpcResponse, ServiceError> {
+    async fn send_and_read(&mut self, request: &IpcRequest) -> Result<IpcResponse, ServiceError> {
         self.send_request(request).await?;
         // The server interleaves IpcResponse and broadcast IpcEvent frames on
         // the same socket. Read frames in a loop until we get one that
@@ -234,7 +231,12 @@ impl PersistentIpcClientHandle {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
         let shutdown = tokio_util::sync::CancellationToken::new();
 
-        tokio::spawn(persistent_client_loop(socket_path, app, cmd_rx, shutdown.clone()));
+        tokio::spawn(persistent_client_loop(
+            socket_path,
+            app,
+            cmd_rx,
+            shutdown.clone(),
+        ));
 
         Self { cmd_tx, shutdown }
     }
@@ -249,7 +251,9 @@ impl PersistentIpcClientHandle {
             })
             .await
             .map_err(|_| ServiceError::Ipc("persistent client shut down".into()))?;
-        reply_rx.await.map_err(|_| ServiceError::Ipc("command dropped".into()))?
+        reply_rx
+            .await
+            .map_err(|_| ServiceError::Ipc("command dropped".into()))?
     }
 
     /// Send a Stop command through the persistent connection.
@@ -259,7 +263,9 @@ impl PersistentIpcClientHandle {
             .send(IpcCommand::Stop { reply: reply_tx })
             .await
             .map_err(|_| ServiceError::Ipc("persistent client shut down".into()))?;
-        reply_rx.await.map_err(|_| ServiceError::Ipc("command dropped".into()))?
+        reply_rx
+            .await
+            .map_err(|_| ServiceError::Ipc("command dropped".into()))?
     }
 
     /// Query whether the service is running through the persistent connection.
@@ -269,7 +275,9 @@ impl PersistentIpcClientHandle {
             .send(IpcCommand::IsRunning { reply: reply_tx })
             .await
             .map_err(|_| ServiceError::Ipc("persistent client shut down".into()))?;
-        reply_rx.await.map_err(|_| ServiceError::Ipc("command dropped".into()))?
+        reply_rx
+            .await
+            .map_err(|_| ServiceError::Ipc("command dropped".into()))?
     }
 }
 
@@ -326,8 +334,9 @@ async fn run_persistent_connection<R: Runtime>(
     let (read_half, mut write_half) = stream.into_split();
 
     // Shared slot for the reader task to deliver response frames.
-    let response_slot: std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<IpcResponse>>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(None));
+    let response_slot: std::sync::Arc<
+        tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<IpcResponse>>>,
+    > = std::sync::Arc::new(tokio::sync::Mutex::new(None));
 
     let slot_writer = response_slot.clone();
     let app_clone = app.clone();
@@ -544,11 +553,7 @@ mod tests {
         let (path, shutdown) = setup_server();
         let mut client = IpcClient::connect(path).await.unwrap();
         let result = client.start(StartConfig::default()).await;
-        assert!(
-            result.is_ok(),
-            "start should succeed: {:?}",
-            result.err()
-        );
+        assert!(result.is_ok(), "start should succeed: {:?}", result.err());
         shutdown.cancel();
     }
 
@@ -560,11 +565,7 @@ mod tests {
         let mut client = IpcClient::connect(path).await.unwrap();
         client.start(StartConfig::default()).await.unwrap();
         let result = client.stop().await;
-        assert!(
-            result.is_ok(),
-            "stop should succeed: {:?}",
-            result.err()
-        );
+        assert!(result.is_ok(), "stop should succeed: {:?}", result.err());
         shutdown.cancel();
     }
 
@@ -708,7 +709,10 @@ mod tests {
         .await
         .expect("timed out waiting for event via listen_events");
 
-        assert!(received.load(Ordering::SeqCst), "should have received event");
+        assert!(
+            received.load(Ordering::SeqCst),
+            "should have received event"
+        );
         shutdown.cancel();
     }
 
@@ -832,9 +836,8 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let path_clone = path.clone();
 
-        let client_handle = tokio::spawn(async move {
-            IpcClient::connect(path_clone).await.unwrap()
-        });
+        let client_handle =
+            tokio::spawn(async move { IpcClient::connect(path_clone).await.unwrap() });
 
         // Accept the connection and immediately drop the server-side stream.
         let (server_stream, _) = listener.accept().await.unwrap();
@@ -936,7 +939,9 @@ mod tests {
         let (cmd_tx2, cmd_rx2) = tokio::sync::mpsc::channel(16);
         let factory: ServiceFactory<tauri::test::MockRuntime> =
             Box::new(|| Box::new(BlockingService));
-        tokio::spawn(manager_loop(cmd_rx2, factory, 0.0, 0.0));
+        tokio::spawn(manager_loop(
+            cmd_rx2, factory, 0.0, 0.0, 0.0, 0.0, false, false,
+        ));
         let server2 = IpcServer::bind(path.clone(), cmd_tx2, app.handle().clone()).unwrap();
         let shutdown2 = CancellationToken::new();
         let s2 = shutdown2.clone();

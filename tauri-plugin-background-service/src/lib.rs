@@ -233,7 +233,11 @@ async fn start<R: Runtime>(app: AppHandle<R>, config: StartConfig) -> Result<(),
     // OS service mode: route through persistent IPC client.
     #[cfg(feature = "desktop-service")]
     if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
-        return ipc_state.client.start(config).await.map_err(|e| e.to_string());
+        return ipc_state
+            .client
+            .start(config)
+            .await
+            .map_err(|e| e.to_string());
     }
 
     // In-process mode (default).
@@ -255,7 +259,9 @@ async fn start<R: Runtime>(app: AppHandle<R>, config: StartConfig) -> Result<(),
         .await
         .map_err(|e| e.to_string())?;
 
-    rx.await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    rx.await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
 
     // iOS: spawn cancel listener after Start succeeds.
     let plugin_config = app.state::<PluginConfig>();
@@ -281,7 +287,9 @@ async fn stop<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    rx.await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())
+    rx.await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -350,11 +358,9 @@ async fn install_service<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
         Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if !stdout.trim().contains("ok") {
-                return Err(
-                    "Binary does not handle --validate-service-install. \
+                return Err("Binary does not handle --validate-service-install. \
                      Ensure headless_main() is called from your app's main()."
-                        .into(),
-                );
+                    .into());
             }
         }
         Ok(Err(e)) => {
@@ -428,7 +434,8 @@ where
             let ios_safety_timeout_secs = config.ios_safety_timeout_secs;
             let ios_processing_safety_timeout_secs = config.ios_processing_safety_timeout_secs;
             let ios_earliest_refresh_begin_minutes = config.ios_earliest_refresh_begin_minutes;
-            let ios_earliest_processing_begin_minutes = config.ios_earliest_processing_begin_minutes;
+            let ios_earliest_processing_begin_minutes =
+                config.ios_earliest_processing_begin_minutes;
             let ios_requires_external_power = config.ios_requires_external_power;
             let ios_requires_network_connectivity = config.ios_requires_network_connectivity;
 
@@ -483,7 +490,9 @@ where
 
                 // Send SetMobile to actor so keepalive is managed by the actor.
                 let mobile_trait: Arc<dyn MobileKeepalive> = lifecycle_arc.clone();
-                if let Err(e) = mobile_cmd_tx.try_send(ManagerCommand::SetMobile { mobile: mobile_trait }) {
+                if let Err(e) = mobile_cmd_tx.try_send(ManagerCommand::SetMobile {
+                    mobile: mobile_trait,
+                }) {
                     log::error!("Failed to send SetMobile command: {e}");
                 }
 
@@ -553,17 +562,11 @@ mod tests {
 
     #[async_trait]
     impl BackgroundService<tauri::Wry> for DummyService {
-        async fn init(
-            &mut self,
-            _ctx: &ServiceContext<tauri::Wry>,
-        ) -> Result<(), ServiceError> {
+        async fn init(&mut self, _ctx: &ServiceContext<tauri::Wry>) -> Result<(), ServiceError> {
             Ok(())
         }
 
-        async fn run(
-            &mut self,
-            _ctx: &ServiceContext<tauri::Wry>,
-        ) -> Result<(), ServiceError> {
+        async fn run(&mut self, _ctx: &ServiceContext<tauri::Wry>) -> Result<(), ServiceError> {
             Ok(())
         }
     }
@@ -602,7 +605,9 @@ mod tests {
 
     /// Verify `init_with_service` returns `TauriPlugin<R>`.
     #[allow(dead_code)]
-    fn init_with_service_returns_tauri_plugin<R: Runtime, S, F>(factory: F) -> TauriPlugin<R, PluginConfig>
+    fn init_with_service_returns_tauri_plugin<R: Runtime, S, F>(
+        factory: F,
+    ) -> TauriPlugin<R, PluginConfig>
     where
         S: BackgroundService<R>,
         F: Fn() -> S + Send + Sync + 'static,
@@ -678,11 +683,8 @@ mod tests {
     ) -> tokio::sync::oneshot::Receiver<bool> {
         let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<bool>();
         tokio::spawn(async move {
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                cmd_rx.recv(),
-            )
-            .await;
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), cmd_rx.recv()).await;
             match result {
                 Ok(Some(ManagerCommand::Stop { reply })) => {
                     let _ = reply.send(Ok(()));
@@ -796,5 +798,4 @@ mod tests {
             "Stop command should NOT be sent on join error"
         );
     }
-
 }

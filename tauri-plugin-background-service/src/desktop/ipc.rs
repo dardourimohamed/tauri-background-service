@@ -263,10 +263,7 @@ mod tests {
             error: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
-        assert!(
-            !json.contains("\"data\""),
-            "Should skip null data: {json}"
-        );
+        assert!(!json.contains("\"data\""), "Should skip null data: {json}");
         assert!(
             !json.contains("\"error\""),
             "Should skip null error: {json}"

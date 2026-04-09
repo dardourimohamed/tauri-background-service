@@ -49,8 +49,7 @@ pub(crate) trait MobileKeepalive: Send + Sync {
 
 /// Type-erased factory: produces a fresh `Box<dyn BackgroundService<R>>` on demand.
 #[doc(hidden)]
-pub type ServiceFactory<R> =
-    Box<dyn Fn() -> Box<dyn BackgroundService<R>> + Send + Sync>;
+pub type ServiceFactory<R> = Box<dyn Fn() -> Box<dyn BackgroundService<R>> + Send + Sync>;
 
 // ─── Commands ───────────────────────────────────────────────────────────
 
@@ -103,18 +102,10 @@ impl<R: Runtime> ServiceManagerHandle<R> {
     ///
     /// Sends a `Start` command to the actor. Returns `AlreadyRunning` if a
     /// service is already active.
-    pub async fn start(
-        &self,
-        app: AppHandle<R>,
-        config: StartConfig,
-    ) -> Result<(), ServiceError> {
+    pub async fn start(&self, app: AppHandle<R>, config: StartConfig) -> Result<(), ServiceError> {
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
-            .send(ManagerCommand::Start {
-                config,
-                reply,
-                app,
-            })
+            .send(ManagerCommand::Start { config, reply, app })
             .await
             .map_err(|_| ServiceError::Runtime("manager actor shut down".into()))?;
         rx.await
@@ -493,10 +484,13 @@ mod tests {
         *mock.last_fst.lock().unwrap() = Some(foreground_service_type.to_string());
         *mock.last_timeout_secs.lock().unwrap() = ios_safety_timeout_secs;
         *mock.last_processing_timeout_secs.lock().unwrap() = ios_processing_safety_timeout_secs;
-        *mock.last_earliest_refresh_begin_minutes.lock().unwrap() = ios_earliest_refresh_begin_minutes;
-        *mock.last_earliest_processing_begin_minutes.lock().unwrap() = ios_earliest_processing_begin_minutes;
+        *mock.last_earliest_refresh_begin_minutes.lock().unwrap() =
+            ios_earliest_refresh_begin_minutes;
+        *mock.last_earliest_processing_begin_minutes.lock().unwrap() =
+            ios_earliest_processing_begin_minutes;
         *mock.last_requires_external_power.lock().unwrap() = ios_requires_external_power;
-        *mock.last_requires_network_connectivity.lock().unwrap() = ios_requires_network_connectivity;
+        *mock.last_requires_network_connectivity.lock().unwrap() =
+            ios_requires_network_connectivity;
         if mock.start_fail {
             return Err(ServiceError::Platform("mock keepalive failure".into()));
         }
@@ -563,7 +557,9 @@ mod tests {
         let handle = ServiceManagerHandle::new(cmd_tx);
         let factory: ServiceFactory<tauri::test::MockRuntime> =
             Box::new(|| Box::new(BlockingService));
-        tokio::spawn(manager_loop(cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false));
+        tokio::spawn(manager_loop(
+            cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false,
+        ));
         handle
     }
 
@@ -596,9 +592,7 @@ mod tests {
         rx.await.unwrap()
     }
 
-    async fn send_is_running(
-        handle: &ServiceManagerHandle<tauri::test::MockRuntime>,
-    ) -> bool {
+    async fn send_is_running(handle: &ServiceManagerHandle<tauri::test::MockRuntime>) -> bool {
         let (tx, rx) = oneshot::channel();
         handle
             .cmd_tx
@@ -761,7 +755,9 @@ mod tests {
     ) -> ServiceManagerHandle<tauri::test::MockRuntime> {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let handle = ServiceManagerHandle::new(cmd_tx);
-        tokio::spawn(manager_loop(cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false));
+        tokio::spawn(manager_loop(
+            cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false,
+        ));
         handle
     }
 
@@ -1137,7 +1133,10 @@ mod tests {
         send_start(&handle, app.handle().clone()).await.unwrap();
 
         let result = send_stop(&handle).await;
-        assert!(result.is_ok(), "stop should succeed even when stop_keepalive fails");
+        assert!(
+            result.is_ok(),
+            "stop should succeed even when stop_keepalive fails"
+        );
 
         assert!(
             !send_is_running(&handle).await,
@@ -1155,7 +1154,9 @@ mod tests {
         let factory: ServiceFactory<tauri::test::MockRuntime> =
             Box::new(|| Box::new(BlockingService));
         // Use a custom timeout value (not default 28.0)
-        tokio::spawn(manager_loop(cmd_rx, factory, 15.0, 0.0, 15.0, 15.0, false, false));
+        tokio::spawn(manager_loop(
+            cmd_rx, factory, 15.0, 0.0, 15.0, 15.0, false, false,
+        ));
 
         let app = tauri::test::mock_app();
 
@@ -1181,7 +1182,9 @@ mod tests {
         let factory: ServiceFactory<tauri::test::MockRuntime> =
             Box::new(|| Box::new(BlockingService));
         // Use a custom processing timeout value
-        tokio::spawn(manager_loop(cmd_rx, factory, 28.0, 60.0, 15.0, 15.0, false, false));
+        tokio::spawn(manager_loop(
+            cmd_rx, factory, 28.0, 60.0, 15.0, 15.0, false, false,
+        ));
 
         let app = tauri::test::mock_app();
 
@@ -1205,7 +1208,9 @@ mod tests {
         let factory: ServiceFactory<tauri::test::MockRuntime> =
             Box::new(|| Box::new(BlockingService));
         // Processing timeout = 0.0 (default, no cap)
-        tokio::spawn(manager_loop(cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false));
+        tokio::spawn(manager_loop(
+            cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false,
+        ));
 
         let app = tauri::test::mock_app();
 
@@ -1215,8 +1220,7 @@ mod tests {
         // Zero timeout should be passed as None
         let timeout = *mock.last_processing_timeout_secs.lock().unwrap();
         assert_eq!(
-            timeout,
-            None,
+            timeout, None,
             "ios_processing_safety_timeout_secs of 0.0 should pass None to mobile"
         );
     }

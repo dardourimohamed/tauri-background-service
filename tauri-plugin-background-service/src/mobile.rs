@@ -47,17 +47,20 @@ impl<R: Runtime> MobileLifecycle<R> {
         ios_requires_network_connectivity: Option<bool>,
     ) -> Result<(), ServiceError> {
         self.handle
-            .run_mobile_plugin::<()>("startKeepalive", StartKeepaliveArgs {
-                label,
-                foreground_service_type,
-                ios_safety_timeout_secs,
-                ios_processing_safety_timeout_secs,
-                ios_earliest_refresh_begin_minutes,
-                ios_earliest_processing_begin_minutes,
-                ios_requires_external_power,
-                ios_requires_network_connectivity,
-            })
-            .map_err(Into::into)?;
+            .run_mobile_plugin::<()>(
+                "startKeepalive",
+                StartKeepaliveArgs {
+                    label,
+                    foreground_service_type,
+                    ios_safety_timeout_secs,
+                    ios_processing_safety_timeout_secs,
+                    ios_earliest_refresh_begin_minutes,
+                    ios_earliest_processing_begin_minutes,
+                    ios_requires_external_power,
+                    ios_requires_network_connectivity,
+                },
+            )
+            .map_err(|e| ServiceError::Platform(e.to_string()))?;
         Ok(())
     }
 
@@ -66,8 +69,9 @@ impl<R: Runtime> MobileLifecycle<R> {
     /// - Android: stops the Foreground Service.
     /// - iOS: cancels the scheduled background task.
     pub fn stop_keepalive(&self) -> Result<(), ServiceError> {
-        self.handle.run_mobile_plugin::<()>("stopKeepalive", ())
-            .map_err(Into::into)?;
+        self.handle
+            .run_mobile_plugin::<()>("stopKeepalive", ())
+            .map_err(|e| ServiceError::Platform(e.to_string()))?;
         Ok(())
     }
 
@@ -77,7 +81,7 @@ impl<R: Runtime> MobileLifecycle<R> {
     pub fn complete_bg_task(&self, success: bool) -> Result<(), ServiceError> {
         self.handle
             .run_mobile_plugin::<()>("completeBgTask", CompleteBgTaskArgs { success })
-            .map_err(Into::into)?;
+            .map_err(|e| ServiceError::Platform(e.to_string()))?;
         Ok(())
     }
 
@@ -87,8 +91,9 @@ impl<R: Runtime> MobileLifecycle<R> {
     /// resolving it, which blocks this thread via `run_mobile_plugin`'s `rx.recv()`.
     /// When the expiration handler fires, it resolves the Invoke, unblocking this call.
     pub fn wait_for_cancel(&self) -> Result<(), ServiceError> {
-        self.handle.run_mobile_plugin::<()>("waitForCancel", ())
-            .map_err(Into::into)?;
+        self.handle
+            .run_mobile_plugin::<()>("waitForCancel", ())
+            .map_err(|e| ServiceError::Platform(e.to_string()))?;
         Ok(())
     }
 
@@ -98,8 +103,9 @@ impl<R: Runtime> MobileLifecycle<R> {
     /// The Swift `cancelCancelListener` method rejects the stored invoke,
     /// which causes `wait_for_cancel` to return `Err` on the blocked thread.
     pub fn cancel_cancel_listener(&self) -> Result<(), ServiceError> {
-        self.handle.run_mobile_plugin::<()>("cancelCancelListener", ())
-            .map_err(Into::into)?;
+        self.handle
+            .run_mobile_plugin::<()>("cancelCancelListener", ())
+            .map_err(|e| ServiceError::Platform(e.to_string()))?;
         Ok(())
     }
 
@@ -111,7 +117,7 @@ impl<R: Runtime> MobileLifecycle<R> {
         let config: AutoStartConfig = self
             .handle
             .run_mobile_plugin("getAutoStartConfig", ())
-            .map_err(Into::into)?;
+            .map_err(|e| ServiceError::Platform(e.to_string()))?;
         Ok(config.into_start_config())
     }
 
@@ -121,7 +127,7 @@ impl<R: Runtime> MobileLifecycle<R> {
     pub fn clear_auto_start_config(&self) -> Result<(), ServiceError> {
         self.handle
             .run_mobile_plugin::<()>("clearAutoStartConfig", ())
-            .map_err(Into::into)?;
+            .map_err(|e| ServiceError::Platform(e.to_string()))?;
         Ok(())
     }
 
@@ -131,7 +137,7 @@ impl<R: Runtime> MobileLifecycle<R> {
     pub fn move_task_to_background(&self) -> Result<(), ServiceError> {
         self.handle
             .run_mobile_plugin::<()>("moveTaskToBackground", ())
-            .map_err(Into::into)?;
+            .map_err(|e| ServiceError::Platform(e.to_string()))?;
         Ok(())
     }
 }
@@ -183,10 +189,12 @@ pub fn init<R: Runtime, C: serde::de::DeserializeOwned>(
     api: PluginApi<R, C>,
 ) -> Result<MobileLifecycle<R>, ServiceError> {
     #[cfg(target_os = "android")]
-    let handle = api.register_android_plugin("app.tauri.backgroundservice", "BackgroundServicePlugin")
+    let handle = api
+        .register_android_plugin("app.tauri.backgroundservice", "BackgroundServicePlugin")
         .map_err(Into::into)?;
     #[cfg(target_os = "ios")]
-    let handle = api.register_ios_plugin(crate::init_plugin_background_service)
+    let handle = api
+        .register_ios_plugin(crate::init_plugin_background_service)
         .map_err(Into::into)?;
     Ok(MobileLifecycle { handle })
 }

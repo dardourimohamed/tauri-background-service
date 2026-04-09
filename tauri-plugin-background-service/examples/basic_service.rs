@@ -30,18 +30,12 @@ impl ExampleService {
 
 #[async_trait]
 impl<R: Runtime> BackgroundService<R> for ExampleService {
-    async fn init(
-        &mut self,
-        _ctx: &ServiceContext<R>,
-    ) -> Result<(), ServiceError> {
+    async fn init(&mut self, _ctx: &ServiceContext<R>) -> Result<(), ServiceError> {
         log::info!("ExampleService initialized");
         Ok(())
     }
 
-    async fn run(
-        &mut self,
-        ctx: &ServiceContext<R>,
-    ) -> Result<(), ServiceError> {
+    async fn run(&mut self, ctx: &ServiceContext<R>) -> Result<(), ServiceError> {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
 
         loop {

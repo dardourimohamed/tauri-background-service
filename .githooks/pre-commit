@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: runs formatting, compilation, and lint checks.
+#
+# Install with:
+#   git config core.hooksPath .githooks
+#
+
+set -euo pipefail
+
+PLUGIN_DIR="tauri-plugin-background-service"
+STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+
+has_rust() { echo "$STAGED" | grep -qE '\.rs$|Cargo\.toml$|Cargo\.lock$'; }
+has_js()   { echo "$STAGED" | grep -qE '\.ts$|\.js$|package\.json$|rollup\.config\.'; }
+
+# --- Rust checks -----------------------------------------------------------
+
+if has_rust; then
+  echo "[pre-commit] Running cargo fmt --check ..."
+  if ! (cd "$PLUGIN_DIR" && cargo fmt --check); then
+    echo ""
+    echo "ERROR: cargo fmt found unformatted code."
+    echo "Fix with: cd $PLUGIN_DIR && cargo fmt"
+    exit 1
+  fi
+
+  echo "[pre-commit] Running cargo check ..."
+  if ! (cd "$PLUGIN_DIR" && cargo check); then
+    echo ""
+    echo "ERROR: cargo check failed. Fix compilation errors before committing."
+    exit 1
+  fi
+
+  echo "[pre-commit] Running cargo check --features desktop-service ..."
+  if ! (cd "$PLUGIN_DIR" && cargo check --features desktop-service); then
+    echo ""
+    echo "ERROR: cargo check --features desktop-service failed."
+    exit 1
+  fi
+
+  echo "[pre-commit] Running cargo clippy ..."
+  if ! (cd "$PLUGIN_DIR" && cargo clippy --features desktop-service -- -D warnings); then
+    echo ""
+    echo "ERROR: cargo clippy found warnings. Fix before committing."
+    exit 1
+  fi
+fi
+
+# --- JS checks -------------------------------------------------------------
+
+if has_js; then
+  echo "[pre-commit] Building guest-js ..."
+  if ! (cd "$PLUGIN_DIR/guest-js" && npm run build); then
+    echo ""
+    echo "ERROR: guest-js build failed."
+    exit 1
+  fi
+fi
+
+echo "[pre-commit] All checks passed."

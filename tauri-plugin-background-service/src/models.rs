@@ -288,7 +288,10 @@ mod tests {
             ..Default::default()
         };
         let json = serde_json::to_string(&config).unwrap();
-        assert!(json.contains("serviceLabel"), "JSON should use camelCase: {json}");
+        assert!(
+            json.contains("serviceLabel"),
+            "JSON should use camelCase: {json}"
+        );
     }
 
     // --- PluginEvent tests ---
@@ -747,7 +750,8 @@ mod tests {
 
     #[test]
     fn plugin_config_custom_scheduling_intervals() {
-        let json = r#"{"iosEarliestRefreshBeginMinutes":30.0,"iosEarliestProcessingBeginMinutes":60.0}"#;
+        let json =
+            r#"{"iosEarliestRefreshBeginMinutes":30.0,"iosEarliestProcessingBeginMinutes":60.0}"#;
         let config: PluginConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.ios_earliest_refresh_begin_minutes, 30.0);
         assert_eq!(config.ios_earliest_processing_begin_minutes, 60.0);

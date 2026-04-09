@@ -47,17 +47,11 @@ mod tests {
 
     #[async_trait]
     impl BackgroundService<tauri::Wry> for DummyService {
-        async fn init(
-            &mut self,
-            _ctx: &ServiceContext<tauri::Wry>,
-        ) -> Result<(), ServiceError> {
+        async fn init(&mut self, _ctx: &ServiceContext<tauri::Wry>) -> Result<(), ServiceError> {
             Ok(())
         }
 
-        async fn run(
-            &mut self,
-            _ctx: &ServiceContext<tauri::Wry>,
-        ) -> Result<(), ServiceError> {
+        async fn run(&mut self, _ctx: &ServiceContext<tauri::Wry>) -> Result<(), ServiceError> {
             Ok(())
         }
     }

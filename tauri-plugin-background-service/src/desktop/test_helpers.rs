@@ -18,10 +18,7 @@ static TEST_ID: AtomicU64 = AtomicU64::new(0);
 /// Generate a unique socket path for testing.
 pub fn unique_socket_path() -> PathBuf {
     let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "ipc-test-{}-{id}.sock",
-        std::process::id()
-    ))
+    std::env::temp_dir().join(format!("ipc-test-{}-{id}.sock", std::process::id()))
 }
 
 /// Service that blocks in `run()` until cancelled.
@@ -74,7 +71,9 @@ pub fn setup_server_with_factory(
     let path = unique_socket_path();
     let app = tauri::test::mock_app();
     let (cmd_tx, cmd_rx) = mpsc::channel(16);
-    tokio::spawn(manager_loop(cmd_rx, factory, 0.0, 0.0));
+    tokio::spawn(manager_loop(
+        cmd_rx, factory, 0.0, 0.0, 0.0, 0.0, false, false,
+    ));
     let server = IpcServer::bind(path.clone(), cmd_tx, app.handle().clone()).unwrap();
     let shutdown = CancellationToken::new();
     let s = shutdown.clone();
@@ -103,7 +102,9 @@ pub fn setup_server_raw(
     let path = unique_socket_path();
     let app = tauri::test::mock_app();
     let (cmd_tx, cmd_rx) = mpsc::channel(16);
-    tokio::spawn(manager_loop(cmd_rx, factory, 0.0, 0.0));
+    tokio::spawn(manager_loop(
+        cmd_rx, factory, 0.0, 0.0, 0.0, 0.0, false, false,
+    ));
     let server = IpcServer::bind(path.clone(), cmd_tx, app.handle().clone()).unwrap();
     let shutdown = CancellationToken::new();
     (server, path, shutdown)
@@ -125,7 +126,9 @@ pub async fn send_request(
 }
 
 /// Read an [`IpcResponse`] from a raw stream.
-pub async fn read_response(stream: &mut tokio::net::UnixStream) -> crate::desktop::ipc::IpcResponse {
+pub async fn read_response(
+    stream: &mut tokio::net::UnixStream,
+) -> crate::desktop::ipc::IpcResponse {
     use tokio::io::AsyncReadExt;
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await.unwrap();

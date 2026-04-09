@@ -46,9 +46,9 @@ fn parse_service_label(args: impl Iterator<Item = String>) -> Result<String, Str
     let mut args = args.skip(1); // skip program name
     while let Some(arg) = args.next() {
         if arg == "--service-label" {
-            let value = args.next().ok_or_else(|| {
-                "--service-label requires a value".to_string()
-            })?;
+            let value = args
+                .next()
+                .ok_or_else(|| "--service-label requires a value".to_string())?;
             if value.is_empty() {
                 return Err("--service-label value must not be empty".to_string());
             }
@@ -98,7 +98,16 @@ where
 
     tauri::async_runtime::block_on(async move {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
-        tauri::async_runtime::spawn(manager_loop(cmd_rx, Box::new(factory), 0.0, 0.0));
+        tauri::async_runtime::spawn(manager_loop(
+            cmd_rx,
+            Box::new(factory),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            false,
+            false,
+        ));
 
         let path = match socket_path(&label) {
             Ok(p) => p,
@@ -171,10 +180,7 @@ mod tests {
 
     #[test]
     fn headless_main_rejects_label_without_value() {
-        let args = vec![
-            "my-app-headless".to_string(),
-            "--service-label".to_string(),
-        ];
+        let args = vec!["my-app-headless".to_string(), "--service-label".to_string()];
         let result = parse_service_label(args.into_iter());
         assert!(result.is_err());
         let err = result.unwrap_err();

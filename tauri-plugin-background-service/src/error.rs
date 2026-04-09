@@ -67,12 +67,18 @@ mod tests {
 
     #[test]
     fn display_already_running() {
-        assert_eq!(ServiceError::AlreadyRunning.to_string(), "Service is already running");
+        assert_eq!(
+            ServiceError::AlreadyRunning.to_string(),
+            "Service is already running"
+        );
     }
 
     #[test]
     fn display_not_running() {
-        assert_eq!(ServiceError::NotRunning.to_string(), "Service is not running");
+        assert_eq!(
+            ServiceError::NotRunning.to_string(),
+            "Service is not running"
+        );
     }
 
     #[test]
