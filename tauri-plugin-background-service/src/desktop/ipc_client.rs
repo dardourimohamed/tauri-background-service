@@ -540,7 +540,7 @@ mod tests {
 
     #[tokio::test]
     async fn ipc_client_connect() {
-        let (path, shutdown) = setup_server();
+        let (path, shutdown, _event_tx) = setup_server();
         let result = IpcClient::connect(path).await;
         assert!(result.is_ok(), "client should connect: {:?}", result.err());
         shutdown.cancel();
@@ -550,7 +550,7 @@ mod tests {
 
     #[tokio::test]
     async fn ipc_client_send_start() {
-        let (path, shutdown) = setup_server();
+        let (path, shutdown, _event_tx) = setup_server();
         let mut client = IpcClient::connect(path).await.unwrap();
         let result = client.start(StartConfig::default()).await;
         assert!(result.is_ok(), "start should succeed: {:?}", result.err());
@@ -561,7 +561,7 @@ mod tests {
 
     #[tokio::test]
     async fn ipc_client_send_stop() {
-        let (path, shutdown) = setup_server();
+        let (path, shutdown, _event_tx) = setup_server();
         let mut client = IpcClient::connect(path).await.unwrap();
         client.start(StartConfig::default()).await.unwrap();
         let result = client.stop().await;
@@ -573,7 +573,7 @@ mod tests {
 
     #[tokio::test]
     async fn ipc_client_is_running() {
-        let (path, shutdown) = setup_server();
+        let (path, shutdown, _event_tx) = setup_server();
         let mut client = IpcClient::connect(path).await.unwrap();
 
         let running = client.is_running().await.unwrap();
@@ -590,10 +590,13 @@ mod tests {
 
     #[tokio::test]
     async fn ipc_client_receive_events() {
-        let (path, shutdown) =
+        let (path, shutdown, event_tx) =
             setup_server_with_factory(Box::new(|| Box::new(ImmediateSuccessService)));
         let mut client = IpcClient::connect(path).await.unwrap();
         client.start(StartConfig::default()).await.unwrap();
+
+        // Simulate relay broadcasting Started
+        let _ = event_tx.send(IpcEvent::Started);
 
         let event = tokio::time::timeout(Duration::from_millis(500), client.read_event())
             .await
@@ -615,7 +618,7 @@ mod tests {
 
     #[tokio::test]
     async fn ipc_client_stop_when_not_running() {
-        let (path, shutdown) = setup_server();
+        let (path, shutdown, _event_tx) = setup_server();
         let mut client = IpcClient::connect(path).await.unwrap();
         let result = client.stop().await;
         assert!(result.is_err(), "stop when not running should fail");
@@ -671,7 +674,7 @@ mod tests {
 
     #[tokio::test]
     async fn ipc_client_full_lifecycle() {
-        let (path, shutdown) = setup_server();
+        let (path, shutdown, _event_tx) = setup_server();
         let mut client = IpcClient::connect(path).await.unwrap();
 
         assert!(!client.is_running().await.unwrap());
@@ -687,7 +690,7 @@ mod tests {
 
     #[tokio::test]
     async fn ipc_client_listen_events() {
-        let (path, shutdown) =
+        let (path, shutdown, event_tx) =
             setup_server_with_factory(Box::new(|| Box::new(ImmediateSuccessService)));
         let app = tauri::test::mock_app();
 
@@ -700,6 +703,9 @@ mod tests {
         let mut client = IpcClient::connect(path).await.unwrap();
         client.start(StartConfig::default()).await.unwrap();
         client.listen_events(app.handle().clone());
+
+        // Simulate relay broadcasting Started
+        let _ = event_tx.send(IpcEvent::Started);
 
         tokio::time::timeout(Duration::from_millis(500), async {
             while !received.load(Ordering::SeqCst) {
@@ -729,7 +735,7 @@ mod tests {
     /// `send_and_read` skips event frames looking for IpcResponse.
     #[tokio::test]
     async fn ipc_loopback_full_lifecycle_with_events() {
-        let (path, shutdown) = setup_server();
+        let (path, shutdown, event_tx) = setup_server();
         let mut client = IpcClient::connect(path).await.unwrap();
 
         // Initially not running
@@ -743,6 +749,9 @@ mod tests {
             .start(StartConfig::default())
             .await
             .expect("start should succeed");
+
+        // Simulate relay broadcasting Started
+        let _ = event_tx.send(IpcEvent::Started);
 
         // Read the Started event BEFORE any other request
         // (send_and_read on subsequent calls would skip buffered events)
@@ -764,6 +773,11 @@ mod tests {
 
         // Stop the service
         client.stop().await.expect("stop should succeed");
+
+        // Simulate relay broadcasting Stopped
+        let _ = event_tx.send(IpcEvent::Stopped {
+            reason: "cancelled".into(),
+        });
 
         // Read the Stopped event BEFORE any other request
         let stopped = tokio::time::timeout(Duration::from_millis(500), client.read_event())
@@ -790,11 +804,12 @@ mod tests {
     /// Verify events streamed through IPC are correctly converted to PluginEvent.
     #[tokio::test]
     async fn ipc_loopback_event_streaming_plugin_event_conversion() {
-        let (path, shutdown) = setup_server();
+        let (path, shutdown, event_tx) = setup_server();
         let mut client = IpcClient::connect(path).await.unwrap();
 
-        // Start — expect Started event → PluginEvent::Started
+        // Start — simulate relay broadcasting Started
         client.start(StartConfig::default()).await.unwrap();
+        let _ = event_tx.send(IpcEvent::Started);
         let started_ipc = tokio::time::timeout(Duration::from_millis(500), client.read_event())
             .await
             .expect("timed out")
@@ -806,8 +821,11 @@ mod tests {
             "Expected PluginEvent::Started, got {started_plugin:?}"
         );
 
-        // Stop — expect Stopped event → PluginEvent::Stopped
+        // Stop — simulate relay broadcasting Stopped
         client.stop().await.unwrap();
+        let _ = event_tx.send(IpcEvent::Stopped {
+            reason: "cancelled".into(),
+        });
         let stopped_ipc = tokio::time::timeout(Duration::from_millis(500), client.read_event())
             .await
             .expect("timed out")
@@ -861,7 +879,7 @@ mod tests {
     /// Verify second start (when already running) returns an IPC error.
     #[tokio::test]
     async fn ipc_loopback_double_start_returns_error() {
-        let (path, shutdown) = setup_server();
+        let (path, shutdown, _event_tx) = setup_server();
         let mut client = IpcClient::connect(path).await.unwrap();
 
         client.start(StartConfig::default()).await.unwrap();
@@ -887,7 +905,7 @@ mod tests {
     /// forward commands through the persistent connection.
     #[tokio::test]
     async fn persistent_client_connects() {
-        let (path, shutdown) = setup_server();
+        let (path, shutdown, _event_tx) = setup_server();
         let app = tauri::test::mock_app();
 
         let handle = PersistentIpcClientHandle::spawn(path, app.handle().clone());
@@ -917,7 +935,7 @@ mod tests {
         use tokio_util::sync::CancellationToken;
 
         // First server
-        let (path, shutdown1) = setup_server();
+        let (path, shutdown1, _event_tx) = setup_server();
         let app = tauri::test::mock_app();
 
         let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
@@ -971,7 +989,7 @@ mod tests {
     /// persistent client's background reader task.
     #[tokio::test]
     async fn event_relay() {
-        let (path, shutdown) =
+        let (path, shutdown, event_tx) =
             setup_server_with_factory(Box::new(|| Box::new(ImmediateSuccessService)));
         let app = tauri::test::mock_app();
 
@@ -986,6 +1004,9 @@ mod tests {
         // Start the service — the reader task should relay the Started event.
         let result = handle.start(StartConfig::default()).await;
         assert!(result.is_ok(), "start should succeed: {:?}", result.err());
+
+        // Simulate relay broadcasting Started
+        let _ = event_tx.send(IpcEvent::Started);
 
         // Wait for the event to be relayed via app.emit().
         tokio::time::timeout(Duration::from_millis(500), async {
@@ -1010,7 +1031,7 @@ mod tests {
     /// through the persistent IPC client.
     #[tokio::test]
     async fn start_stop_lifecycle() {
-        let (path, shutdown) = setup_server();
+        let (path, shutdown, _event_tx) = setup_server();
         let app = tauri::test::mock_app();
 
         let handle = PersistentIpcClientHandle::spawn(path, app.handle().clone());
@@ -1089,7 +1110,7 @@ mod tests {
     /// leaks where the task reconnects forever after the handle is dropped.
     #[tokio::test]
     async fn persistent_client_terminates_on_handle_drop() {
-        let (path, shutdown) = setup_server();
+        let (path, shutdown, _event_tx) = setup_server();
         let app = tauri::test::mock_app();
 
         let handle = PersistentIpcClientHandle::spawn(path, app.handle().clone());

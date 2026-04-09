@@ -22,13 +22,14 @@
 //! }
 //! ```
 
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Listener, Runtime};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::desktop::ipc::socket_path;
+use crate::desktop::ipc::{socket_path, IpcEvent};
 use crate::desktop::ipc_server::IpcServer;
 use crate::manager::manager_loop;
+use crate::models::PluginEvent;
 use crate::service_trait::BackgroundService;
 
 /// Check if `--validate-service-install` is present in CLI arguments.
@@ -116,6 +117,8 @@ where
                 return;
             }
         };
+        // Clone app handle for event relay listener before moving into IpcServer.
+        let app_for_events = app.clone();
         let server = match IpcServer::bind(path, cmd_tx, app) {
             Ok(s) => s,
             Err(e) => {
@@ -123,12 +126,50 @@ where
                 return;
             }
         };
+
+        // Set up event relay: subscribe to actor-emitted PluginEvents on the
+        // headless AppHandle and forward them as IpcEvents to connected clients.
+        // This must happen BEFORE server.run() to avoid missing early events.
+        let event_tx = server.event_sender();
+        let _listener = app_for_events.listen("background-service://event", move |event| {
+            if let Ok(plugin_event) = serde_json::from_str::<PluginEvent>(event.payload()) {
+                let ipc_event = match plugin_event {
+                    PluginEvent::Started => IpcEvent::Started,
+                    PluginEvent::Stopped { reason } => IpcEvent::Stopped { reason },
+                    PluginEvent::Error { message } => IpcEvent::Error { message },
+                };
+                if event_tx.send(ipc_event).is_err() {
+                    log::warn!("headless event relay: broadcast channel closed during shutdown");
+                }
+            }
+        });
+
         let shutdown = CancellationToken::new();
 
-        tokio::select! {
-            _ = server.run(shutdown.clone()) => {}
-            _ = tokio::signal::ctrl_c() => {
-                shutdown.cancel();
+        // Handle both SIGINT (Ctrl+C) and SIGTERM (systemd stop).
+        // SIGTERM is Unix-only; Windows doesn't have it.
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to install SIGTERM handler");
+            tokio::select! {
+                _ = server.run(shutdown.clone()) => {}
+                _ = tokio::signal::ctrl_c() => {
+                    shutdown.cancel();
+                }
+                _ = sigterm.recv() => {
+                    shutdown.cancel();
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                _ = server.run(shutdown.clone()) => {}
+                _ = tokio::signal::ctrl_c() => {
+                    shutdown.cancel();
+                }
             }
         }
     });
@@ -227,5 +268,81 @@ mod tests {
             "com.example.svc".to_string(),
         ];
         assert!(!has_validate_flag(args.into_iter()));
+    }
+
+    // ── Event mapping: PluginEvent → IpcEvent ─────────────────────────────
+
+    #[test]
+    fn plugin_event_maps_to_ipc_event_started() {
+        let plugin_event = PluginEvent::Started;
+        let json = serde_json::to_string(&plugin_event).unwrap();
+        let parsed: PluginEvent = serde_json::from_str(&json).unwrap();
+        let ipc_event: IpcEvent = match parsed {
+            PluginEvent::Started => IpcEvent::Started,
+            PluginEvent::Stopped { reason } => IpcEvent::Stopped { reason },
+            PluginEvent::Error { message } => IpcEvent::Error { message },
+        };
+        assert!(matches!(ipc_event, IpcEvent::Started));
+    }
+
+    #[test]
+    fn plugin_event_maps_to_ipc_event_stopped() {
+        let plugin_event = PluginEvent::Stopped {
+            reason: "completed".into(),
+        };
+        let json = serde_json::to_string(&plugin_event).unwrap();
+        let parsed: PluginEvent = serde_json::from_str(&json).unwrap();
+        let ipc_event: IpcEvent = match parsed {
+            PluginEvent::Started => IpcEvent::Started,
+            PluginEvent::Stopped { reason } => IpcEvent::Stopped { reason },
+            PluginEvent::Error { message } => IpcEvent::Error { message },
+        };
+        match ipc_event {
+            IpcEvent::Stopped { reason } => assert_eq!(reason, "completed"),
+            other => panic!("Expected Stopped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_event_maps_to_ipc_event_error() {
+        let plugin_event = PluginEvent::Error {
+            message: "init failed".into(),
+        };
+        let json = serde_json::to_string(&plugin_event).unwrap();
+        let parsed: PluginEvent = serde_json::from_str(&json).unwrap();
+        let ipc_event: IpcEvent = match parsed {
+            PluginEvent::Started => IpcEvent::Started,
+            PluginEvent::Stopped { reason } => IpcEvent::Stopped { reason },
+            PluginEvent::Error { message } => IpcEvent::Error { message },
+        };
+        match ipc_event {
+            IpcEvent::Error { message } => assert_eq!(message, "init failed"),
+            other => panic!("Expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn event_sender_broadcasts_mapped_events() {
+        use tokio::sync::broadcast;
+
+        let (tx, _) = broadcast::channel::<IpcEvent>(32);
+        // Subscribe BEFORE sending (broadcast only delivers to active receivers)
+        let mut rx = tx.subscribe();
+
+        let plugin_event = PluginEvent::Error {
+            message: "test error".into(),
+        };
+        let ipc_event = match plugin_event {
+            PluginEvent::Started => IpcEvent::Started,
+            PluginEvent::Stopped { reason } => IpcEvent::Stopped { reason },
+            PluginEvent::Error { message } => IpcEvent::Error { message },
+        };
+        let _ = tx.send(ipc_event);
+
+        let received = rx.try_recv().unwrap();
+        match received {
+            IpcEvent::Error { message } => assert_eq!(message, "test error"),
+            other => panic!("Expected Error event, got {other:?}"),
+        }
     }
 }

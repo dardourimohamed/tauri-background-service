@@ -4,9 +4,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
+use crate::desktop::ipc::IpcEvent;
 use crate::desktop::ipc_server::IpcServer;
 use crate::error::ServiceError;
 use crate::manager::{manager_loop, ServiceFactory};
@@ -64,10 +65,13 @@ impl BackgroundService<tauri::test::MockRuntime> for ImmediateSuccessService {
 
 /// Set up an IPC server with a custom service factory.
 ///
-/// Returns `(socket_path, shutdown_token)`.
+/// Returns `(socket_path, shutdown_token, event_sender)`.
+///
+/// The `event_sender` can be used to simulate the event relay from
+/// `headless.rs` by sending `IpcEvent`s to the broadcast channel.
 pub fn setup_server_with_factory(
     factory: ServiceFactory<tauri::test::MockRuntime>,
-) -> (PathBuf, CancellationToken) {
+) -> (PathBuf, CancellationToken, broadcast::Sender<IpcEvent>) {
     let path = unique_socket_path();
     let app = tauri::test::mock_app();
     let (cmd_tx, cmd_rx) = mpsc::channel(16);
@@ -75,16 +79,17 @@ pub fn setup_server_with_factory(
         cmd_rx, factory, 0.0, 0.0, 0.0, 0.0, false, false,
     ));
     let server = IpcServer::bind(path.clone(), cmd_tx, app.handle().clone()).unwrap();
+    let event_tx = server.event_sender();
     let shutdown = CancellationToken::new();
     let s = shutdown.clone();
     tokio::spawn(async move { server.run(s).await });
-    (path, shutdown)
+    (path, shutdown, event_tx)
 }
 
 /// Set up an IPC server with the default [`BlockingService`].
 ///
-/// Returns `(socket_path, shutdown_token)`.
-pub fn setup_server() -> (PathBuf, CancellationToken) {
+/// Returns `(socket_path, shutdown_token, event_sender)`.
+pub fn setup_server() -> (PathBuf, CancellationToken, broadcast::Sender<IpcEvent>) {
     setup_server_with_factory(Box::new(|| Box::new(BlockingService)))
 }
 

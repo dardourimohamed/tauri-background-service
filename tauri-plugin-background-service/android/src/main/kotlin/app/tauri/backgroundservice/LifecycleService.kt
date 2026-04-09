@@ -5,8 +5,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
+import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 
 class LifecycleService : Service() {
@@ -18,10 +21,14 @@ class LifecycleService : Service() {
         const val EXTRA_SERVICE_TYPE = "foregroundServiceType"
         const val ACTION_START = "START"
         const val ACTION_STOP  = "STOP"
+        internal const val RESTART_TIMEOUT_MS = 30_000L
 
         @Volatile var isRunning = false
         @Volatile var autoRestarting = false
     }
+
+    private val restartTimeoutHandler = Handler(Looper.getMainLooper())
+    private var restartTimeoutRunnable: Runnable? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // ACTION_STOP: clear prefs and stop
@@ -44,6 +51,11 @@ class LifecycleService : Service() {
         }
 
         // Normal start
+        // Cancel any pending restart timeout — the plugin has consumed the auto-start.
+        restartTimeoutRunnable?.let {
+            restartTimeoutHandler.removeCallbacks(it)
+            restartTimeoutRunnable = null
+        }
         val label = intent.getStringExtra(EXTRA_LABEL) ?: "Service running"
         val serviceType = intent.getStringExtra(EXTRA_SERVICE_TYPE) ?: "dataSync"
         createChannel()
@@ -54,11 +66,16 @@ class LifecycleService : Service() {
     }
 
     override fun onDestroy() {
+        restartTimeoutRunnable?.let {
+            restartTimeoutHandler.removeCallbacks(it)
+            restartTimeoutRunnable = null
+        }
         isRunning = false
         autoRestarting = false
         super.onDestroy()
     }
 
+    @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
     override fun onTimeout(startId: Int, fgsType: Int) {
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -89,6 +106,12 @@ class LifecycleService : Service() {
         startForegroundTyped(NOTIF_ID, buildNotification("Restarting..."), mapServiceType(serviceType))
         isRunning = true
         autoRestarting = true
+
+        // Self-stop timeout: if the plugin doesn't consume the auto-start within
+        // 30 seconds (e.g. app has no launcher Activity), stop the service to
+        // prevent an orphaned foreground notification.
+        restartTimeoutRunnable = Runnable { stopSelf() }
+        restartTimeoutHandler.postDelayed(restartTimeoutRunnable!!, RESTART_TIMEOUT_MS)
 
         // Launch Activity to reinitialize Tauri runtime
         packageManager.getLaunchIntentForPackage(packageName)?.let { launchIntent ->

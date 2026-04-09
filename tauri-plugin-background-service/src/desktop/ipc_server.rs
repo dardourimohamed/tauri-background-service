@@ -98,6 +98,12 @@ impl<R: Runtime> IpcServer<R> {
         })
     }
 
+    /// Get a clone of the broadcast sender for relaying events from the
+    /// headless actor to connected IPC clients.
+    pub fn event_sender(&self) -> broadcast::Sender<IpcEvent> {
+        self.event_tx.clone()
+    }
+
     /// Run the accept loop, spawning a task per client connection.
     ///
     /// This method consumes `self` and runs until either:
@@ -162,8 +168,9 @@ async fn request_reader(mut stream: tokio::net::unix::OwnedReadHalf, tx: mpsc::S
 ///
 /// Splits the stream into read and write halves. A reader task forwards
 /// [`IpcRequest`] frames through an mpsc channel. The main loop uses
-/// `tokio::select!` to handle both incoming requests and broadcast events,
-/// relaying events to the connected client.
+/// `tokio::select!` to handle both incoming requests and broadcast events.
+/// Events are sourced exclusively from the broadcast channel (fed by the
+/// headless event relay), not from request handling.
 async fn handle_connection<R: Runtime>(
     stream: tokio::net::UnixStream,
     cmd_tx: mpsc::Sender<ManagerCommand<R>>,
@@ -214,7 +221,7 @@ async fn handle_connection<R: Runtime>(
             incoming = incoming_rx.recv() => {
                 match incoming {
                     Some(Incoming::Request(request)) => {
-                        let (response, maybe_event) = handle_request_with_event(
+                        let response = handle_request(
                             request, &cmd_tx, &app,
                         )
                         .await;
@@ -227,9 +234,6 @@ async fn handle_connection<R: Runtime>(
                         };
                         if stream_write.write_all(&resp_frame).await.is_err() {
                             break;
-                        }
-                        if let Some(event) = maybe_event {
-                            let _ = event_tx.send(event);
                         }
                     }
                     Some(Incoming::Error(msg)) => {
@@ -299,12 +303,17 @@ async fn read_request<R: tokio::io::AsyncRead + Unpin>(
     serde_json::from_slice(&payload).map_err(|e| ReadError::Json(e.to_string()))
 }
 
-/// Forward an [`IpcRequest`] to the actor and return the response + optional event.
-async fn handle_request_with_event<R: Runtime>(
+/// Forward an [`IpcRequest`] to the actor and return the response.
+///
+/// Events are NOT emitted here — the headless event relay (in `headless.rs`)
+/// subscribes to actor-emitted `PluginEvent`s and forwards them as `IpcEvent`s
+/// to the broadcast channel. This avoids duplicate events when both this
+/// handler and the relay would send the same event.
+async fn handle_request<R: Runtime>(
     request: IpcRequest,
     cmd_tx: &mpsc::Sender<ManagerCommand<R>>,
     app: &AppHandle<R>,
-) -> (IpcResponse, Option<IpcEvent>) {
+) -> IpcResponse {
     match request {
         IpcRequest::Start { config } => {
             let (reply, rx) = tokio::sync::oneshot::channel();
@@ -320,22 +329,16 @@ async fn handle_request_with_event<R: Runtime>(
                 return error_response("manager shut down");
             }
             match rx.await {
-                Ok(Ok(())) => (
-                    IpcResponse {
-                        ok: true,
-                        data: None,
-                        error: None,
-                    },
-                    Some(IpcEvent::Started),
-                ),
-                Ok(Err(e)) => (
-                    IpcResponse {
-                        ok: false,
-                        data: None,
-                        error: Some(e.to_string()),
-                    },
-                    None,
-                ),
+                Ok(Ok(())) => IpcResponse {
+                    ok: true,
+                    data: None,
+                    error: None,
+                },
+                Ok(Err(e)) => IpcResponse {
+                    ok: false,
+                    data: None,
+                    error: Some(e.to_string()),
+                },
                 Err(_) => error_response("manager dropped reply"),
             }
         }
@@ -345,24 +348,16 @@ async fn handle_request_with_event<R: Runtime>(
                 return error_response("manager shut down");
             }
             match rx.await {
-                Ok(Ok(())) => (
-                    IpcResponse {
-                        ok: true,
-                        data: None,
-                        error: None,
-                    },
-                    Some(IpcEvent::Stopped {
-                        reason: "cancelled".into(),
-                    }),
-                ),
-                Ok(Err(e)) => (
-                    IpcResponse {
-                        ok: false,
-                        data: None,
-                        error: Some(e.to_string()),
-                    },
-                    None,
-                ),
+                Ok(Ok(())) => IpcResponse {
+                    ok: true,
+                    data: None,
+                    error: None,
+                },
+                Ok(Err(e)) => IpcResponse {
+                    ok: false,
+                    data: None,
+                    error: Some(e.to_string()),
+                },
                 Err(_) => error_response("manager dropped reply"),
             }
         }
@@ -376,30 +371,24 @@ async fn handle_request_with_event<R: Runtime>(
                 return error_response("manager shut down");
             }
             match rx.await {
-                Ok(running) => (
-                    IpcResponse {
-                        ok: true,
-                        data: Some(serde_json::json!({ "running": running })),
-                        error: None,
-                    },
-                    None,
-                ),
+                Ok(running) => IpcResponse {
+                    ok: true,
+                    data: Some(serde_json::json!({ "running": running })),
+                    error: None,
+                },
                 Err(_) => error_response("manager dropped reply"),
             }
         }
     }
 }
 
-/// Helper to build an error-only response tuple.
-fn error_response(msg: &str) -> (IpcResponse, Option<IpcEvent>) {
-    (
-        IpcResponse {
-            ok: false,
-            data: None,
-            error: Some(msg.to_string()),
-        },
-        None,
-    )
+/// Helper to build an error-only response.
+fn error_response(msg: &str) -> IpcResponse {
+    IpcResponse {
+        ok: false,
+        data: None,
+        error: Some(msg.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -489,8 +478,6 @@ mod tests {
         .await;
         let resp = read_response(&mut stream).await;
         assert!(resp.ok);
-        // Consume the Started event broadcast
-        let _ = read_event(&mut stream).await;
 
         // Stop
         send_request(&mut stream, &IpcRequest::Stop).await;
@@ -501,12 +488,13 @@ mod tests {
         let _ = handle.await;
     }
 
-    // ── AC4: Events are streamed ───────────────────────────────────────
+    // ── AC4: Events are streamed (via relay broadcast channel) ──────────
 
     #[tokio::test]
     async fn ipc_server_streams_started_event() {
         let (server, path, shutdown) =
             setup_server_with_factory(Box::new(|| Box::new(ImmediateSuccessService)));
+        let event_tx = server.event_sender();
         let s = shutdown.clone();
         let handle = tokio::spawn(async move { server.run(s).await });
 
@@ -523,7 +511,10 @@ mod tests {
         let resp = read_response(&mut stream).await;
         assert!(resp.ok);
 
-        // Read event — should be Started (broadcast)
+        // Simulate event relay broadcasting Started
+        let _ = event_tx.send(IpcEvent::Started);
+
+        // Read event — should be Started (from relay broadcast)
         let event = tokio::time::timeout(Duration::from_millis(500), read_event(&mut stream))
             .await
             .expect("timed out waiting for Started event");
@@ -634,11 +625,12 @@ mod tests {
         let _ = handle.await;
     }
 
-    // ── Additional: Stopped event on stop ──────────────────────────────
+    // ── Additional: Stopped event on stop (via relay) ─────────────────
 
     #[tokio::test]
     async fn ipc_server_stopped_event_on_stop() {
         let (server, path, shutdown) = setup_server();
+        let event_tx = server.event_sender();
         let s = shutdown.clone();
         let handle = tokio::spawn(async move { server.run(s).await });
 
@@ -654,13 +646,20 @@ mod tests {
         .await;
         let resp = read_response(&mut stream).await;
         assert!(resp.ok);
-        // Consume the Started event (broadcast)
+
+        // Simulate relay broadcasting Started
+        let _ = event_tx.send(IpcEvent::Started);
         let _ = tokio::time::timeout(Duration::from_millis(500), read_event(&mut stream)).await;
 
         // Stop
         send_request(&mut stream, &IpcRequest::Stop).await;
         let resp = read_response(&mut stream).await;
         assert!(resp.ok);
+
+        // Simulate relay broadcasting Stopped
+        let _ = event_tx.send(IpcEvent::Stopped {
+            reason: "cancelled".into(),
+        });
         let event = tokio::time::timeout(Duration::from_millis(500), read_event(&mut stream))
             .await
             .expect("timed out waiting for Stopped event");
@@ -679,6 +678,7 @@ mod tests {
     #[tokio::test]
     async fn ipc_server_multiple_clients() {
         let (server, path, shutdown) = setup_server();
+        let event_tx = server.event_sender();
         let s = shutdown.clone();
         let handle = tokio::spawn(async move { server.run(s).await });
 
@@ -696,10 +696,9 @@ mod tests {
         let resp1 = read_response(&mut stream1).await;
         assert!(resp1.ok);
 
-        // Consume broadcast Started event on client 1
+        // Simulate relay broadcasting Started — both clients should receive it
+        let _ = event_tx.send(IpcEvent::Started);
         let _ = tokio::time::timeout(Duration::from_millis(500), read_event(&mut stream1)).await;
-
-        // Client 2 also receives the broadcast Started event
         let _ = tokio::time::timeout(Duration::from_millis(500), read_event(&mut stream2)).await;
 
         // Client 2 can query is_running
@@ -738,11 +737,12 @@ mod tests {
         );
     }
 
-    // ── TR6: Events broadcast to all connected clients ─────────────────
+    // ── TR6: Events broadcast to all connected clients (via relay) ──────
 
     #[tokio::test]
     async fn ipc_server_broadcasts_events_to_all_clients() {
         let (server, path, shutdown) = setup_server();
+        let event_tx = server.event_sender();
         let s = shutdown.clone();
         let handle = tokio::spawn(async move { server.run(s).await });
 
@@ -760,6 +760,9 @@ mod tests {
         .await;
         let resp1 = read_response(&mut stream1).await;
         assert!(resp1.ok);
+
+        // Simulate relay broadcasting Started — all clients should receive it
+        let _ = event_tx.send(IpcEvent::Started);
 
         // Client 1 should get Started event (broadcast)
         let event1 = tokio::time::timeout(Duration::from_millis(500), read_event(&mut stream1))
@@ -788,17 +791,18 @@ mod tests {
     // ── Additional: No duplicate events ────────────────────────────────
 
     /// Verify that the requesting client receives each event exactly once.
-    /// The event is broadcast after the response, and the requesting client
-    /// receives it via the broadcast echo — not duplicated.
+    /// Events come from the relay broadcast channel only — not from the
+    /// request handler.
     #[tokio::test]
     async fn ipc_server_no_duplicate_events() {
         let (server, path, shutdown) = setup_server();
+        let event_tx = server.event_sender();
         let s = shutdown.clone();
         let handle = tokio::spawn(async move { server.run(s).await });
 
         let mut stream = connect(&path).await;
 
-        // Start — response + Started event
+        // Start — only response, no event from handler
         send_request(
             &mut stream,
             &IpcRequest::Start {
@@ -809,7 +813,9 @@ mod tests {
         let resp = read_response(&mut stream).await;
         assert!(resp.ok);
 
-        // Read the Started event (broadcast echo)
+        // Relay broadcasts exactly one Started event
+        let _ = event_tx.send(IpcEvent::Started);
+
         let event = tokio::time::timeout(Duration::from_millis(500), read_event(&mut stream))
             .await
             .expect("timed out waiting for Started event");
@@ -922,5 +928,67 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_file(&link);
+    }
+
+    // ── L1 fix: No duplicate events when relay is active ─────────────────
+
+    /// Verify that when the event relay (as in headless_main) sends events,
+    /// clients receive each event exactly once — not twice.
+    ///
+    /// In production, the headless event relay subscribes to PluginEvents
+    /// and forwards them as IpcEvents. If handle_request_with_event also
+    /// broadcasts, clients see duplicates.
+    #[tokio::test]
+    async fn ipc_server_no_duplicate_events_with_relay() {
+        let (server, path, shutdown) = setup_server();
+        let event_tx = server.event_sender();
+        let s = shutdown.clone();
+        let handle = tokio::spawn(async move { server.run(s).await });
+
+        let mut stream = connect(&path).await;
+
+        // Simulate the event relay from headless.rs: it also sends Started
+        // to the broadcast channel when the actor emits a PluginEvent.
+        let relay_tx = event_tx.clone();
+        tokio::spawn(async move {
+            // Small delay to simulate the relay firing after the service
+            // task emits PluginEvent::Started (which happens after init()
+            // succeeds, slightly after the command response).
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = relay_tx.send(IpcEvent::Started);
+        });
+
+        // Client sends Start
+        send_request(
+            &mut stream,
+            &IpcRequest::Start {
+                config: crate::models::StartConfig::default(),
+            },
+        )
+        .await;
+        let resp = read_response(&mut stream).await;
+        assert!(resp.ok, "Start should succeed");
+
+        // Read first Started event
+        let event1 = tokio::time::timeout(Duration::from_millis(500), read_event(&mut stream))
+            .await
+            .expect("timed out waiting for first Started event");
+        assert!(
+            matches!(event1, IpcEvent::Started),
+            "Expected Started, got {event1:?}"
+        );
+
+        // Verify NO second event arrives within a generous window.
+        // If handle_request_with_event also broadcasts Started, we'd see a
+        // duplicate here.
+        let result =
+            tokio::time::timeout(Duration::from_millis(200), read_event(&mut stream)).await;
+        assert!(
+            result.is_err(),
+            "should not receive a duplicate Started event when relay is active"
+        );
+
+        shutdown.cancel();
+        let _ = handle.await;
     }
 }

@@ -1,0 +1,113 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.50s
+     Running unittests src/lib.rs (target/debug/deps/tauri_plugin_background_service-90735922dd546a80)
+
+running 82 tests
+test error::tests::display_not_running ... ok
+test error::tests::display_runtime ... ok
+test error::tests::display_platform ... ok
+test error::tests::convert_to_invoke_error_via_serialize ... ok
+test error::tests::clone_roundtrip ... ok
+test error::tests::display_already_running ... ok
+test error::tests::serde_roundtrip_init ... ok
+test error::tests::display_init ... ok
+test error::tests::serde_roundtrip_already_running ... ok
+test manager::tests::ios_processing_timeout_passed_to_mobile ... ok
+test manager::tests::ios_processing_timeout_zero_passes_as_none ... ok
+test manager::tests::no_callback_no_panic ... ok
+test manager::tests::callback_fires_on_error ... ok
+test manager::tests::start_from_idle ... ok
+test manager::tests::callback_fires_on_success ... ok
+test manager::tests::double_start_returns_already_running ... ok
+test manager::tests::start_stop_restart_cycle ... ok
+test manager::tests::stop_from_running ... ok
+test manager::tests::stop_keepalive_called_on_stop ... ok
+test models::tests::auto_start_config_pending_no_label_returns_none ... ok
+test models::tests::auto_start_config_null_service_type_uses_default ... ok
+test models::tests::auto_start_config_pending_with_label_returns_start_config ... ok
+test models::tests::auto_start_config_with_service_type_preserves_it ... ok
+test models::tests::auto_start_config_not_pending_returns_none ... ok
+test models::tests::auto_start_config_without_service_type_uses_default ... ok
+test manager::tests::stop_when_not_running_returns_not_running ... ok
+test models::tests::plugin_config_custom_ios_safety_timeout ... ok
+test manager::tests::stop_keepalive_failure_does_not_propagate ... ok
+test models::tests::plugin_config_cancel_timeout_serde_roundtrip ... ok
+test models::tests::plugin_config_default_impl ... ok
+test models::tests::plugin_config_custom_cancel_timeout ... ok
+test models::tests::plugin_config_custom_processing_options ... ok
+test models::tests::plugin_config_custom_scheduling_intervals ... ok
+test models::tests::plugin_config_default_cancel_timeout ... ok
+test models::tests::plugin_config_default_ios_safety_timeout ... ok
+test models::tests::plugin_config_earliest_processing_default ... ok
+test models::tests::plugin_config_earliest_refresh_default ... ok
+test models::tests::plugin_config_processing_timeout_custom ... ok
+test models::tests::plugin_config_processing_timeout_default ... ok
+test models::tests::plugin_config_requires_external_power_default ... ok
+test models::tests::plugin_config_requires_network_connectivity_default ... ok
+test models::tests::plugin_config_processing_timeout_serde_roundtrip ... ok
+test models::tests::plugin_event_error_json_keys_camel_case ... ok
+test models::tests::plugin_config_serde_roundtrip_preserves_value ... ok
+test models::tests::plugin_event_error_serde_roundtrip ... ok
+test models::tests::plugin_event_started_serde_roundtrip ... ok
+test models::tests::plugin_event_stopped_json_keys_camel_case ... ok
+test models::tests::plugin_event_stopped_serde_roundtrip ... ok
+test models::tests::start_config_custom_label ... ok
+test models::tests::start_config_custom_service_type ... ok
+test models::tests::start_config_default_label ... ok
+test models::tests::start_config_default_service_type ... ok
+test models::tests::plugin_event_tagged_json_format ... ok
+test models::tests::start_config_deserialize_missing_field_uses_default ... ok
+test models::tests::start_config_deserialize_missing_service_type ... ok
+test models::tests::start_config_serde_roundtrip_custom ... ok
+test models::tests::start_config_serde_roundtrip_default ... ok
+test models::tests::start_config_deserialize_special_use ... ok
+test models::tests::start_config_serde_roundtrip_service_type ... ok
+test models::tests::start_config_json_key_is_camel_case ... ok
+test models::tests::start_keepalive_args_camel_case_keys ... ok
+test models::tests::start_config_unrecognized_type_passes_through ... ok
+test models::tests::start_keepalive_args_no_processing_timeout ... ok
+test models::tests::start_keepalive_args_processing_options ... ok
+test models::tests::start_config_json_key_is_camel_case_service_type ... ok
+test tests::factory_produces_boxed_service ... ok
+test models::tests::start_keepalive_args_processing_timeout ... ok
+test models::tests::start_keepalive_args_scheduling_intervals ... ok
+test models::tests::start_keepalive_args_without_timeout ... ok
+test tests::handle_factory_creates_fresh_instances ... ok
+test models::tests::start_keepalive_args_with_timeout ... ok
+test tests::service_manager_handle_constructs ... ok
+test tests::cancel_listener_rejected_invoke_no_stop ... ok
+test tests::cancel_listener_resolved_invoke_sends_stop ... ok
+test tests::cancel_listener_join_error_no_stop ... ok
+test tests::cancel_listener_timeout_sends_stop ... ok
+test manager::tests::start_keepalive_called_on_start ... ok
+test manager::tests::ios_safety_timeout_passed_to_mobile ... ok
+test manager::tests::start_keepalive_failure_rollback ... ok
+test manager::tests::callback_captured_at_spawn_time ... ok
+test manager::tests::generation_guard_prevents_stale_cleanup ... ok
+test manager::tests::callback_fires_on_init_failure ... ok
+
+test result: ok. 82 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/integration.rs (target/debug/deps/integration-4298a4b965157bb2)
+
+running 10 tests
+test trait_implementation_compiles ... ok
+test stop_when_not_running_returns_not_running ... ok
+test double_start_returns_already_running ... ok
+test stop_from_running_succeeds ... ok
+test start_stop_restart_cycle ... ok
+test start_from_idle_succeeds ... ok
+test service_context_fields_populated ... ok
+test is_running_reports_correct_state ... ok
+test callback_fires_on_error ... ok
+test callback_fires_on_success ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+   Doc-tests tauri_plugin_background_service
+
+running 2 tests
+test src/lib.rs - (line 15) ... ignored
+test src/lib.rs - init_with_service (line 401) ... ignored
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
