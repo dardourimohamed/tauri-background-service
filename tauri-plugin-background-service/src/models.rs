@@ -73,6 +73,28 @@ pub struct PluginConfig {
     #[serde(default = "default_ios_processing_safety_timeout_secs")]
     pub ios_processing_safety_timeout_secs: f64,
 
+    /// iOS `BGAppRefreshTask` earliest begin date in minutes from now.
+    /// Default: 15.0. Controls how soon iOS can launch the refresh task.
+    #[serde(default = "default_ios_earliest_refresh_begin_minutes")]
+    pub ios_earliest_refresh_begin_minutes: f64,
+
+    /// iOS `BGProcessingTask` earliest begin date in minutes from now.
+    /// Default: 15.0. Controls how soon iOS can launch the processing task.
+    #[serde(default = "default_ios_earliest_processing_begin_minutes")]
+    pub ios_earliest_processing_begin_minutes: f64,
+
+    /// iOS `BGProcessingTask` requires external power.
+    /// Default: false. When true, iOS only launches the processing task
+    /// while the device is connected to power.
+    #[serde(default)]
+    pub ios_requires_external_power: bool,
+
+    /// iOS `BGProcessingTask` requires network connectivity.
+    /// Default: false. When true, iOS only launches the processing task
+    /// when the device has network access.
+    #[serde(default)]
+    pub ios_requires_network_connectivity: bool,
+
     /// Desktop service mode: "inProcess" (default) or "osService".
     /// Controls whether the background service runs in-process or as a
     /// registered OS service/daemon.
@@ -97,6 +119,14 @@ fn default_ios_cancel_listener_timeout_secs() -> u64 {
 
 fn default_ios_processing_safety_timeout_secs() -> f64 {
     0.0
+}
+
+fn default_ios_earliest_refresh_begin_minutes() -> f64 {
+    15.0
+}
+
+fn default_ios_earliest_processing_begin_minutes() -> f64 {
+    15.0
 }
 
 #[cfg(feature = "desktop-service")]
@@ -132,6 +162,10 @@ impl Default for PluginConfig {
             ios_safety_timeout_secs: default_ios_safety_timeout(),
             ios_cancel_listener_timeout_secs: default_ios_cancel_listener_timeout_secs(),
             ios_processing_safety_timeout_secs: default_ios_processing_safety_timeout_secs(),
+            ios_earliest_refresh_begin_minutes: default_ios_earliest_refresh_begin_minutes(),
+            ios_earliest_processing_begin_minutes: default_ios_earliest_processing_begin_minutes(),
+            ios_requires_external_power: false,
+            ios_requires_network_connectivity: false,
             #[cfg(feature = "desktop-service")]
             desktop_service_mode: default_desktop_service_mode(),
             #[cfg(feature = "desktop-service")]
@@ -156,6 +190,18 @@ pub(crate) struct StartKeepaliveArgs<'a> {
     /// When `Some(positive)`, caps the processing task duration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ios_processing_safety_timeout_secs: Option<f64>,
+    /// iOS BGAppRefreshTask earliest begin date in minutes. Only sent to iOS; `None` omits the key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ios_earliest_refresh_begin_minutes: Option<f64>,
+    /// iOS BGProcessingTask earliest begin date in minutes. Only sent to iOS; `None` omits the key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ios_earliest_processing_begin_minutes: Option<f64>,
+    /// iOS BGProcessingTask requires external power. Only sent to iOS; `None` omits the key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ios_requires_external_power: Option<bool>,
+    /// iOS BGProcessingTask requires network connectivity. Only sent to iOS; `None` omits the key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ios_requires_network_connectivity: Option<bool>,
 }
 
 /// Auto-start config returned by the Kotlin bridge.
@@ -452,11 +498,19 @@ mod tests {
             ios_safety_timeout_secs: 30.0,
             ios_cancel_listener_timeout_secs: 14400,
             ios_processing_safety_timeout_secs: 0.0,
+            ios_earliest_refresh_begin_minutes: 20.0,
+            ios_earliest_processing_begin_minutes: 30.0,
+            ios_requires_external_power: true,
+            ios_requires_network_connectivity: true,
             ..Default::default()
         };
         let json = serde_json::to_string(&config).unwrap();
         let de: PluginConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(de.ios_safety_timeout_secs, 30.0);
+        assert_eq!(de.ios_earliest_refresh_begin_minutes, 20.0);
+        assert_eq!(de.ios_earliest_processing_begin_minutes, 30.0);
+        assert!(de.ios_requires_external_power);
+        assert!(de.ios_requires_network_connectivity);
     }
 
     #[test]
@@ -482,9 +536,7 @@ mod tests {
     #[test]
     fn plugin_config_cancel_timeout_serde_roundtrip() {
         let config = PluginConfig {
-            ios_safety_timeout_secs: 28.0,
             ios_cancel_listener_timeout_secs: 3600,
-            ios_processing_safety_timeout_secs: 0.0,
             ..Default::default()
         };
         let json = serde_json::to_string(&config).unwrap();
@@ -511,8 +563,6 @@ mod tests {
     #[test]
     fn plugin_config_processing_timeout_serde_roundtrip() {
         let config = PluginConfig {
-            ios_safety_timeout_secs: 28.0,
-            ios_cancel_listener_timeout_secs: 14400,
             ios_processing_safety_timeout_secs: 120.0,
             ..Default::default()
         };
@@ -530,6 +580,10 @@ mod tests {
             foreground_service_type: "dataSync",
             ios_safety_timeout_secs: Some(15.0),
             ios_processing_safety_timeout_secs: None,
+            ios_earliest_refresh_begin_minutes: None,
+            ios_earliest_processing_begin_minutes: None,
+            ios_requires_external_power: None,
+            ios_requires_network_connectivity: None,
         };
         let json = serde_json::to_string(&args).unwrap();
         assert!(
@@ -545,6 +599,10 @@ mod tests {
             foreground_service_type: "dataSync",
             ios_safety_timeout_secs: None,
             ios_processing_safety_timeout_secs: None,
+            ios_earliest_refresh_begin_minutes: None,
+            ios_earliest_processing_begin_minutes: None,
+            ios_requires_external_power: None,
+            ios_requires_network_connectivity: None,
         };
         let json = serde_json::to_string(&args).unwrap();
         assert!(
@@ -560,6 +618,10 @@ mod tests {
             foreground_service_type: "dataSync",
             ios_safety_timeout_secs: None,
             ios_processing_safety_timeout_secs: Some(60.0),
+            ios_earliest_refresh_begin_minutes: None,
+            ios_earliest_processing_begin_minutes: None,
+            ios_requires_external_power: None,
+            ios_requires_network_connectivity: None,
         };
         let json = serde_json::to_string(&args).unwrap();
         assert!(
@@ -575,6 +637,10 @@ mod tests {
             foreground_service_type: "dataSync",
             ios_safety_timeout_secs: None,
             ios_processing_safety_timeout_secs: None,
+            ios_earliest_refresh_begin_minutes: None,
+            ios_earliest_processing_begin_minutes: None,
+            ios_requires_external_power: None,
+            ios_requires_network_connectivity: None,
         };
         let json = serde_json::to_string(&args).unwrap();
         assert!(
@@ -590,6 +656,10 @@ mod tests {
             foreground_service_type: "specialUse",
             ios_safety_timeout_secs: None,
             ios_processing_safety_timeout_secs: None,
+            ios_earliest_refresh_begin_minutes: None,
+            ios_earliest_processing_begin_minutes: None,
+            ios_requires_external_power: None,
+            ios_requires_network_connectivity: None,
         };
         let json = serde_json::to_string(&args).unwrap();
         assert!(json.contains("\"label\""), "label: {json}");
@@ -597,6 +667,98 @@ mod tests {
             json.contains("\"foregroundServiceType\""),
             "foregroundServiceType: {json}"
         );
+    }
+
+    #[test]
+    fn start_keepalive_args_scheduling_intervals() {
+        let args = StartKeepaliveArgs {
+            label: "Test",
+            foreground_service_type: "dataSync",
+            ios_safety_timeout_secs: None,
+            ios_processing_safety_timeout_secs: None,
+            ios_earliest_refresh_begin_minutes: Some(30.0),
+            ios_earliest_processing_begin_minutes: Some(60.0),
+            ios_requires_external_power: None,
+            ios_requires_network_connectivity: None,
+        };
+        let json = serde_json::to_string(&args).unwrap();
+        assert!(
+            json.contains("\"iosEarliestRefreshBeginMinutes\":30.0"),
+            "JSON should contain iosEarliestRefreshBeginMinutes: {json}"
+        );
+        assert!(
+            json.contains("\"iosEarliestProcessingBeginMinutes\":60.0"),
+            "JSON should contain iosEarliestProcessingBeginMinutes: {json}"
+        );
+    }
+
+    #[test]
+    fn start_keepalive_args_processing_options() {
+        let args = StartKeepaliveArgs {
+            label: "Test",
+            foreground_service_type: "dataSync",
+            ios_safety_timeout_secs: None,
+            ios_processing_safety_timeout_secs: None,
+            ios_earliest_refresh_begin_minutes: None,
+            ios_earliest_processing_begin_minutes: None,
+            ios_requires_external_power: Some(true),
+            ios_requires_network_connectivity: Some(true),
+        };
+        let json = serde_json::to_string(&args).unwrap();
+        assert!(
+            json.contains("\"iosRequiresExternalPower\":true"),
+            "JSON should contain iosRequiresExternalPower: {json}"
+        );
+        assert!(
+            json.contains("\"iosRequiresNetworkConnectivity\":true"),
+            "JSON should contain iosRequiresNetworkConnectivity: {json}"
+        );
+    }
+
+    // --- PluginConfig new scheduling fields tests ---
+
+    #[test]
+    fn plugin_config_earliest_refresh_default() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.ios_earliest_refresh_begin_minutes, 15.0);
+    }
+
+    #[test]
+    fn plugin_config_earliest_processing_default() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.ios_earliest_processing_begin_minutes, 15.0);
+    }
+
+    #[test]
+    fn plugin_config_requires_external_power_default() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.ios_requires_external_power);
+    }
+
+    #[test]
+    fn plugin_config_requires_network_connectivity_default() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.ios_requires_network_connectivity);
+    }
+
+    #[test]
+    fn plugin_config_custom_scheduling_intervals() {
+        let json = r#"{"iosEarliestRefreshBeginMinutes":30.0,"iosEarliestProcessingBeginMinutes":60.0}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.ios_earliest_refresh_begin_minutes, 30.0);
+        assert_eq!(config.ios_earliest_processing_begin_minutes, 60.0);
+    }
+
+    #[test]
+    fn plugin_config_custom_processing_options() {
+        let json = r#"{"iosRequiresExternalPower":true,"iosRequiresNetworkConnectivity":true}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert!(config.ios_requires_external_power);
+        assert!(config.ios_requires_network_connectivity);
     }
 
     // --- PluginConfig desktop fields tests (feature-gated) ---

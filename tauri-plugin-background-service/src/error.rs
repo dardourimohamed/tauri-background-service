@@ -48,6 +48,19 @@ pub enum ServiceError {
     Ipc(String),
 }
 
+// ─── From impls for mobile error types ─────────────────────────────────────
+
+/// Convert `PluginInvokeError` into `ServiceError::PluginInvoke`.
+///
+/// This allows mobile call sites to use `.map_err(Into::into)` instead of
+/// `.map_err(|e| ServiceError::PluginInvoke(e.to_string()))`.
+#[cfg(mobile)]
+impl From<tauri::plugin::mobile::PluginInvokeError> for ServiceError {
+    fn from(e: tauri::plugin::mobile::PluginInvokeError) -> Self {
+        Self::PluginInvoke(e.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

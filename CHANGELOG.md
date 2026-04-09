@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- iOS safety timer now resolves (instead of rejecting) the pending cancel invoke, enabling graceful Rust-side shutdown on the most common `BGAppRefreshTask` path
+- iOS `completeBgTask` no longer spuriously reschedules `BGTaskScheduler` requests after explicit stop or expiration
+- iOS cancel listener now sends `Stop` on timeout (default: 4h) and unblocks the `spawn_blocking` thread via new `cancelCancelListener` native method
+- iOS `BGTaskScheduler` submission errors are now logged instead of silently swallowed
+
+### Added
+
+- `From<PluginInvokeError> for ServiceError` conversion for cleaner mobile error handling
+- Configurable iOS `BGAppRefreshTask` and `BGProcessingTask` scheduling intervals via `PluginConfig` (`ios_earliest_refresh_begin_minutes`, `ios_earliest_processing_begin_minutes`)
+- Configurable iOS `BGProcessingTask` requirements (`ios_requires_external_power`, `ios_requires_network_connectivity`) via `PluginConfig`
+- `cancel_cancel_listener` bridge method to unblock the Rust cancel listener thread on timeout
+- Rust cancel listener integration tests covering resolved, rejected, timeout, and join-error paths
+- Documented required iOS `Info.plist` entries (`BGTaskSchedulerPermittedIdentifiers`, `UIBackgroundModes`) in Swift doc comments and Rust module docs
+
 ## [0.1.0] - 2026-04-04
 
 ### Added

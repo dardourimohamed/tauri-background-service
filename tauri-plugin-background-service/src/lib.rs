@@ -45,6 +45,27 @@
 //! | iOS | `BGTaskScheduler` with expiration handler | No |
 //! | Desktop | Plain `tokio::spawn` | No |
 //!
+//! ## iOS Setup
+//!
+//! Add the following entries to your app's `Info.plist`:
+//!
+//! ```xml
+//! <key>BGTaskSchedulerPermittedIdentifiers</key>
+//! <array>
+//!     <string>$(BUNDLE_ID).bg-refresh</string>
+//!     <string>$(BUNDLE_ID).bg-processing</string>
+//! </array>
+//!
+//! <key>UIBackgroundModes</key>
+//! <array>
+//!     <string>background-processing</string>
+//!     <string>background-fetch</string>
+//! </array>
+//! ```
+//!
+//! Replace `$(BUNDLE_ID)` with your app's bundle identifier.
+//! Without these entries, `BGTaskScheduler.shared.submit(_:)` will throw at runtime.
+//!
 //! See the [project repository](https://github.com/dardourimohamed/tauri-background-service)
 //! for detailed platform guides and API documentation.
 
@@ -134,28 +155,71 @@ async fn ios_set_on_complete_callback<R: Runtime>(_app: &AppHandle<R>) -> Result
 ///
 /// Must be called **after** `Start` succeeds so the service is running when the
 /// cancel listener begins waiting. Sends `Stop` to the actor when cancelled.
+///
+/// Three outcomes:
+/// 1. **Resolved invoke** (safety timer / expiration) → `Ok(())` → send `Stop`.
+/// 2. **Timeout** (default: 4h) → call `cancel_cancel_listener` to unblock the
+///    thread, then send `Stop`.
+/// 3. **Rejected invoke** (explicit stop / natural completion) → `Err` → no action.
+///
+/// Core cancel listener logic, extracted for testability.
+///
+/// - `wait_fn`: blocking function simulating `wait_for_cancel` (returns `Ok(())` on resolve,
+///   `Err` on reject).
+/// - `cancel_fn`: called on timeout to unblock the `wait_fn` thread.
+/// - `cmd_tx`: channel to send `Stop` command on resolve/timeout.
+/// - `timeout_secs`: how long to wait before treating the listener as timed out.
+///
+/// Returns `true` if a `Stop` was sent, `false` otherwise.
+#[allow(dead_code)] // used on iOS + in tests
+async fn run_cancel_listener<R: Runtime>(
+    wait_fn: Box<dyn FnOnce() -> Result<(), ServiceError> + Send>,
+    cancel_fn: Box<dyn FnOnce() + Send>,
+    cmd_tx: tokio::sync::mpsc::Sender<ManagerCommand<R>>,
+    timeout_secs: u64,
+) -> bool {
+    let handle = tokio::task::spawn_blocking(wait_fn);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), handle).await;
+    match result {
+        // Resolved invoke (safety timer or expiration) → graceful shutdown
+        Ok(Ok(Ok(()))) | Err(_) => {
+            // On timeout, unblock the spawn_blocking thread first.
+            if result.is_err() {
+                cancel_fn();
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = cmd_tx.send(ManagerCommand::Stop { reply: tx }).await;
+            let _ = rx.await;
+            true
+        }
+        // Rejected invoke (explicit stop or natural completion) → no action
+        _ => false,
+    }
+}
+
 #[cfg(target_os = "ios")]
 fn ios_spawn_cancel_listener<R: Runtime>(app: &AppHandle<R>, timeout_secs: u64) {
     let mobile = app.state::<Arc<MobileLifecycle<R>>>();
     let mobile_handle = mobile.handle.clone();
+    let mobile_handle_for_cancel = mobile.handle.clone();
     let manager = app.state::<ServiceManagerHandle<R>>();
     let cmd_tx = manager.cmd_tx.clone();
 
     tokio::spawn(async move {
-        let handle = tokio::task::spawn_blocking(move || {
+        let wait_fn = Box::new(move || {
             let mob = MobileLifecycle {
                 handle: mobile_handle,
             };
             mob.wait_for_cancel()
         });
-        // Safety timeout prevents indefinite thread leaks if iOS
-        // invoke is never resolved (e.g., iOS kills the app).
-        let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), handle).await;
-        if let Ok(Ok(Ok(()))) = result {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let _ = cmd_tx.send(ManagerCommand::Stop { reply: tx }).await;
-            let _ = rx.await;
-        }
+        let cancel_fn = Box::new(move || {
+            let cancel_mob = MobileLifecycle {
+                handle: mobile_handle_for_cancel,
+            };
+            let _ = cancel_mob.cancel_cancel_listener();
+        });
+        // Ignore result — the listener fires-and-forgets.
+        let _ = run_cancel_listener(wait_fn, cancel_fn, cmd_tx, timeout_secs).await;
     });
 }
 
@@ -363,6 +427,10 @@ where
 
             let ios_safety_timeout_secs = config.ios_safety_timeout_secs;
             let ios_processing_safety_timeout_secs = config.ios_processing_safety_timeout_secs;
+            let ios_earliest_refresh_begin_minutes = config.ios_earliest_refresh_begin_minutes;
+            let ios_earliest_processing_begin_minutes = config.ios_earliest_processing_begin_minutes;
+            let ios_requires_external_power = config.ios_requires_external_power;
+            let ios_requires_network_connectivity = config.ios_requires_network_connectivity;
 
             // Mode dispatch: spawn in-process actor or configure IPC for OS service.
             #[cfg(feature = "desktop-service")]
@@ -386,6 +454,10 @@ where
                     factory,
                     ios_safety_timeout_secs,
                     ios_processing_safety_timeout_secs,
+                    ios_earliest_refresh_begin_minutes,
+                    ios_earliest_processing_begin_minutes,
+                    ios_requires_external_power,
+                    ios_requires_network_connectivity,
                 ));
             }
 
@@ -397,6 +469,10 @@ where
                     factory,
                     ios_safety_timeout_secs,
                     ios_processing_safety_timeout_secs,
+                    ios_earliest_refresh_begin_minutes,
+                    ios_earliest_processing_begin_minutes,
+                    ios_requires_external_power,
+                    ios_requires_network_connectivity,
                 ));
             }
 
@@ -588,6 +664,137 @@ mod tests {
         app: AppHandle<R>,
     ) -> Result<(), String> {
         uninstall_service(app).await
+    }
+
+    // ── Cancel Listener Tests ───────────────────────────────────────────────
+
+    use crate::manager::ManagerCommand;
+    use std::sync::atomic::AtomicBool;
+
+    /// Helper: spawn a background task that accepts one Stop command and replies Ok(()).
+    /// Returns a oneshot receiver that yields true if Stop was received.
+    fn spawn_stop_drain(
+        mut cmd_rx: tokio::sync::mpsc::Receiver<ManagerCommand<tauri::test::MockRuntime>>,
+    ) -> tokio::sync::oneshot::Receiver<bool> {
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<bool>();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                cmd_rx.recv(),
+            )
+            .await;
+            match result {
+                Ok(Some(ManagerCommand::Stop { reply })) => {
+                    let _ = reply.send(Ok(()));
+                    let _ = seen_tx.send(true);
+                }
+                _ => {
+                    let _ = seen_tx.send(false);
+                }
+            }
+        });
+        seen_rx
+    }
+
+    #[tokio::test]
+    async fn cancel_listener_resolved_invoke_sends_stop() {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let seen = spawn_stop_drain(cmd_rx);
+
+        // wait_fn returns Ok(()) → simulates resolved invoke (safety timer / expiration)
+        let stop_sent = run_cancel_listener(
+            Box::new(|| Ok(())),
+            Box::new(|| {}),
+            cmd_tx,
+            5, // timeout, shouldn't matter since wait_fn returns immediately
+        )
+        .await;
+
+        assert!(stop_sent, "resolved invoke should return true");
+        assert!(
+            seen.await.unwrap(),
+            "Stop command should be sent on resolved invoke"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_listener_rejected_invoke_no_stop() {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let seen = spawn_stop_drain(cmd_rx);
+
+        // wait_fn returns Err → simulates rejected invoke (explicit stop / completion)
+        let stop_sent = run_cancel_listener(
+            Box::new(|| Err(ServiceError::Platform("rejected".into()))),
+            Box::new(|| {}),
+            cmd_tx,
+            5,
+        )
+        .await;
+
+        assert!(!stop_sent, "rejected invoke should return false");
+        assert!(
+            !seen.await.unwrap(),
+            "Stop command should NOT be sent on rejected invoke"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_listener_timeout_sends_stop() {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let cancel_called = Arc::new(AtomicBool::new(false));
+        let cancel_called_clone = cancel_called.clone();
+        let seen = spawn_stop_drain(cmd_rx);
+
+        // Use a channel to unblock the wait_fn when cancel_fn is called,
+        // simulating how the real cancelCancelListener rejects the invoke.
+        let (unblock_tx, unblock_rx) = std::sync::mpsc::channel::<()>();
+
+        let stop_sent = run_cancel_listener(
+            Box::new(move || {
+                // Block until cancel_fn signals us (simulates wait_for_cancel blocking)
+                let _ = unblock_rx.recv();
+                Ok(())
+            }),
+            Box::new(move || {
+                cancel_called_clone.store(true, Ordering::SeqCst);
+                let _ = unblock_tx.send(());
+            }),
+            cmd_tx,
+            0, // immediate timeout
+        )
+        .await;
+
+        assert!(stop_sent, "timeout should return true");
+        assert!(
+            cancel_called.load(Ordering::SeqCst),
+            "cancel_fn should be called on timeout"
+        );
+        assert!(
+            seen.await.unwrap(),
+            "Stop command should be sent on timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_listener_join_error_no_stop() {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let seen = spawn_stop_drain(cmd_rx);
+
+        // wait_fn panics → simulates JoinError from spawn_blocking
+        let stop_sent = run_cancel_listener(
+            Box::new(|| panic!("simulated panic in wait_for_cancel")),
+            Box::new(|| {}),
+            cmd_tx,
+            5,
+        )
+        .await;
+
+        // JoinError is Ok(Err(_)) which falls into the `_ => false` branch
+        assert!(!stop_sent, "join error should return false (no stop sent)");
+        assert!(
+            !seen.await.unwrap(),
+            "Stop command should NOT be sent on join error"
+        );
     }
 
 }

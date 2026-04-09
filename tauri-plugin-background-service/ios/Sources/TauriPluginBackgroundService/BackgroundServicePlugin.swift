@@ -2,7 +2,58 @@ import UIKit
 import BackgroundTasks
 import UserNotifications
 import WebKit
+import os.log
 
+/**
+ Manages background service lifecycle on iOS using `BGTaskScheduler`.
+
+ ## Required Info.plist Entries
+
+ Add the following entries to your app's `Info.plist` to enable background task scheduling:
+
+ ### BGTaskSchedulerPermittedIdentifiers
+
+ A string array listing the task identifiers this plugin registers. The plugin uses
+ two identifiers derived from your bundle identifier:
+
+ ```
+ <key>BGTaskSchedulerPermittedIdentifiers</key>
+ <array>
+     <string>$(BUNDLE_ID).bg-refresh</string>
+     <string>$(BUNDLE_ID).bg-processing</string>
+ </array>
+ ```
+
+ Replace `$(BUNDLE_ID)` with your app's actual bundle identifier (e.g. `com.example.myapp`).
+ Omitting this key causes `BGTaskScheduler.shared.submit(_:)` to throw an error at runtime.
+
+ ### UIBackgroundModes
+
+ Include both `background-processing` and `background-fetch` modes:
+
+ ```
+ <key>UIBackgroundModes</key>
+ <array>
+     <string>background-processing</string>
+     <string>background-fetch</string>
+ </array>
+ ```
+
+ - `background-fetch` enables `BGAppRefreshTask` scheduling (~30s budget).
+ - `background-processing` enables `BGProcessingTask` scheduling (minutes/hours,
+   requires device idle).
+
+ ## Task Behavior
+
+ | Task Type | Budget | Safety Timer | Use Case |
+ |-----------|--------|-------------|----------|
+ | BGAppRefreshTask | ~30s | 28s (default) | Short periodic work |
+ | BGProcessingTask | Minutes/hours | Optional | Long maintenance tasks |
+
+ - Note: Force-quitting the app kills **all** background tasks. iOS will not relaunch
+   force-killed apps. Only location/audio/VoIP background modes can relaunch after kill
+   (App Store validates legitimate use).
+*/
 @objc public class BackgroundServicePlugin: Plugin {
 
     // MARK: - Task Identifiers
@@ -39,6 +90,20 @@ import WebKit
     /// When `nil` or `0`, no safety timer is started for processing tasks — only the
     /// iOS expiration handler terminates them. Set via `startKeepalive` args from Rust.
     private var processingSafetyTimeoutSecs: Double?
+
+    /// BGAppRefreshTask earliest begin date in minutes from now (default: 15.0).
+    /// Controls how soon iOS can launch the refresh task.
+    private var earliestRefreshBeginMinutes: Double = 15.0
+
+    /// BGProcessingTask earliest begin date in minutes from now (default: 15.0).
+    /// Controls how soon iOS can launch the processing task.
+    private var earliestProcessingBeginMinutes: Double = 15.0
+
+    /// BGProcessingTask requires external power (default: false).
+    private var requiresExternalPower: Bool = false
+
+    /// BGProcessingTask requires network connectivity (default: false).
+    private var requiresNetworkConnectivity: Bool = false
 
     // MARK: - Plugin Lifecycle
 
@@ -180,6 +245,21 @@ import WebKit
         pendingCancelInvoke = invoke
     }
 
+    // MARK: - cancelCancelListener (timeout unblock)
+
+    /// Reject the pending cancel invoke to unblock the Rust `spawn_blocking` thread.
+    ///
+    /// Called from Rust when the cancel listener timeout fires (default: 4h).
+    /// This ensures the `wait_for_cancel` thread does not leak indefinitely
+    /// when iOS never resolves the invoke (e.g., app killed in background).
+    @objc public func cancelCancelListener(_ invoke: Invoke) {
+        if let cancelInvoke = pendingCancelInvoke {
+            cancelInvoke.reject(error: nil)
+            pendingCancelInvoke = nil
+        }
+        invoke.resolve()
+    }
+
     // MARK: - completeBgTask (Rust→Swift completion signal)
 
     @objc public func completeBgTask(_ invoke: Invoke) {
@@ -232,6 +312,22 @@ import WebKit
             if let processingTimeout = args["iosProcessingSafetyTimeoutSecs"] as? Double {
                 processingSafetyTimeoutSecs = processingTimeout
             }
+            // BGAppRefreshTask earliest begin date in minutes
+            if let minutes = args["iosEarliestRefreshBeginMinutes"] as? Double {
+                earliestRefreshBeginMinutes = minutes
+            }
+            // BGProcessingTask earliest begin date in minutes
+            if let minutes = args["iosEarliestProcessingBeginMinutes"] as? Double {
+                earliestProcessingBeginMinutes = minutes
+            }
+            // BGProcessingTask requires external power
+            if let power = args["iosRequiresExternalPower"] as? Bool {
+                requiresExternalPower = power
+            }
+            // BGProcessingTask requires network connectivity
+            if let network = args["iosRequiresNetworkConnectivity"] as? Bool {
+                requiresNetworkConnectivity = network
+            }
         }
         scheduleNext()
         invoke.resolve()
@@ -269,17 +365,27 @@ import WebKit
 
     // MARK: - Scheduling
 
+    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "app.tauri.backgroundservice", category: "BGTaskScheduler")
+
     private func scheduleNext() {
         // BGAppRefreshTask — runs opportunistically, ~30s budget
         let refreshReq = BGAppRefreshTaskRequest(identifier: refreshTaskId)
-        refreshReq.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
-        try? BGTaskScheduler.shared.submit(refreshReq)
+        refreshReq.earliestBeginDate = Date(timeIntervalSinceNow: earliestRefreshBeginMinutes * 60)
+        do {
+            try BGTaskScheduler.shared.submit(refreshReq)
+        } catch {
+            logger.error("Failed to submit BGAppRefreshTask '\(self.refreshTaskId)': \(error.localizedDescription)")
+        }
 
         // BGProcessingTask — runs when device idle, minutes budget
         let processingReq = BGProcessingTaskRequest(identifier: processingTaskId)
-        processingReq.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
-        processingReq.requiresExternalPower = false
-        processingReq.requiresNetworkConnectivity = false
-        try? BGTaskScheduler.shared.submit(processingReq)
+        processingReq.earliestBeginDate = Date(timeIntervalSinceNow: earliestProcessingBeginMinutes * 60)
+        processingReq.requiresExternalPower = requiresExternalPower
+        processingReq.requiresNetworkConnectivity = requiresNetworkConnectivity
+        do {
+            try BGTaskScheduler.shared.submit(processingReq)
+        } catch {
+            logger.error("Failed to submit BGProcessingTask '\(self.processingTaskId)': \(error.localizedDescription)")
+        }
     }
 }

@@ -31,7 +31,18 @@ pub type OnCompleteCallback = Box<dyn Fn(bool) + Send + Sync>;
 /// methods are never called. On mobile, `MobileLifecycle` implements this trait.
 pub(crate) trait MobileKeepalive: Send + Sync {
     /// Start the OS-specific keepalive (Android foreground service / iOS BGTask).
-    fn start_keepalive(&self, label: &str, foreground_service_type: &str, ios_safety_timeout_secs: Option<f64>, ios_processing_safety_timeout_secs: Option<f64>) -> Result<(), ServiceError>;
+    #[allow(clippy::too_many_arguments)]
+    fn start_keepalive(
+        &self,
+        label: &str,
+        foreground_service_type: &str,
+        ios_safety_timeout_secs: Option<f64>,
+        ios_processing_safety_timeout_secs: Option<f64>,
+        ios_earliest_refresh_begin_minutes: Option<f64>,
+        ios_earliest_processing_begin_minutes: Option<f64>,
+        ios_requires_external_power: Option<bool>,
+        ios_requires_network_connectivity: Option<bool>,
+    ) -> Result<(), ServiceError>;
     /// Stop the OS-specific keepalive.
     fn stop_keepalive(&self) -> Result<(), ServiceError>;
 }
@@ -177,6 +188,14 @@ struct ServiceState<R: Runtime> {
     /// When > 0.0, caps processing task duration. Passed as `Some(value)` to mobile.
     /// When 0.0, passed as `None` (no cap).
     ios_processing_safety_timeout_secs: f64,
+    /// iOS BGAppRefreshTask earliest begin date in minutes (default 15.0).
+    ios_earliest_refresh_begin_minutes: f64,
+    /// iOS BGProcessingTask earliest begin date in minutes (default 15.0).
+    ios_earliest_processing_begin_minutes: f64,
+    /// iOS BGProcessingTask requires external power (default false).
+    ios_requires_external_power: bool,
+    /// iOS BGProcessingTask requires network connectivity (default false).
+    ios_requires_network_connectivity: bool,
 }
 
 // ─── Actor Loop ────────────────────────────────────────────────────────
@@ -186,6 +205,7 @@ struct ServiceState<R: Runtime> {
 /// Runs as a spawned Tokio task. The loop exits when all `Sender` halves
 /// are dropped (i.e., the handle is dropped).
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
 pub async fn manager_loop<R: Runtime>(
     mut rx: mpsc::Receiver<ManagerCommand<R>>,
     factory: ServiceFactory<R>,
@@ -196,6 +216,14 @@ pub async fn manager_loop<R: Runtime>(
     // iOS BGProcessingTask safety timeout in seconds. From PluginConfig.
     // Default: 0.0 (no cap). When > 0.0, passed as Some(value) to mobile.
     ios_processing_safety_timeout_secs: f64,
+    // iOS BGAppRefreshTask earliest begin date in minutes. From PluginConfig.
+    ios_earliest_refresh_begin_minutes: f64,
+    // iOS BGProcessingTask earliest begin date in minutes. From PluginConfig.
+    ios_earliest_processing_begin_minutes: f64,
+    // iOS BGProcessingTask requires external power. From PluginConfig.
+    ios_requires_external_power: bool,
+    // iOS BGProcessingTask requires network connectivity. From PluginConfig.
+    ios_requires_network_connectivity: bool,
 ) {
     let mut state = ServiceState {
         token: Arc::new(Mutex::new(None)),
@@ -205,6 +233,10 @@ pub async fn manager_loop<R: Runtime>(
         mobile: None,
         ios_safety_timeout_secs,
         ios_processing_safety_timeout_secs,
+        ios_earliest_refresh_begin_minutes,
+        ios_earliest_processing_begin_minutes,
+        ios_requires_external_power,
+        ios_requires_network_connectivity,
     };
 
     while let Some(cmd) = rx.recv().await {
@@ -268,7 +300,16 @@ fn handle_start<R: Runtime>(
         } else {
             None
         };
-        if let Err(e) = mobile.start_keepalive(&config.service_label, &config.foreground_service_type, Some(state.ios_safety_timeout_secs), processing_timeout) {
+        if let Err(e) = mobile.start_keepalive(
+            &config.service_label,
+            &config.foreground_service_type,
+            Some(state.ios_safety_timeout_secs),
+            processing_timeout,
+            Some(state.ios_earliest_refresh_begin_minutes),
+            Some(state.ios_earliest_processing_begin_minutes),
+            Some(state.ios_requires_external_power),
+            Some(state.ios_requires_network_connectivity),
+        ) {
             // Rollback: clear the token we just set.
             state.token.lock().unwrap().take();
             // Rollback: restore the callback we took.
@@ -395,6 +436,10 @@ mod tests {
         last_fst: std::sync::Mutex<Option<String>>,
         last_timeout_secs: std::sync::Mutex<Option<f64>>,
         last_processing_timeout_secs: std::sync::Mutex<Option<f64>>,
+        last_earliest_refresh_begin_minutes: std::sync::Mutex<Option<f64>>,
+        last_earliest_processing_begin_minutes: std::sync::Mutex<Option<f64>>,
+        last_requires_external_power: std::sync::Mutex<Option<bool>>,
+        last_requires_network_connectivity: std::sync::Mutex<Option<bool>>,
     }
 
     impl MockMobile {
@@ -407,6 +452,10 @@ mod tests {
                 last_fst: std::sync::Mutex::new(None),
                 last_timeout_secs: std::sync::Mutex::new(None),
                 last_processing_timeout_secs: std::sync::Mutex::new(None),
+                last_earliest_refresh_begin_minutes: std::sync::Mutex::new(None),
+                last_earliest_processing_begin_minutes: std::sync::Mutex::new(None),
+                last_requires_external_power: std::sync::Mutex::new(None),
+                last_requires_network_connectivity: std::sync::Mutex::new(None),
             })
         }
 
@@ -419,21 +468,65 @@ mod tests {
                 last_fst: std::sync::Mutex::new(None),
                 last_timeout_secs: std::sync::Mutex::new(None),
                 last_processing_timeout_secs: std::sync::Mutex::new(None),
+                last_earliest_refresh_begin_minutes: std::sync::Mutex::new(None),
+                last_earliest_processing_begin_minutes: std::sync::Mutex::new(None),
+                last_requires_external_power: std::sync::Mutex::new(None),
+                last_requires_network_connectivity: std::sync::Mutex::new(None),
             })
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn mock_start_keepalive(
+        mock: &MockMobile,
+        label: &str,
+        foreground_service_type: &str,
+        ios_safety_timeout_secs: Option<f64>,
+        ios_processing_safety_timeout_secs: Option<f64>,
+        ios_earliest_refresh_begin_minutes: Option<f64>,
+        ios_earliest_processing_begin_minutes: Option<f64>,
+        ios_requires_external_power: Option<bool>,
+        ios_requires_network_connectivity: Option<bool>,
+    ) -> Result<(), ServiceError> {
+        mock.start_called.fetch_add(1, Ordering::Release);
+        *mock.last_label.lock().unwrap() = Some(label.to_string());
+        *mock.last_fst.lock().unwrap() = Some(foreground_service_type.to_string());
+        *mock.last_timeout_secs.lock().unwrap() = ios_safety_timeout_secs;
+        *mock.last_processing_timeout_secs.lock().unwrap() = ios_processing_safety_timeout_secs;
+        *mock.last_earliest_refresh_begin_minutes.lock().unwrap() = ios_earliest_refresh_begin_minutes;
+        *mock.last_earliest_processing_begin_minutes.lock().unwrap() = ios_earliest_processing_begin_minutes;
+        *mock.last_requires_external_power.lock().unwrap() = ios_requires_external_power;
+        *mock.last_requires_network_connectivity.lock().unwrap() = ios_requires_network_connectivity;
+        if mock.start_fail {
+            return Err(ServiceError::Platform("mock keepalive failure".into()));
+        }
+        Ok(())
+    }
+
     impl MobileKeepalive for MockMobile {
-        fn start_keepalive(&self, label: &str, foreground_service_type: &str, ios_safety_timeout_secs: Option<f64>, ios_processing_safety_timeout_secs: Option<f64>) -> Result<(), ServiceError> {
-            self.start_called.fetch_add(1, Ordering::Release);
-            *self.last_label.lock().unwrap() = Some(label.to_string());
-            *self.last_fst.lock().unwrap() = Some(foreground_service_type.to_string());
-            *self.last_timeout_secs.lock().unwrap() = ios_safety_timeout_secs;
-            *self.last_processing_timeout_secs.lock().unwrap() = ios_processing_safety_timeout_secs;
-            if self.start_fail {
-                return Err(ServiceError::Platform("mock keepalive failure".into()));
-            }
-            Ok(())
+        #[allow(clippy::too_many_arguments)]
+        fn start_keepalive(
+            &self,
+            label: &str,
+            foreground_service_type: &str,
+            ios_safety_timeout_secs: Option<f64>,
+            ios_processing_safety_timeout_secs: Option<f64>,
+            ios_earliest_refresh_begin_minutes: Option<f64>,
+            ios_earliest_processing_begin_minutes: Option<f64>,
+            ios_requires_external_power: Option<bool>,
+            ios_requires_network_connectivity: Option<bool>,
+        ) -> Result<(), ServiceError> {
+            mock_start_keepalive(
+                self,
+                label,
+                foreground_service_type,
+                ios_safety_timeout_secs,
+                ios_processing_safety_timeout_secs,
+                ios_earliest_refresh_begin_minutes,
+                ios_earliest_processing_begin_minutes,
+                ios_requires_external_power,
+                ios_requires_network_connectivity,
+            )
         }
 
         fn stop_keepalive(&self) -> Result<(), ServiceError> {
@@ -470,7 +563,7 @@ mod tests {
         let handle = ServiceManagerHandle::new(cmd_tx);
         let factory: ServiceFactory<tauri::test::MockRuntime> =
             Box::new(|| Box::new(BlockingService));
-        tokio::spawn(manager_loop(cmd_rx, factory, 28.0, 0.0));
+        tokio::spawn(manager_loop(cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false));
         handle
     }
 
@@ -668,7 +761,7 @@ mod tests {
     ) -> ServiceManagerHandle<tauri::test::MockRuntime> {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let handle = ServiceManagerHandle::new(cmd_tx);
-        tokio::spawn(manager_loop(cmd_rx, factory, 28.0, 0.0));
+        tokio::spawn(manager_loop(cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false));
         handle
     }
 
@@ -1014,8 +1107,19 @@ mod tests {
     /// Mock mobile where `stop_keepalive` always fails.
     struct MockMobileFailingStop;
 
+    #[allow(clippy::too_many_arguments)]
     impl MobileKeepalive for MockMobileFailingStop {
-        fn start_keepalive(&self, _label: &str, _foreground_service_type: &str, _ios_safety_timeout_secs: Option<f64>, _ios_processing_safety_timeout_secs: Option<f64>) -> Result<(), ServiceError> {
+        fn start_keepalive(
+            &self,
+            _label: &str,
+            _foreground_service_type: &str,
+            _ios_safety_timeout_secs: Option<f64>,
+            _ios_processing_safety_timeout_secs: Option<f64>,
+            _ios_earliest_refresh_begin_minutes: Option<f64>,
+            _ios_earliest_processing_begin_minutes: Option<f64>,
+            _ios_requires_external_power: Option<bool>,
+            _ios_requires_network_connectivity: Option<bool>,
+        ) -> Result<(), ServiceError> {
             Ok(())
         }
 
@@ -1051,7 +1155,7 @@ mod tests {
         let factory: ServiceFactory<tauri::test::MockRuntime> =
             Box::new(|| Box::new(BlockingService));
         // Use a custom timeout value (not default 28.0)
-        tokio::spawn(manager_loop(cmd_rx, factory, 15.0, 0.0));
+        tokio::spawn(manager_loop(cmd_rx, factory, 15.0, 0.0, 15.0, 15.0, false, false));
 
         let app = tauri::test::mock_app();
 
@@ -1077,7 +1181,7 @@ mod tests {
         let factory: ServiceFactory<tauri::test::MockRuntime> =
             Box::new(|| Box::new(BlockingService));
         // Use a custom processing timeout value
-        tokio::spawn(manager_loop(cmd_rx, factory, 28.0, 60.0));
+        tokio::spawn(manager_loop(cmd_rx, factory, 28.0, 60.0, 15.0, 15.0, false, false));
 
         let app = tauri::test::mock_app();
 
@@ -1101,7 +1205,7 @@ mod tests {
         let factory: ServiceFactory<tauri::test::MockRuntime> =
             Box::new(|| Box::new(BlockingService));
         // Processing timeout = 0.0 (default, no cap)
-        tokio::spawn(manager_loop(cmd_rx, factory, 28.0, 0.0));
+        tokio::spawn(manager_loop(cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false));
 
         let app = tauri::test::mock_app();
 
