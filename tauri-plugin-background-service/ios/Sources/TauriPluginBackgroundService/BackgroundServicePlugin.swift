@@ -139,9 +139,9 @@ import WebKit
     private func handleSafetyTimerExpiration() {
         // Force-complete task if Rust never called completeBgTask
         if currentRefreshTask != nil || currentProcessingTask != nil {
-            // Reject pending cancel invoke (unblocks Rust thread)
+            // Resolve pending cancel invoke (unblocks Rust thread)
             if let invoke = pendingCancelInvoke {
-                invoke.reject(error: nil)
+                invoke.resolve()
                 pendingCancelInvoke = nil
             }
 
@@ -186,6 +186,11 @@ import WebKit
         // Extract success value from invoke arguments
         let success = invoke.args(as: [String: Bool].self)?["success"] ?? true
 
+        // Track whether we had an active BGTask before nil-out.
+        // Prevents spurious rescheduling when completeBgTask is called
+        // after expiration or explicit stop already cleaned up the task.
+        let hadActiveTask = currentRefreshTask != nil || currentProcessingTask != nil
+
         // Complete whichever task is active — nil out BEFORE completing
         // to prevent double-completion. At most one BGTask is active at a time.
         if let task = currentRefreshTask {
@@ -202,8 +207,11 @@ import WebKit
             pendingCancelInvoke = nil
         }
 
-        // Schedule next tasks
-        scheduleNext()
+        // Only reschedule if we actually completed a background task.
+        // Avoids scheduling when called after expiration or stop already handled it.
+        if hadActiveTask {
+            scheduleNext()
+        }
 
         // Clear remaining state
         cleanup()
