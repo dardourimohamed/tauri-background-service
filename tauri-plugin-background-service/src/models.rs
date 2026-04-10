@@ -8,7 +8,45 @@ use serde::{Deserialize, Serialize};
 use tauri::Runtime;
 use tokio_util::sync::CancellationToken;
 
+use crate::error::ServiceError;
 use crate::notifier::Notifier;
+
+/// The 14 valid Android foreground service types.
+///
+/// Sourced from <https://developer.android.com/about/versions/14/changes/fg-types>.
+/// Unknown types are rejected with [`ServiceError::Platform`] at both the Rust
+/// and Kotlin layers.
+pub const VALID_FOREGROUND_SERVICE_TYPES: &[&str] = &[
+    "dataSync",
+    "mediaPlayback",
+    "phoneCall",
+    "location",
+    "connectedDevice",
+    "mediaProjection",
+    "camera",
+    "microphone",
+    "health",
+    "remoteMessaging",
+    "systemExempted",
+    "shortService",
+    "specialUse",
+    "mediaProcessing",
+];
+
+/// Validate a foreground service type against the allowlist.
+///
+/// Returns `Ok(())` if the type is one of the 14 valid Android foreground
+/// service types, or `Err(ServiceError::Platform)` for unknown strings.
+pub fn validate_foreground_service_type(t: &str) -> Result<(), ServiceError> {
+    if VALID_FOREGROUND_SERVICE_TYPES.contains(&t) {
+        Ok(())
+    } else {
+        Err(ServiceError::Platform(format!(
+            "invalid foreground_service_type '{}'. Valid types: {:?}",
+            t, VALID_FOREGROUND_SERVICE_TYPES
+        )))
+    }
+}
 
 /// Passed into both `init` and `run`.
 /// Gives your service everything it needs to interact with the outside world.
@@ -95,6 +133,12 @@ pub struct PluginConfig {
     #[serde(default)]
     pub ios_requires_network_connectivity: bool,
 
+    /// Capacity for the manager command channel (mpsc).
+    /// Default: 16. Increase for high-throughput scenarios with many
+    /// concurrent start/stop/is-running calls.
+    #[serde(default = "default_channel_capacity")]
+    pub channel_capacity: usize,
+
     /// Desktop service mode: "inProcess" (default) or "osService".
     /// Controls whether the background service runs in-process or as a
     /// registered OS service/daemon.
@@ -127,6 +171,10 @@ fn default_ios_earliest_refresh_begin_minutes() -> f64 {
 
 fn default_ios_earliest_processing_begin_minutes() -> f64 {
     15.0
+}
+
+fn default_channel_capacity() -> usize {
+    16
 }
 
 #[cfg(feature = "desktop-service")]
@@ -166,6 +214,7 @@ impl Default for PluginConfig {
             ios_earliest_processing_begin_minutes: default_ios_earliest_processing_begin_minutes(),
             ios_requires_external_power: false,
             ios_requires_network_connectivity: false,
+            channel_capacity: default_channel_capacity(),
             #[cfg(feature = "desktop-service")]
             desktop_service_mode: default_desktop_service_mode(),
             #[cfg(feature = "desktop-service")]
@@ -400,10 +449,22 @@ mod tests {
     }
 
     #[test]
-    fn start_config_unrecognized_type_passes_through() {
+    fn start_config_unrecognized_type_rejected_by_validation() {
+        // Deserialization still passes through any string.
         let json = r#"{"serviceLabel":"test","foregroundServiceType":"customType"}"#;
         let de: StartConfig = serde_json::from_str(json).unwrap();
         assert_eq!(de.foreground_service_type, "customType");
+        // But validation rejects it.
+        let result = validate_foreground_service_type(&de.foreground_service_type);
+        assert!(
+            result.is_err(),
+            "validation should reject unrecognized type"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("customType"),
+            "error should mention the invalid type: {err_msg}"
+        );
     }
 
     #[test]
@@ -520,6 +581,7 @@ mod tests {
     fn plugin_config_default_impl() {
         let config = PluginConfig::default();
         assert_eq!(config.ios_safety_timeout_secs, 28.0);
+        assert_eq!(config.channel_capacity, 16);
     }
 
     #[test]
@@ -765,6 +827,46 @@ mod tests {
         assert!(config.ios_requires_network_connectivity);
     }
 
+    // --- PluginConfig channel_capacity tests ---
+
+    #[test]
+    fn plugin_config_channel_capacity_default() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.channel_capacity, 16);
+    }
+
+    #[test]
+    fn plugin_config_channel_capacity_custom() {
+        let json = r#"{"channelCapacity":32}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.channel_capacity, 32);
+    }
+
+    #[test]
+    fn plugin_config_channel_capacity_serde_roundtrip() {
+        let config = PluginConfig {
+            channel_capacity: 64,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.channel_capacity, 64);
+    }
+
+    #[test]
+    fn plugin_config_channel_capacity_json_key_camel_case() {
+        let config = PluginConfig {
+            channel_capacity: 32,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("channelCapacity"),
+            "JSON should use camelCase: {json}"
+        );
+    }
+
     // --- PluginConfig desktop fields tests (feature-gated) ---
 
     #[cfg(feature = "desktop-service")]
@@ -841,5 +943,73 @@ mod tests {
         };
         assert_eq!(ctx.service_label.as_deref(), Some("Syncing"));
         assert_eq!(ctx.foreground_service_type.as_deref(), Some("dataSync"));
+    }
+
+    // --- Foreground service type validation tests ---
+
+    #[test]
+    fn validate_data_sync_passes() {
+        assert!(
+            validate_foreground_service_type("dataSync").is_ok(),
+            "dataSync should be valid"
+        );
+    }
+
+    #[test]
+    fn validate_special_use_passes() {
+        assert!(
+            validate_foreground_service_type("specialUse").is_ok(),
+            "specialUse should be valid"
+        );
+    }
+
+    #[test]
+    fn validate_invalid_type_returns_platform_error() {
+        let result = validate_foreground_service_type("invalidType");
+        assert!(result.is_err(), "invalidType should be rejected");
+        match result {
+            Err(crate::error::ServiceError::Platform(msg)) => {
+                assert!(
+                    msg.contains("invalidType"),
+                    "error should mention the type: {msg}"
+                );
+            }
+            other => panic!("Expected Platform error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_all_14_types_pass() {
+        for &t in VALID_FOREGROUND_SERVICE_TYPES {
+            assert!(
+                validate_foreground_service_type(t).is_ok(),
+                "{t} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_types_count_is_14() {
+        assert_eq!(
+            VALID_FOREGROUND_SERVICE_TYPES.len(),
+            14,
+            "should have exactly 14 valid types"
+        );
+    }
+
+    #[test]
+    fn validate_empty_string_returns_error() {
+        let result = validate_foreground_service_type("");
+        assert!(result.is_err(), "empty string should be rejected");
+    }
+
+    #[test]
+    fn validate_case_sensitive() {
+        // "DataSync" (capitalized) should NOT pass — case-sensitive.
+        let result = validate_foreground_service_type("DataSync");
+        assert!(
+            result.is_err(),
+            "validation should be case-sensitive: DataSync should fail"
+        );
     }
 }

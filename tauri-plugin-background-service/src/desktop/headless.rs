@@ -36,15 +36,15 @@ use crate::service_trait::BackgroundService;
 ///
 /// Used by `install_service` to verify the binary handles `--service-label`
 /// without actually starting the service.
-fn has_validate_flag(mut args: impl Iterator<Item = String>) -> bool {
-    args.any(|arg| arg == "--validate-service-install")
+fn has_validate_flag(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--validate-service-install")
 }
 
 /// Parse `--service-label <label>` from CLI arguments.
 ///
 /// Returns the label on success, or a descriptive error message on failure.
-fn parse_service_label(args: impl Iterator<Item = String>) -> Result<String, String> {
-    let mut args = args.skip(1); // skip program name
+fn parse_service_label(args: &[String]) -> Result<String, String> {
+    let mut args = args.iter().skip(1); // skip program name
     while let Some(arg) = args.next() {
         if arg == "--service-label" {
             let value = args
@@ -53,7 +53,7 @@ fn parse_service_label(args: impl Iterator<Item = String>) -> Result<String, Str
             if value.is_empty() {
                 return Err("--service-label value must not be empty".to_string());
             }
-            return Ok(value);
+            return Ok(value.clone());
         }
     }
     Err("--service-label is required. Usage: <binary> --service-label <label>".to_string())
@@ -84,7 +84,9 @@ where
     F: Fn() -> Box<dyn BackgroundService<R>> + Send + Sync + 'static,
     R: Runtime,
 {
-    let label = parse_service_label(std::env::args()).unwrap_or_else(|e| {
+    let args: Vec<String> = std::env::args().collect();
+
+    let label = parse_service_label(&args).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(1);
     });
@@ -92,7 +94,7 @@ where
     // Early-exit for install validation: the GUI process spawns us with
     // --validate-service-install to confirm we handle --service-label.
     // Exit immediately before binding sockets or spawning tasks.
-    if has_validate_flag(std::env::args()) {
+    if has_validate_flag(&args) {
         println!("ok");
         std::process::exit(0);
     }
@@ -188,7 +190,7 @@ mod tests {
             "--service-label".to_string(),
             "com.example.svc".to_string(),
         ];
-        let label = parse_service_label(args.into_iter()).unwrap();
+        let label = parse_service_label(&args).unwrap();
         assert_eq!(label, "com.example.svc");
     }
 
@@ -201,7 +203,7 @@ mod tests {
             "com.example.svc".to_string(),
             "--other".to_string(),
         ];
-        let label = parse_service_label(args.into_iter()).unwrap();
+        let label = parse_service_label(&args).unwrap();
         assert_eq!(label, "com.example.svc");
     }
 
@@ -210,7 +212,7 @@ mod tests {
     #[test]
     fn headless_main_rejects_missing_label() {
         let args = vec!["my-app-headless".to_string()];
-        let result = parse_service_label(args.into_iter());
+        let result = parse_service_label(&args);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -222,7 +224,7 @@ mod tests {
     #[test]
     fn headless_main_rejects_label_without_value() {
         let args = vec!["my-app-headless".to_string(), "--service-label".to_string()];
-        let result = parse_service_label(args.into_iter());
+        let result = parse_service_label(&args);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -238,7 +240,7 @@ mod tests {
             "--service-label".to_string(),
             "".to_string(),
         ];
-        let result = parse_service_label(args.into_iter());
+        let result = parse_service_label(&args);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -257,7 +259,7 @@ mod tests {
             "com.example.svc".to_string(),
             "--validate-service-install".to_string(),
         ];
-        assert!(has_validate_flag(args.into_iter()));
+        assert!(has_validate_flag(&args));
     }
 
     #[test]
@@ -267,7 +269,22 @@ mod tests {
             "--service-label".to_string(),
             "com.example.svc".to_string(),
         ];
-        assert!(!has_validate_flag(args.into_iter()));
+        assert!(!has_validate_flag(&args));
+    }
+
+    // ── Step 12: slice-based API tests ────────────────────────────────────
+
+    #[test]
+    fn parse_service_label_slice_returns_label() {
+        let args: Vec<String> = vec!["headless".into(), "--service-label".into(), "test".into()];
+        let label = parse_service_label(&args).unwrap();
+        assert_eq!(label, "test");
+    }
+
+    #[test]
+    fn has_validate_flag_slice_detects_flag() {
+        let args: Vec<String> = vec!["headless".into(), "--validate-service-install".into()];
+        assert!(has_validate_flag(&args));
     }
 
     // ── Event mapping: PluginEvent → IpcEvent ─────────────────────────────

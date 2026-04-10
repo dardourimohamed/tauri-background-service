@@ -16,7 +16,9 @@ use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::desktop::ipc::{encode_frame, IpcEvent, IpcRequest, IpcResponse, MAX_FRAME_SIZE};
+use crate::desktop::ipc::{
+    encode_frame, IpcEvent, IpcMessage, IpcRequest, IpcResponse, MAX_FRAME_SIZE,
+};
 use crate::error::ServiceError;
 use crate::manager::ManagerCommand;
 
@@ -210,6 +212,32 @@ async fn handle_connection<R: Runtime>(
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let mut peer_uid: libc::uid_t = 0;
+        let mut peer_gid: libc::gid_t = 0;
+        // SAFETY: getpeereid() on a connected Unix domain socket retrieves
+        // the effective UID/GID of the peer. The fd is valid (just accepted),
+        // and the output parameters are properly aligned.
+        if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut peer_uid, &mut peer_gid) } != 0 {
+            log::warn!("IPC: failed to get peer credentials via getpeereid, rejecting connection");
+            return;
+        }
+        // SAFETY: getuid() never fails and has no side effects — it returns
+        // the real UID of the calling process per POSIX.
+        let my_uid = unsafe { libc::getuid() };
+        if peer_uid != my_uid {
+            log::warn!("IPC connection rejected: uid mismatch ({peer_uid} != {my_uid})");
+            return;
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        log::warn!("IPC: no peer credential check available on this platform");
+    }
+
     let mut event_rx = event_tx.subscribe();
     let (stream_read, mut stream_write) = stream.into_split();
     let (incoming_tx, mut incoming_rx) = mpsc::channel::<Incoming>(16);
@@ -225,7 +253,8 @@ async fn handle_connection<R: Runtime>(
                             request, &cmd_tx, &app,
                         )
                         .await;
-                        let resp_frame = match encode_frame(&response) {
+                        let resp_msg = IpcMessage::Response(response);
+                        let resp_frame = match encode_frame(&resp_msg) {
                             Ok(f) => f,
                             Err(e) => {
                                 log::warn!("IPC encode response error: {e}");
@@ -242,7 +271,8 @@ async fn handle_connection<R: Runtime>(
                             data: None,
                             error: Some(msg),
                         };
-                        let frame = match encode_frame(&resp) {
+                        let resp_msg = IpcMessage::Response(resp);
+                        let frame = match encode_frame(&resp_msg) {
                             Ok(f) => f,
                             Err(e) => {
                                 log::warn!("IPC encode error response: {e}");
@@ -259,7 +289,8 @@ async fn handle_connection<R: Runtime>(
             event_result = event_rx.recv() => {
                 match event_result {
                     Ok(event) => {
-                        let frame = match encode_frame(&event) {
+                        let event_msg = IpcMessage::Event(event);
+                        let frame = match encode_frame(&event_msg) {
                             Ok(f) => f,
                             Err(e) => {
                                 log::warn!("IPC encode event error: {e}");
@@ -283,6 +314,9 @@ async fn handle_connection<R: Runtime>(
 }
 
 /// Read a length-prefixed [`IpcRequest`] from the stream.
+///
+/// Expects the frame payload to be an [`IpcMessage::Request`] variant.
+/// Returns an error for non-request variants or malformed payloads.
 async fn read_request<R: tokio::io::AsyncRead + Unpin>(
     stream: &mut R,
 ) -> Result<IpcRequest, ReadError> {
@@ -300,7 +334,11 @@ async fn read_request<R: tokio::io::AsyncRead + Unpin>(
         .read_exact(&mut payload)
         .await
         .map_err(ReadError::Io)?;
-    serde_json::from_slice(&payload).map_err(|e| ReadError::Json(e.to_string()))
+    match serde_json::from_slice::<IpcMessage>(&payload) {
+        Ok(IpcMessage::Request(req)) => Ok(req),
+        Ok(_) => Err(ReadError::Json("expected request frame".into())),
+        Err(e) => Err(ReadError::Json(e.to_string())),
+    }
 }
 
 /// Forward an [`IpcRequest`] to the actor and return the response.

@@ -6,7 +6,11 @@ export interface StartConfig {
   /** Text shown in the Android persistent foreground notification */
   serviceLabel?: string;
   /**
-   * Android foreground service type. Valid values: `"dataSync"` (default), `"specialUse"`.
+   * Android foreground service type.
+   * Valid values: `"dataSync"` (default), `"mediaPlayback"`, `"phoneCall"`,
+   * `"location"`, `"connectedDevice"`, `"mediaProjection"`, `"camera"`,
+   * `"microphone"`, `"health"`, `"remoteMessaging"`, `"systemExempted"`,
+   * `"shortService"`, `"specialUse"`, `"mediaProcessing"`.
    * Ignored on non-Android platforms.
    */
   foregroundServiceType?: string;

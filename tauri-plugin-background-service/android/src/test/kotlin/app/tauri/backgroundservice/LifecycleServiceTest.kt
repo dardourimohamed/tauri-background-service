@@ -7,6 +7,7 @@ import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
 import org.mockito.Mockito
+import java.lang.reflect.InvocationTargetException
 
 /**
  * Unit tests for LifecycleService logic:
@@ -97,39 +98,121 @@ class LifecycleServiceTest {
         Mockito.verify(editor).apply()
     }
 
-    // ── Service type mapping ────────────────────────────────────────────
+    // ── Service type mapping (all 14 valid types) ─────────────────────
 
-    @Test
-    fun mapServiceTypeDataSync() {
+    private fun invokeMapServiceType(type: String): Int {
         val service = LifecycleService()
         val method = LifecycleService::class.java.getDeclaredMethod(
             "mapServiceType", String::class.java
         )
         method.isAccessible = true
-        val result = method.invoke(service, "dataSync") as Int
-        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC, result)
+        return method.invoke(service, type) as Int
+    }
+
+    private fun invokeMapServiceTypeThrows(type: String): Throwable {
+        val service = LifecycleService()
+        val method = LifecycleService::class.java.getDeclaredMethod(
+            "mapServiceType", String::class.java
+        )
+        method.isAccessible = true
+        try {
+            method.invoke(service, type)
+            fail("Expected IllegalArgumentException for type: $type")
+            throw AssertionError("unreachable")
+        } catch (e: InvocationTargetException) {
+            return e.targetException
+        }
     }
 
     @Test
-    fun mapServiceTypeSpecialUse() {
-        val service = LifecycleService()
-        val method = LifecycleService::class.java.getDeclaredMethod(
-            "mapServiceType", String::class.java
-        )
-        method.isAccessible = true
-        val result = method.invoke(service, "specialUse") as Int
-        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE, result)
+    fun mapServiceType_dataSync() {
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC, invokeMapServiceType("dataSync"))
     }
 
     @Test
-    fun mapServiceTypeUnknownFallsBackToDataSync() {
-        val service = LifecycleService()
-        val method = LifecycleService::class.java.getDeclaredMethod(
-            "mapServiceType", String::class.java
-        )
-        method.isAccessible = true
-        val result = method.invoke(service, "unknownType") as Int
-        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC, result)
+    fun mapServiceType_mediaPlayback() {
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK, invokeMapServiceType("mediaPlayback"))
+    }
+
+    @Test
+    fun mapServiceType_phoneCall() {
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL, invokeMapServiceType("phoneCall"))
+    }
+
+    @Test
+    fun mapServiceType_location() {
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION, invokeMapServiceType("location"))
+    }
+
+    @Test
+    fun mapServiceType_connectedDevice() {
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE, invokeMapServiceType("connectedDevice"))
+    }
+
+    @Test
+    fun mapServiceType_mediaProjection() {
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION, invokeMapServiceType("mediaProjection"))
+    }
+
+    @Test
+    fun mapServiceType_camera() {
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA, invokeMapServiceType("camera"))
+    }
+
+    @Test
+    fun mapServiceType_microphone() {
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE, invokeMapServiceType("microphone"))
+    }
+
+    @Test
+    fun mapServiceType_health() {
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH, invokeMapServiceType("health"))
+    }
+
+    @Test
+    fun mapServiceType_remoteMessaging() {
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING, invokeMapServiceType("remoteMessaging"))
+    }
+
+    @Test
+    fun mapServiceType_systemExempted() {
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED, invokeMapServiceType("systemExempted"))
+    }
+
+    @Test
+    fun mapServiceType_shortService() {
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE, invokeMapServiceType("shortService"))
+    }
+
+    @Test
+    fun mapServiceType_specialUse() {
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE, invokeMapServiceType("specialUse"))
+    }
+
+    @Test
+    fun mapServiceType_mediaProcessing() {
+        assertEquals(ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING, invokeMapServiceType("mediaProcessing"))
+    }
+
+    @Test
+    fun mapServiceType_unknown_throwsIllegalArgument() {
+        val ex = invokeMapServiceTypeThrows("unknownType")
+        assertTrue("Expected IllegalArgumentException, got ${ex.javaClass.simpleName}",
+            ex is IllegalArgumentException)
+        assertTrue("Message should contain the invalid type",
+            ex.message?.contains("unknownType") == true)
+    }
+
+    @Test
+    fun mapServiceType_empty_throwsIllegalArgument() {
+        val ex = invokeMapServiceTypeThrows("")
+        assertTrue(ex is IllegalArgumentException)
+    }
+
+    @Test
+    fun mapServiceType_caseSensitive_throwsIllegalArgument() {
+        val ex = invokeMapServiceTypeThrows("DataSync")
+        assertTrue(ex is IllegalArgumentException)
     }
 
     // ── Restart timeout constants ───────────────────────────────────────

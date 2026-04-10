@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::ServiceError;
-use crate::models::{PluginEvent, ServiceContext, StartConfig};
+use crate::models::{validate_foreground_service_type, PluginEvent, ServiceContext, StartConfig};
 use crate::notifier::Notifier;
 use crate::service_trait::BackgroundService;
 
@@ -272,6 +272,9 @@ fn handle_start<R: Runtime>(
         return Err(ServiceError::AlreadyRunning);
     }
 
+    // Validate foreground service type against the allowlist.
+    validate_foreground_service_type(&config.foreground_service_type)?;
+
     let token = CancellationToken::new();
     let shutdown = token.clone();
     *guard = Some(token);
@@ -315,12 +318,23 @@ fn handle_start<R: Runtime>(
 
     let mut service = (state.factory)();
 
+    // On mobile, surface the label/type so the service can display them
+    // in notifications. On desktop, they're irrelevant — set to None.
+    let (service_label, foreground_service_type) = if cfg!(mobile) {
+        (
+            Some(config.service_label),
+            Some(config.foreground_service_type),
+        )
+    } else {
+        (None, None)
+    };
+
     let ctx = ServiceContext {
         notifier: Notifier { app: app.clone() },
         app: app.clone(),
         shutdown,
-        service_label: Some(config.service_label),
-        foreground_service_type: Some(config.foreground_service_type),
+        service_label,
+        foreground_service_type,
     };
 
     // Use tauri::async_runtime::spawn() instead of tokio::spawn() because
@@ -567,11 +581,19 @@ mod tests {
         handle: &ServiceManagerHandle<tauri::test::MockRuntime>,
         app: AppHandle<tauri::test::MockRuntime>,
     ) -> Result<(), ServiceError> {
+        send_start_with_config(handle, StartConfig::default(), app).await
+    }
+
+    async fn send_start_with_config(
+        handle: &ServiceManagerHandle<tauri::test::MockRuntime>,
+        config: StartConfig,
+        app: AppHandle<tauri::test::MockRuntime>,
+    ) -> Result<(), ServiceError> {
         let (tx, rx) = oneshot::channel();
         handle
             .cmd_tx
             .send(ManagerCommand::Start {
-                config: StartConfig::default(),
+                config,
                 reply: tx,
                 app,
             })
@@ -1198,6 +1220,123 @@ mod tests {
             Some(60.0),
             "ios_processing_safety_timeout_secs should be passed to mobile"
         );
+    }
+
+    // ── Service that captures ServiceContext fields for inspection ──────
+
+    /// Service that captures `service_label` and `foreground_service_type`
+    /// from the `ServiceContext` it receives in `init()`.
+    struct ContextCapturingService {
+        captured_label: Arc<std::sync::Mutex<Option<String>>>,
+        captured_fst: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl BackgroundService<tauri::test::MockRuntime> for ContextCapturingService {
+        async fn init(
+            &mut self,
+            ctx: &ServiceContext<tauri::test::MockRuntime>,
+        ) -> Result<(), ServiceError> {
+            *self.captured_label.lock().unwrap() = ctx.service_label.clone();
+            *self.captured_fst.lock().unwrap() = ctx.foreground_service_type.clone();
+            Ok(())
+        }
+
+        async fn run(
+            &mut self,
+            ctx: &ServiceContext<tauri::test::MockRuntime>,
+        ) -> Result<(), ServiceError> {
+            ctx.shutdown.cancelled().await;
+            Ok(())
+        }
+    }
+
+    // ── AC (Step 11): ServiceContext fields are None on desktop ────────
+
+    #[tokio::test]
+    async fn service_context_fields_none_on_desktop() {
+        let captured_label: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(Some("initial".into())));
+        let captured_fst: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(Some("initial".into())));
+        let cl = captured_label.clone();
+        let cf = captured_fst.clone();
+
+        let handle = setup_manager_with_factory(Box::new(move || {
+            let cl = cl.clone();
+            let cf = cf.clone();
+            Box::new(ContextCapturingService {
+                captured_label: cl,
+                captured_fst: cf,
+            })
+        }));
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+
+        // Give the spawned task time to run init() (which captures the values).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // On desktop (cfg!(mobile) == false), both fields should be None
+        assert!(
+            captured_label.lock().unwrap().is_none(),
+            "service_label should be None on desktop"
+        );
+        assert!(
+            captured_fst.lock().unwrap().is_none(),
+            "foreground_service_type should be None on desktop"
+        );
+
+        send_stop(&handle).await.unwrap();
+    }
+
+    // ── AC: handle_start rejects invalid foreground_service_type ────────
+
+    #[tokio::test]
+    async fn handle_start_rejects_invalid_foreground_service_type() {
+        let handle = setup_manager();
+        let app = tauri::test::mock_app();
+
+        let config = StartConfig {
+            service_label: "test".into(),
+            foreground_service_type: "bogusType".into(),
+        };
+
+        let result = send_start_with_config(&handle, config, app.handle().clone()).await;
+        assert!(
+            matches!(result, Err(ServiceError::Platform(ref msg)) if msg.contains("bogusType")),
+            "start with invalid fg type should return Platform error mentioning the type: {result:?}"
+        );
+
+        // Service should NOT be running after rejection.
+        assert!(
+            !send_is_running(&handle).await,
+            "service should not be running after invalid type rejection"
+        );
+    }
+
+    // ── handle_start accepts all valid foreground_service_types ────────
+
+    #[tokio::test]
+    async fn handle_start_accepts_all_valid_foreground_service_types() {
+        for &valid_type in crate::models::VALID_FOREGROUND_SERVICE_TYPES {
+            let handle = setup_manager();
+            let app = tauri::test::mock_app();
+
+            let config = StartConfig {
+                service_label: "test".into(),
+                foreground_service_type: valid_type.into(),
+            };
+
+            let result = send_start_with_config(&handle, config, app.handle().clone()).await;
+            assert!(
+                result.is_ok(),
+                "start with valid type '{valid_type}' should succeed: {result:?}"
+            );
+            assert!(send_is_running(&handle).await);
+            // Stop for cleanup
+            send_stop(&handle).await.unwrap();
+        }
     }
 
     #[tokio::test]

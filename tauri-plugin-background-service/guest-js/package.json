@@ -1,6 +1,6 @@
 {
   "name": "tauri-plugin-background-service",
-  "version": "0.2.4",
+  "version": "0.3.0",
   "description": "Manage long-lived background service lifecycle in Tauri v2 apps across Android, iOS, and desktop.",
   "license": "MIT OR Apache-2.0",
   "authors": [

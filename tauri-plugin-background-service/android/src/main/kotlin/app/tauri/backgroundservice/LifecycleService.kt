@@ -8,7 +8,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.core.app.NotificationCompat
 
@@ -133,11 +132,20 @@ class LifecycleService : Service() {
     private fun mapServiceType(type: String): Int {
         return when (type) {
             "dataSync" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            "mediaPlayback" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+            "phoneCall" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL
+            "location" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            "connectedDevice" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            "mediaProjection" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            "camera" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+            "microphone" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            "health" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH
+            "remoteMessaging" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING
+            "systemExempted" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED
+            "shortService" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE
             "specialUse" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            else -> {
-                Log.w("LifecycleService", "Unrecognized foreground service type: '$type', falling back to DATA_SYNC")
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            }
+            "mediaProcessing" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
+            else -> throw IllegalArgumentException("Invalid foreground_service_type: $type")
         }
     }
 

@@ -54,6 +54,22 @@ pub enum IpcEvent {
     Error { message: String },
 }
 
+/// Tagged wrapper for all IPC messages on the wire.
+///
+/// Uses `#[serde(tag = "kind")]` for single-point deserialization — no
+/// trial-and-error dispatch needed. The reader deserializes once and matches
+/// on the variant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum IpcMessage {
+    /// A request from the GUI process to the headless service.
+    Request(IpcRequest),
+    /// A response from the headless service to the GUI process.
+    Response(IpcResponse),
+    /// An event streamed from the headless service to the GUI process.
+    Event(IpcEvent),
+}
+
 /// Encode a message into a length-prefixed JSON frame.
 ///
 /// Frame format: `[4-byte big-endian u32 length][JSON payload]`
@@ -66,46 +82,14 @@ pub fn encode_frame<T: Serialize>(msg: &T) -> Result<Vec<u8>, serde_json::Error>
     Ok(buf)
 }
 
-/// Decode a length-prefixed JSON frame.
+/// Decode an [`IpcMessage`] from raw payload bytes.
 ///
-/// Returns an error if:
-/// - The frame is shorter than 4 bytes (missing length prefix)
-/// - The payload length exceeds `MAX_FRAME_SIZE`
-/// - The JSON payload cannot be deserialized
-pub fn decode_frame<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T, FrameError> {
-    if data.len() < 4 {
-        return Err(FrameError::IncompleteLength);
-    }
-    let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    if len > MAX_FRAME_SIZE {
-        return Err(FrameError::TooLarge {
-            size: len,
-            max: MAX_FRAME_SIZE,
-        });
-    }
-    let payload = data.get(4..4 + len).ok_or(FrameError::IncompletePayload {
-        expected: len,
-        available: data.len().saturating_sub(4),
-    })?;
-    serde_json::from_slice(payload).map_err(FrameError::Json)
-}
-
-/// Errors that can occur during frame decoding.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum FrameError {
-    /// The frame is shorter than 4 bytes.
-    #[error("incomplete length prefix: need 4 bytes")]
-    IncompleteLength,
-    /// The payload exceeds the maximum frame size.
-    #[error("frame too large: {size} bytes (max {max})")]
-    TooLarge { size: usize, max: usize },
-    /// The available data is shorter than the declared payload length.
-    #[error("incomplete payload: expected {expected} bytes, got {available}")]
-    IncompletePayload { expected: usize, available: usize },
-    /// The JSON payload could not be deserialized.
-    #[error("JSON decode error: {0}")]
-    Json(#[from] serde_json::Error),
+/// Takes payload bytes (without length prefix) and deserializes as
+/// [`IpcMessage`]. The caller matches on the variant to extract the
+/// concrete type. Length-prefix reading and frame-size validation are
+/// handled by `read_frame` / `read_frame_from` at the stream level.
+pub fn decode_frame(payload: &[u8]) -> Result<IpcMessage, serde_json::Error> {
+    serde_json::from_slice(payload)
 }
 
 /// Derive the IPC socket path for a given service label.
@@ -351,13 +335,14 @@ mod tests {
         let req = IpcRequest::Start {
             config: crate::models::StartConfig::default(),
         };
-        let encoded = encode_frame(&req).unwrap();
-        let decoded: IpcRequest = decode_frame(&encoded).unwrap();
+        let msg = IpcMessage::Request(req);
+        let encoded = encode_frame(&msg).unwrap();
+        let decoded = decode_frame(&encoded[4..]).unwrap();
         match decoded {
-            IpcRequest::Start { config } => {
+            IpcMessage::Request(IpcRequest::Start { config }) => {
                 assert_eq!(config.service_label, "Service running");
             }
-            other => panic!("Expected Start, got {other:?}"),
+            other => panic!("Expected Request(Start), got {other:?}"),
         }
     }
 
@@ -368,10 +353,16 @@ mod tests {
             data: Some(serde_json::json!(42)),
             error: None,
         };
-        let encoded = encode_frame(&resp).unwrap();
-        let decoded: IpcResponse = decode_frame(&encoded).unwrap();
-        assert!(decoded.ok);
-        assert_eq!(decoded.data.unwrap(), 42);
+        let msg = IpcMessage::Response(resp);
+        let encoded = encode_frame(&msg).unwrap();
+        let decoded = decode_frame(&encoded[4..]).unwrap();
+        match decoded {
+            IpcMessage::Response(r) => {
+                assert!(r.ok);
+                assert_eq!(r.data.unwrap(), 42);
+            }
+            other => panic!("Expected Response, got {other:?}"),
+        }
     }
 
     #[test]
@@ -379,11 +370,12 @@ mod tests {
         let event = IpcEvent::Stopped {
             reason: "done".into(),
         };
-        let encoded = encode_frame(&event).unwrap();
-        let decoded: IpcEvent = decode_frame(&encoded).unwrap();
+        let msg = IpcMessage::Event(event);
+        let encoded = encode_frame(&msg).unwrap();
+        let decoded = decode_frame(&encoded[4..]).unwrap();
         match decoded {
-            IpcEvent::Stopped { reason } => assert_eq!(reason, "done"),
-            other => panic!("Expected Stopped, got {other:?}"),
+            IpcMessage::Event(IpcEvent::Stopped { reason }) => assert_eq!(reason, "done"),
+            other => panic!("Expected Event(Stopped), got {other:?}"),
         }
     }
 
@@ -397,63 +389,96 @@ mod tests {
     }
 
     #[test]
-    fn ipc_frame_too_large_rejected() {
-        // Create a frame with length prefix claiming > 16MB
-        let fake_len = (MAX_FRAME_SIZE + 1) as u32;
-        let mut data = vec![0u8; 4 + 1];
-        data[0..4].copy_from_slice(&fake_len.to_be_bytes());
-        data[4] = b'{';
-        let result: Result<IpcRequest, FrameError> = decode_frame(&data);
-        match result {
-            Err(FrameError::TooLarge { size, max }) => {
-                assert_eq!(size, MAX_FRAME_SIZE + 1);
-                assert_eq!(max, MAX_FRAME_SIZE);
+    fn ipc_frame_decode_payload_without_length_prefix() {
+        // Verify decode_frame works with payload-only bytes (no length prefix).
+        let resp = IpcResponse {
+            ok: true,
+            data: Some(serde_json::json!({"status": "ok"})),
+            error: None,
+        };
+        let msg = IpcMessage::Response(resp);
+        let payload = serde_json::to_vec(&msg).unwrap();
+        let decoded = decode_frame(&payload).unwrap();
+        match decoded {
+            IpcMessage::Response(r) => {
+                assert!(r.ok);
+                assert_eq!(r.data.unwrap()["status"], "ok");
             }
-            other => panic!("Expected TooLarge, got {other:?}"),
+            other => panic!("Expected Response, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn ipc_frame_incomplete_length() {
-        let data = [0u8; 3]; // Only 3 bytes, need 4
-        let result: Result<IpcRequest, FrameError> = decode_frame(&data);
-        assert!(
-            matches!(result, Err(FrameError::IncompleteLength)),
-            "Expected IncompleteLength, got {result:?}"
-        );
     }
 
     #[test]
     fn ipc_frame_malformed_json() {
-        // Valid length prefix (3 bytes) + invalid JSON
         let payload = b"{invalid";
-        let mut data = Vec::with_capacity(4 + payload.len());
-        data.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        data.extend_from_slice(payload);
-        let result: Result<IpcRequest, FrameError> = decode_frame(&data);
-        match result {
-            Err(FrameError::Json(_)) => {} // expected
-            other => panic!("Expected Json error, got {other:?}"),
+        let result = decode_frame(payload);
+        assert!(result.is_err(), "Expected JSON error for malformed payload");
+    }
+
+    // --- IpcMessage wrapper enum tests ---
+
+    #[test]
+    fn ipc_message_response_roundtrip() {
+        let msg = IpcMessage::Response(IpcResponse {
+            ok: true,
+            data: Some(serde_json::json!({"running": true})),
+            error: None,
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"kind\":\"response\""), "kind tag: {json}");
+        let de: IpcMessage = serde_json::from_str(&json).unwrap();
+        match de {
+            IpcMessage::Response(resp) => {
+                assert!(resp.ok);
+                assert_eq!(resp.data.unwrap()["running"], true);
+            }
+            other => panic!("Expected Response, got {other:?}"),
         }
     }
 
     #[test]
-    fn ipc_frame_incomplete_payload() {
-        // Length says 100 bytes but only 1 byte available
-        let mut data = vec![0u8; 5];
-        data[0..4].copy_from_slice(&100u32.to_be_bytes());
-        data[4] = b'{';
-        let result: Result<IpcRequest, FrameError> = decode_frame(&data);
-        match result {
-            Err(FrameError::IncompletePayload {
-                expected,
-                available,
-            }) => {
-                assert_eq!(expected, 100);
-                assert_eq!(available, 1);
+    fn ipc_message_event_roundtrip() {
+        let msg = IpcMessage::Event(IpcEvent::Stopped {
+            reason: "cancelled".into(),
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"kind\":\"event\""), "kind tag: {json}");
+        let de: IpcMessage = serde_json::from_str(&json).unwrap();
+        match de {
+            IpcMessage::Event(IpcEvent::Stopped { reason }) => {
+                assert_eq!(reason, "cancelled");
             }
-            other => panic!("Expected IncompletePayload, got {other:?}"),
+            other => panic!("Expected Event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ipc_message_ambiguous_frame_deterministic() {
+        // A frame with fields that overlap between Response and Event
+        // must be deserialized deterministically based on the "kind" tag.
+        let json = r#"{"kind":"event","type":"started","ok":true}"#;
+        let de: IpcMessage = serde_json::from_str(json).unwrap();
+        match de {
+            IpcMessage::Event(IpcEvent::Started) => {} // correct
+            other => panic!("Expected Event::Started, got {other:?}"),
+        }
+
+        // Same frame with kind=response must deserialize as Response
+        let json2 = r#"{"kind":"response","ok":true,"data":{"type":"started"}}"#;
+        let de2: IpcMessage = serde_json::from_str(json2).unwrap();
+        match de2 {
+            IpcMessage::Response(resp) => {
+                assert!(resp.ok);
+            }
+            other => panic!("Expected Response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipc_message_unknown_kind_rejected() {
+        let json = r#"{"kind":"unknown","ok":true}"#;
+        let result: Result<IpcMessage, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "Expected error for unknown kind value");
     }
 
     // --- socket_path tests ---

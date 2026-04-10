@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::desktop::ipc::IpcEvent;
+use crate::desktop::ipc::{IpcEvent, IpcMessage};
 use crate::desktop::ipc_server::IpcServer;
 use crate::error::ServiceError;
 use crate::manager::{manager_loop, ServiceFactory};
@@ -120,17 +120,18 @@ pub async fn connect(path: &PathBuf) -> tokio::net::UnixStream {
     tokio::net::UnixStream::connect(path).await.unwrap()
 }
 
-/// Send an [`IpcRequest`] over a raw stream.
+/// Send an [`IpcRequest`] over a raw stream, wrapped in [`IpcMessage::Request`].
 pub async fn send_request(
     stream: &mut tokio::net::UnixStream,
     request: &crate::desktop::ipc::IpcRequest,
 ) {
     use tokio::io::AsyncWriteExt;
-    let frame = crate::desktop::ipc::encode_frame(request).unwrap();
+    let msg = IpcMessage::Request(request.clone());
+    let frame = crate::desktop::ipc::encode_frame(&msg).unwrap();
     stream.write_all(&frame).await.unwrap();
 }
 
-/// Read an [`IpcResponse`] from a raw stream.
+/// Read an [`IpcResponse`] from a raw stream (expects [`IpcMessage::Response`] on the wire).
 pub async fn read_response(
     stream: &mut tokio::net::UnixStream,
 ) -> crate::desktop::ipc::IpcResponse {
@@ -140,10 +141,13 @@ pub async fn read_response(
     let len = u32::from_be_bytes(len_buf) as usize;
     let mut payload = vec![0u8; len];
     stream.read_exact(&mut payload).await.unwrap();
-    serde_json::from_slice(&payload).unwrap()
+    match serde_json::from_slice::<IpcMessage>(&payload).unwrap() {
+        IpcMessage::Response(resp) => resp,
+        other => panic!("Expected IpcMessage::Response, got {other:?}"),
+    }
 }
 
-/// Read an [`IpcEvent`] from a raw stream.
+/// Read an [`IpcEvent`] from a raw stream (expects [`IpcMessage::Event`] on the wire).
 pub async fn read_event(stream: &mut tokio::net::UnixStream) -> crate::desktop::ipc::IpcEvent {
     use tokio::io::AsyncReadExt;
     let mut len_buf = [0u8; 4];
@@ -151,5 +155,8 @@ pub async fn read_event(stream: &mut tokio::net::UnixStream) -> crate::desktop::
     let len = u32::from_be_bytes(len_buf) as usize;
     let mut payload = vec![0u8; len];
     stream.read_exact(&mut payload).await.unwrap();
-    serde_json::from_slice(&payload).unwrap()
+    match serde_json::from_slice::<IpcMessage>(&payload).unwrap() {
+        IpcMessage::Event(event) => event,
+        other => panic!("Expected IpcMessage::Event, got {other:?}"),
+    }
 }

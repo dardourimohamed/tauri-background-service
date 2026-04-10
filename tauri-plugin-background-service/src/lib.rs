@@ -422,13 +422,13 @@ where
             uninstall_service,
         ])
         .setup(move |app, api| {
-            let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+            let config = api.config().clone();
+            let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(config.channel_capacity);
             #[cfg(mobile)]
             let mobile_cmd_tx = cmd_tx.clone();
             let handle = ServiceManagerHandle::new(cmd_tx);
             app.manage(handle);
 
-            let config = api.config().clone();
             app.manage(config.clone());
 
             let ios_safety_timeout_secs = config.ios_safety_timeout_secs;

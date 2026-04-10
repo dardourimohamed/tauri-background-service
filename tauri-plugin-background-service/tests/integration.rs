@@ -301,10 +301,10 @@ async fn callback_fires_on_error() {
     );
 }
 
-// ─── Test 9: ServiceContext fields populated ─────────────────────────
+// ─── Test 9: ServiceContext fields are None on desktop ────────────────
 
 #[tokio::test]
-async fn service_context_fields_populated() {
+async fn service_context_fields_none_on_desktop() {
     let label = Arc::new(Mutex::new(None::<String>));
     let fst = Arc::new(Mutex::new(None::<String>));
     let label_clone = label.clone();
@@ -325,15 +325,15 @@ async fn service_context_fields_populated() {
     handle.start(app.handle().clone(), config).await.unwrap();
     wait_until_stopped(&handle, 1000).await;
 
-    assert_eq!(
-        label.lock().unwrap().as_deref(),
-        Some("Integration Test"),
-        "service_label should be populated from StartConfig"
+    // On desktop, service_label and foreground_service_type are None.
+    // On mobile (cfg!(mobile) == true), they would be Some(...).
+    assert!(
+        label.lock().unwrap().is_none(),
+        "service_label should be None on desktop"
     );
-    assert_eq!(
-        fst.lock().unwrap().as_deref(),
-        Some("specialUse"),
-        "foreground_service_type should be populated from StartConfig"
+    assert!(
+        fst.lock().unwrap().is_none(),
+        "foreground_service_type should be None on desktop"
     );
 }
 

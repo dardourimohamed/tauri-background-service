@@ -7,13 +7,16 @@
 //! Only available when the `desktop-service` Cargo feature is enabled.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Duration;
 
 use tauri::{Emitter, Runtime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 use crate::desktop::ipc::{
-    decode_frame, encode_frame, IpcEvent, IpcRequest, IpcResponse, MAX_FRAME_SIZE,
+    decode_frame, encode_frame, IpcEvent, IpcMessage, IpcRequest, IpcResponse, MAX_FRAME_SIZE,
 };
 use crate::error::ServiceError;
 use crate::models::{PluginEvent, StartConfig};
@@ -43,7 +46,7 @@ impl IpcClient {
     /// Send a Start command to the sidecar.
     pub async fn start(&mut self, config: StartConfig) -> Result<(), ServiceError> {
         let request = IpcRequest::Start { config };
-        let response = self.send_and_read(&request).await?;
+        let (response, _events) = self.send_and_read(&request).await?;
         if response.ok {
             Ok(())
         } else {
@@ -55,7 +58,7 @@ impl IpcClient {
 
     /// Send a Stop command to the sidecar.
     pub async fn stop(&mut self) -> Result<(), ServiceError> {
-        let response = self.send_and_read(&IpcRequest::Stop).await?;
+        let (response, _events) = self.send_and_read(&IpcRequest::Stop).await?;
         if response.ok {
             Ok(())
         } else {
@@ -67,7 +70,7 @@ impl IpcClient {
 
     /// Send an IsRunning query to the sidecar.
     pub async fn is_running(&mut self) -> Result<bool, ServiceError> {
-        let response = self.send_and_read(&IpcRequest::IsRunning).await?;
+        let (response, _events) = self.send_and_read(&IpcRequest::IsRunning).await?;
         if response.ok {
             Ok(response
                 .data
@@ -88,9 +91,13 @@ impl IpcClient {
             Some(f) => f,
             None => return Ok(None),
         };
-        decode_frame::<IpcEvent>(&frame)
-            .map(Some)
-            .map_err(|e| ServiceError::Ipc(format!("decode event: {e}")))
+        match decode_frame(&frame).map_err(|e| ServiceError::Ipc(format!("decode event: {e}")))? {
+            IpcMessage::Event(event) => Ok(Some(event)),
+            other => Err(ServiceError::Ipc(format!(
+                "expected event frame, got {:?}",
+                std::mem::discriminant(&other),
+            ))),
+        }
     }
 
     /// Spawn a background task that reads [`IpcEvent`] frames and emits
@@ -114,34 +121,35 @@ impl IpcClient {
 
     // -- Private helpers -------------------------------------------------------
 
-    async fn send_and_read(&mut self, request: &IpcRequest) -> Result<IpcResponse, ServiceError> {
+    async fn send_and_read(
+        &mut self,
+        request: &IpcRequest,
+    ) -> Result<(IpcResponse, Vec<IpcEvent>), ServiceError> {
         self.send_request(request).await?;
         // The server interleaves IpcResponse and broadcast IpcEvent frames on
-        // the same socket. Read frames in a loop until we get one that
-        // deserialises as an IpcResponse.
-        //
-        // IpcEvent frames encountered here are discarded. Direct IpcClient users
-        // should use `listen_events()` (which takes ownership of self) for event
-        // consumption. For PersistentIpcClientHandle, the background reader task
-        // handles events — these interleaved frames are redundant.
+        // the same socket. Read frames in a loop until we get a Response,
+        // collecting any Event frames encountered along the way.
+        let mut events = Vec::new();
         loop {
             let frame = self
                 .read_frame()
                 .await?
                 .ok_or_else(|| ServiceError::Ipc("connection closed".into()))?;
-            if let Ok(resp) = decode_frame::<IpcResponse>(&frame) {
-                return Ok(resp);
+            match decode_frame(&frame).map_err(|e| ServiceError::Ipc(format!("decode: {e}")))? {
+                IpcMessage::Response(resp) => return Ok((resp, events)),
+                IpcMessage::Event(e) => {
+                    events.push(e);
+                }
+                IpcMessage::Request(_) => {
+                    return Err(ServiceError::Ipc("unexpected request frame".into()));
+                }
             }
-            // Not a response frame — log it at debug level and skip.
-            log::debug!(
-                "send_and_read: discarding interleaved non-response frame ({} bytes)",
-                frame.len()
-            );
         }
     }
 
     async fn send_request(&mut self, request: &IpcRequest) -> Result<(), ServiceError> {
-        let frame = encode_frame(request).map_err(|e| ServiceError::Ipc(format!("encode: {e}")))?;
+        let msg = IpcMessage::Request(request.clone());
+        let frame = encode_frame(&msg).map_err(|e| ServiceError::Ipc(format!("encode: {e}")))?;
         self.stream
             .write_all(&frame)
             .await
@@ -151,6 +159,7 @@ impl IpcClient {
 
     /// Read a single length-prefixed frame from the socket.
     ///
+    /// Returns the payload bytes only (no length prefix).
     /// Returns `None` if the connection was closed cleanly.
     async fn read_frame(&mut self) -> Result<Option<Vec<u8>>, ServiceError> {
         let mut len_buf = [0u8; 4];
@@ -171,10 +180,7 @@ impl IpcClient {
             .read_exact(&mut payload)
             .await
             .map_err(|e| ServiceError::Ipc(format!("read payload: {e}")))?;
-        let mut frame = Vec::with_capacity(4 + len);
-        frame.extend_from_slice(&len_buf);
-        frame.extend_from_slice(&payload);
-        Ok(Some(frame))
+        Ok(Some(payload))
     }
 }
 
@@ -208,11 +214,12 @@ enum IpcCommand {
 ///
 /// The background task automatically:
 /// - Relays [`IpcEvent`] frames to `app.emit("background-service://event", ...)`
-/// - Reconnects on connection failure with a 1-second delay
+/// - Reconnects on connection failure with exponential backoff (1s–30s, up to 10 retries)
 /// - Forwards commands (start/stop/is_running) over the same connection
 pub struct PersistentIpcClientHandle {
     cmd_tx: tokio::sync::mpsc::Sender<IpcCommand>,
     shutdown: tokio_util::sync::CancellationToken,
+    connected: Arc<AtomicBool>,
 }
 
 impl Drop for PersistentIpcClientHandle {
@@ -230,15 +237,21 @@ impl PersistentIpcClientHandle {
     pub fn spawn<R: Runtime>(socket_path: PathBuf, app: tauri::AppHandle<R>) -> Self {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
         let shutdown = tokio_util::sync::CancellationToken::new();
+        let connected = Arc::new(AtomicBool::new(false));
 
         tokio::spawn(persistent_client_loop(
             socket_path,
             app,
             cmd_rx,
             shutdown.clone(),
+            connected.clone(),
         ));
 
-        Self { cmd_tx, shutdown }
+        Self {
+            cmd_tx,
+            shutdown,
+            connected,
+        }
     }
 
     /// Send a Start command through the persistent connection.
@@ -279,6 +292,12 @@ impl PersistentIpcClientHandle {
             .await
             .map_err(|_| ServiceError::Ipc("command dropped".into()))?
     }
+
+    /// Returns `true` if the persistent client is currently connected to the
+    /// headless sidecar, `false` otherwise.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// Background task: maintain a persistent connection with reconnection.
@@ -287,33 +306,59 @@ async fn persistent_client_loop<R: Runtime>(
     app: tauri::AppHandle<R>,
     mut cmd_rx: tokio::sync::mpsc::Receiver<IpcCommand>,
     shutdown: tokio_util::sync::CancellationToken,
+    connected: Arc<AtomicBool>,
 ) {
+    use backon::BackoffBuilder;
+
+    let backoff_builder = backon::ExponentialBuilder::default()
+        .with_min_delay(Duration::from_secs(1))
+        .with_max_delay(Duration::from_secs(30))
+        .with_max_times(10)
+        .with_jitter();
+
+    let mut attempts = backoff_builder.build();
+
     loop {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
                 log::info!("Persistent IPC client shutting down");
+                connected.store(false, std::sync::atomic::Ordering::Relaxed);
                 break;
             }
             connect_result = UnixStream::connect(&socket_path) => {
                 match connect_result {
                     Ok(stream) => {
                         log::info!("Persistent IPC client connected");
-                        if run_persistent_connection(stream, &app, &mut cmd_rx).await.is_err() {
+                        connected.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let result = run_persistent_connection(stream, &app, &mut cmd_rx, &connected).await;
+                        // Reset backoff on successful connect (even if session later failed).
+                        attempts = backoff_builder.build();
+                        if result.is_err() {
                             log::info!("Persistent IPC connection lost, reconnecting...");
+                            connected.store(false, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                     Err(_) => {
                         log::debug!("Persistent IPC client: connection failed, retrying...");
+                        connected.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
+                let delay = match attempts.next() {
+                    Some(d) => d,
+                    None => {
+                        log::warn!("Persistent IPC client: backoff exhausted, giving up");
+                        break;
+                    }
+                };
                 tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => {
                         log::info!("Persistent IPC client shutting down");
+                        connected.store(false, std::sync::atomic::Ordering::Relaxed);
                         break;
                     }
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                    _ = tokio::time::sleep(delay) => {}
                 }
             }
         }
@@ -330,6 +375,7 @@ async fn run_persistent_connection<R: Runtime>(
     stream: UnixStream,
     app: &tauri::AppHandle<R>,
     cmd_rx: &mut tokio::sync::mpsc::Receiver<IpcCommand>,
+    connected: &Arc<AtomicBool>,
 ) -> Result<(), ServiceError> {
     let (read_half, mut write_half) = stream.into_split();
 
@@ -340,6 +386,7 @@ async fn run_persistent_connection<R: Runtime>(
 
     let slot_writer = response_slot.clone();
     let app_clone = app.clone();
+    let connected_reader = connected.clone();
 
     // Reader task: reads frames and either relays events or delivers responses.
     let reader_handle = tokio::spawn(async move {
@@ -351,24 +398,31 @@ async fn run_persistent_connection<R: Runtime>(
                 Err(_) => break,
             };
 
-            // Try to decode as IpcResponse first (command reply)
-            if let Ok(resp) = decode_frame::<IpcResponse>(&frame) {
-                let mut slot = slot_writer.lock().await;
-                if let Some(sender) = slot.take() {
-                    let _ = sender.send(resp);
+            match decode_frame(&frame) {
+                Ok(IpcMessage::Response(resp)) => {
+                    let mut slot = slot_writer.lock().await;
+                    if let Some(sender) = slot.take() {
+                        let _ = sender.send(resp);
+                    }
+                    continue;
                 }
-                continue;
+                Ok(IpcMessage::Event(event)) => {
+                    let plugin_event = ipc_event_to_plugin_event(event);
+                    let _ = app_clone.emit("background-service://event", plugin_event);
+                    continue;
+                }
+                Ok(IpcMessage::Request(_)) => {
+                    log::warn!("unexpected request frame on client connection");
+                    continue;
+                }
+                Err(e) => {
+                    log::debug!("failed to decode IPC frame: {e}");
+                    continue;
+                }
             }
-
-            // Try to decode as IpcEvent
-            if let Ok(event) = decode_frame::<IpcEvent>(&frame) {
-                let plugin_event = ipc_event_to_plugin_event(event);
-                let _ = app_clone.emit("background-service://event", plugin_event);
-                continue;
-            }
-
-            // Unknown frame type — skip
         }
+        // Reader exited — mark disconnected.
+        connected_reader.store(false, std::sync::atomic::Ordering::Relaxed);
     });
 
     // Main loop: receive commands, send requests, wait for responses.
@@ -453,7 +507,8 @@ async fn send_request_to(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     request: &IpcRequest,
 ) -> Result<(), ServiceError> {
-    let frame = encode_frame(request).map_err(|e| ServiceError::Ipc(format!("encode: {e}")))?;
+    let msg = IpcMessage::Request(request.clone());
+    let frame = encode_frame(&msg).map_err(|e| ServiceError::Ipc(format!("encode: {e}")))?;
     write_half
         .write_all(&frame)
         .await
@@ -499,6 +554,8 @@ async fn await_response(
 }
 
 /// Read a single length-prefixed frame from a read half.
+///
+/// Returns the payload bytes only (no length prefix).
 async fn read_frame_from(
     read_half: &mut tokio::net::unix::OwnedReadHalf,
 ) -> Result<Option<Vec<u8>>, ServiceError> {
@@ -520,10 +577,7 @@ async fn read_frame_from(
         .read_exact(&mut payload)
         .await
         .map_err(|e| ServiceError::Ipc(format!("read payload: {e}")))?;
-    let mut frame = Vec::with_capacity(4 + len);
-    frame.extend_from_slice(&len_buf);
-    frame.extend_from_slice(&payload);
-    Ok(Some(frame))
+    Ok(Some(payload))
 }
 
 #[cfg(test)]
@@ -1128,5 +1182,420 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         shutdown.cancel();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  BUFFERED EVENTS TESTS (Step 4)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Helper: create a raw server that sends specific frames in response to
+    /// any request, giving full control over the event/response interleaving.
+    async fn buffered_server(
+        path: &std::path::Path,
+        frames: Vec<IpcMessage>,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            // Read and discard the incoming request.
+            let mut len_buf = [0u8; 4];
+            if stream.read_exact(&mut len_buf).await.is_err() {
+                return;
+            }
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len];
+            if stream.read_exact(&mut payload).await.is_err() {
+                return;
+            }
+            // Send the pre-programmed frames in order.
+            for msg in &frames {
+                let frame = crate::desktop::ipc::encode_frame(msg).unwrap();
+                if stream.write_all(&frame).await.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// send_and_read returns response with empty event list when no events interleave.
+    #[tokio::test]
+    async fn send_and_read_no_interleaved_events() {
+        let path = crate::desktop::test_helpers::unique_socket_path();
+        let server = buffered_server(
+            &path,
+            vec![IpcMessage::Response(IpcResponse {
+                ok: true,
+                data: None,
+                error: None,
+            })],
+        )
+        .await;
+
+        let mut client = IpcClient::connect(path.clone()).await.unwrap();
+        let (response, events) = client.send_and_read(&IpcRequest::IsRunning).await.unwrap();
+        assert!(response.ok, "response should be ok");
+        assert!(
+            events.is_empty(),
+            "events should be empty when no events interleave, got {:?}",
+            events
+        );
+
+        server.await.unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// send_and_read collects a single interleaved event alongside the response.
+    #[tokio::test]
+    async fn send_and_read_single_interleaved_event() {
+        let path = crate::desktop::test_helpers::unique_socket_path();
+        let server = buffered_server(
+            &path,
+            vec![
+                IpcMessage::Event(IpcEvent::Started),
+                IpcMessage::Response(IpcResponse {
+                    ok: true,
+                    data: None,
+                    error: None,
+                }),
+            ],
+        )
+        .await;
+
+        let mut client = IpcClient::connect(path.clone()).await.unwrap();
+        let (response, events) = client
+            .send_and_read(&IpcRequest::Start {
+                config: StartConfig::default(),
+            })
+            .await
+            .unwrap();
+        assert!(response.ok, "response should be ok");
+        assert_eq!(events.len(), 1, "should collect exactly one event");
+        assert!(
+            matches!(events[0], IpcEvent::Started),
+            "expected Started event, got {:?}",
+            events[0]
+        );
+
+        server.await.unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  IS_CONNECTED TESTS (Step 5)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// is_connected() returns false before the background task has connected
+    /// to any server.
+    #[tokio::test]
+    async fn is_connected_false_before_server() {
+        let app = tauri::test::mock_app();
+        let path = crate::desktop::test_helpers::unique_socket_path();
+        // No server running — spawn handle pointing at a nonexistent socket.
+        let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+        // The background task may or may not have attempted a connection yet,
+        // but it should definitely NOT be connected.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !handle.is_connected(),
+            "should not be connected when no server is running"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// is_connected() returns true once the persistent client has established
+    /// a connection to a running server.
+    #[tokio::test]
+    async fn is_connected_true_after_connect() {
+        let (path, shutdown, _event_tx) = setup_server();
+        let app = tauri::test::mock_app();
+        let handle = PersistentIpcClientHandle::spawn(path, app.handle().clone());
+
+        // Wait for the background task to connect.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !handle.is_connected() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for is_connected to become true");
+
+        assert!(
+            handle.is_connected(),
+            "should be connected after server is up"
+        );
+
+        shutdown.cancel();
+    }
+
+    /// is_connected() returns false after the server shuts down and the
+    /// persistent client detects the disconnection.
+    ///
+    /// Uses a minimal server that accepts one connection then explicitly drops
+    /// it, guaranteeing the reader task exits and sets connected = false.
+    #[tokio::test]
+    async fn is_connected_false_after_server_shutdown() {
+        let path = crate::desktop::test_helpers::unique_socket_path();
+        let path_clone = path.clone();
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+
+        // Server that accepts a connection, waits briefly, then drops
+        // everything (stream + listener), preventing reconnection.
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // Hold the connection briefly so the client can connect.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // Drop the stream — reader will detect EOF.
+            drop(stream);
+            // Drop the listener (moved into this closure) and clean up socket.
+            let _ = std::fs::remove_file(&path_clone);
+        });
+
+        let app = tauri::test::mock_app();
+        let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+
+        // Wait for connection.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !handle.is_connected() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for initial connection");
+
+        assert!(handle.is_connected(), "should be connected initially");
+
+        // Wait for the server to drop the connection and listener.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while handle.is_connected() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for is_connected to become false");
+
+        assert!(
+            !handle.is_connected(),
+            "should not be connected after server shutdown"
+        );
+
+        server_handle.abort();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  BACKOFF BEHAVIOR TESTS (Step 6c)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Verify the ExponentialBuilder config used in persistent_client_loop
+    /// produces increasing delays, respects the 30s max, and exhausts after
+    /// exactly 10 attempts.
+    #[test]
+    fn backoff_builder_produces_increasing_delays() {
+        use backon::BackoffBuilder;
+
+        let builder = backon::ExponentialBuilder::default()
+            .with_min_delay(Duration::from_secs(1))
+            .with_max_delay(Duration::from_secs(30))
+            .with_max_times(10)
+            .with_jitter();
+
+        let mut attempts = builder.build();
+        let mut delays = Vec::new();
+        while let Some(d) = attempts.next() {
+            delays.push(d);
+        }
+
+        assert_eq!(delays.len(), 10, "should produce exactly 10 delays");
+
+        // First delay ≈ 1s (with jitter, allow 0.5–2s).
+        assert!(
+            delays[0] >= Duration::from_millis(500),
+            "first delay too short: {:?}",
+            delays[0]
+        );
+        assert!(
+            delays[0] <= Duration::from_secs(2),
+            "first delay too long: {:?}",
+            delays[0]
+        );
+
+        // Last delay should be at or near the 30s cap.
+        assert!(
+            delays[9] >= Duration::from_secs(15),
+            "last delay should approach max: {:?}",
+            delays[9]
+        );
+
+        // All delays capped — with jitter, allow up to 2× max_delay.
+        for d in &delays {
+            assert!(
+                *d <= Duration::from_secs(60),
+                "delay exceeds max_delay + jitter margin: {:?}",
+                d
+            );
+        }
+
+        // Iterator is exhausted after 10 attempts.
+        assert!(
+            attempts.next().is_none(),
+            "should return None after 10 attempts"
+        );
+    }
+
+    /// Verify the persistent client stops retrying after exhausting its backoff
+    /// budget and that subsequent commands fail with "shut down" (channel closed).
+    ///
+    /// With min_delay=1s, max_delay=30s, max_times=10, total retry time ≈ 152s.
+    /// Marked `#[ignore]` to avoid slowing down normal test runs.
+    /// Run with `cargo test -- --ignored`.
+    #[ignore]
+    #[tokio::test]
+    async fn persistent_client_exits_after_max_retries() {
+        let app = tauri::test::mock_app();
+        let path = crate::desktop::test_helpers::unique_socket_path();
+        let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+
+        // Wait for the background task to exhaust retries.
+        // Poll is_running() — once the loop exits, the command channel closes
+        // and we get "shut down" instead of a timeout.
+        let exited = tokio::time::timeout(Duration::from_secs(180), async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if let Err(e) = handle.is_running().await {
+                    if e.to_string().contains("shut down") {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            exited.is_ok(),
+            "persistent client should exit after max retries"
+        );
+        assert!(!handle.is_connected(), "should not be connected after exit");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Verify the persistent client reconnects after a server restart and that
+    /// the backoff resets (reconnection starts from ~1s min_delay, not an
+    /// accumulated delay).
+    #[tokio::test]
+    async fn persistent_client_reconnects_after_server_restart() {
+        use crate::desktop::ipc_server::IpcServer;
+        use crate::manager::{manager_loop, ServiceFactory};
+        use tokio_util::sync::CancellationToken;
+
+        // Start first server.
+        let (path, shutdown1, _event_tx) = setup_server();
+        let app = tauri::test::mock_app();
+        let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+
+        // Wait for connection to first server.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !handle.is_connected() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("should connect to first server");
+
+        // Verify commands work through first connection.
+        let result = handle.is_running().await;
+        assert!(
+            result.is_ok(),
+            "command should succeed on first server: {:?}",
+            result.err()
+        );
+
+        // Kill first server.
+        shutdown1.cancel();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Start second server at the same path.
+        let (cmd_tx2, cmd_rx2) = tokio::sync::mpsc::channel(16);
+        let factory: ServiceFactory<tauri::test::MockRuntime> =
+            Box::new(|| Box::new(BlockingService));
+        tokio::spawn(manager_loop(
+            cmd_rx2, factory, 0.0, 0.0, 0.0, 0.0, false, false,
+        ));
+        let server2 = IpcServer::bind(path.clone(), cmd_tx2, app.handle().clone()).unwrap();
+        let shutdown2 = CancellationToken::new();
+        let s2 = shutdown2.clone();
+        tokio::spawn(async move { server2.run(s2).await });
+
+        // Client should reconnect within ~1s (backoff resets to min_delay after
+        // a successful session, so the first retry is ~1s, not accumulated).
+        let reconnected = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if handle.is_connected() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+
+        assert!(
+            reconnected.is_ok(),
+            "persistent client should reconnect after server restart (backoff resets)"
+        );
+
+        // Verify commands work through the new connection.
+        let result = handle.is_running().await;
+        assert!(
+            result.is_ok(),
+            "commands should work after reconnection: {:?}",
+            result.err()
+        );
+
+        shutdown2.cancel();
+    }
+
+    /// send_and_read collects multiple consecutive events before the response.
+    #[tokio::test]
+    async fn send_and_read_multiple_interleaved_events() {
+        let path = crate::desktop::test_helpers::unique_socket_path();
+        let server = buffered_server(
+            &path,
+            vec![
+                IpcMessage::Event(IpcEvent::Started),
+                IpcMessage::Event(IpcEvent::Error {
+                    message: "warning".into(),
+                }),
+                IpcMessage::Event(IpcEvent::Stopped {
+                    reason: "cancelled".into(),
+                }),
+                IpcMessage::Response(IpcResponse {
+                    ok: true,
+                    data: Some(serde_json::json!({"running": false})),
+                    error: None,
+                }),
+            ],
+        )
+        .await;
+
+        let mut client = IpcClient::connect(path.clone()).await.unwrap();
+        let (response, events) = client.send_and_read(&IpcRequest::IsRunning).await.unwrap();
+        assert!(response.ok, "response should be ok");
+        assert_eq!(events.len(), 3, "should collect all three events");
+        assert!(
+            matches!(events[0], IpcEvent::Started),
+            "first event should be Started"
+        );
+        assert!(
+            matches!(events[1], IpcEvent::Error { .. }),
+            "second event should be Error"
+        );
+        assert!(
+            matches!(events[2], IpcEvent::Stopped { .. }),
+            "third event should be Stopped"
+        );
+
+        server.await.unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 }
