@@ -9,7 +9,8 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use service_manager::{
-    ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager, ServiceUninstallCtx,
+    RestartPolicy, ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager,
+    ServiceUninstallCtx,
 };
 use tauri::AppHandle;
 
@@ -72,6 +73,11 @@ impl DesktopServiceManager {
                 working_directory: None,
                 environment: None,
                 autostart: false,
+                restart_policy: RestartPolicy::OnFailure {
+                    delay_secs: None,
+                    max_retries: None,
+                    reset_after_secs: None,
+                },
             })
             .map_err(|e| ServiceError::ServiceInstall(e.to_string()))
     }

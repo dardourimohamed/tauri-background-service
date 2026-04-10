@@ -1,6 +1,6 @@
 [package]
 name = "tauri-plugin-background-service"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 links = "tauri-plugin-background-service"
 description = "Background service lifecycle plugin for Tauri v2 — run long-lived tasks on Android, iOS, and desktop"
@@ -37,7 +37,7 @@ log = "0.4"
 async-trait = "0.1"
 libc = "0.2"
 backon = { version = "~1.5", optional = true }
-service-manager = { version = "0.7", optional = true }
+service-manager = { version = "0.11", optional = true }
 
 [build-dependencies]
 tauri-plugin = { version = "2", features = ["build"] }
