@@ -16,6 +16,17 @@ export interface StartConfig {
   foregroundServiceType?: string;
 }
 
+/** Service lifecycle state. */
+export type ServiceState = 'idle' | 'initializing' | 'running' | 'stopped';
+
+/** Snapshot of the service lifecycle status. */
+export interface ServiceStatus {
+  /** Current lifecycle state. */
+  state: ServiceState;
+  /** Last error message, if the service stopped due to an error. */
+  lastError: string | null;
+}
+
 /** Built-in plugin lifecycle events */
 export type PluginEvent =
   | { type: 'started' }
@@ -38,6 +49,11 @@ export async function stopService(): Promise<void> {
 /** Returns true if the Rust service is currently running. */
 export async function isServiceRunning(): Promise<boolean> {
   return invoke<boolean>('plugin:background-service|is_running');
+}
+
+/** Returns the current service lifecycle state and optional error. */
+export async function getServiceState(): Promise<ServiceStatus> {
+  return invoke<ServiceStatus>('plugin:background-service|get_service_state');
 }
 
 /**

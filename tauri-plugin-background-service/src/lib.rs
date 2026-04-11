@@ -1,4 +1,4 @@
-#![doc(html_root_url = "https://docs.rs/tauri-plugin-background-service/0.2.2")]
+#![doc(html_root_url = "https://docs.rs/tauri-plugin-background-service/0.3.1")]
 
 //! # tauri-plugin-background-service
 //!
@@ -88,7 +88,9 @@ pub use error::ServiceError;
 pub use manager::{manager_loop, OnCompleteCallback, ServiceFactory, ServiceManagerHandle};
 #[doc(hidden)]
 pub use models::AutoStartConfig;
-pub use models::{PluginConfig, PluginEvent, ServiceContext, StartConfig};
+pub use models::{
+    PluginConfig, PluginEvent, ServiceContext, ServiceState, ServiceStatus, StartConfig,
+};
 pub use notifier::Notifier;
 pub use service_trait::BackgroundService;
 
@@ -314,6 +316,23 @@ async fn is_running<R: Runtime>(app: AppHandle<R>) -> bool {
     rx.await.unwrap_or(false)
 }
 
+#[tauri::command]
+async fn get_service_state<R: Runtime>(app: AppHandle<R>) -> Result<models::ServiceStatus, String> {
+    // OS service mode: route through persistent IPC client.
+    #[cfg(feature = "desktop-service")]
+    if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
+        return ipc_state
+            .client
+            .get_state()
+            .await
+            .map_err(|e| e.to_string());
+    }
+
+    // In-process mode (default).
+    let manager = app.state::<ServiceManagerHandle<R>>();
+    Ok(manager.get_state().await)
+}
+
 // ─── Desktop OS Service State & Commands ──────────────────────────────────────
 
 /// Managed state indicating OS service mode via IPC.
@@ -416,6 +435,7 @@ where
             start,
             stop,
             is_running,
+            get_service_state,
             #[cfg(feature = "desktop-service")]
             install_service,
             #[cfg(feature = "desktop-service")]
@@ -547,6 +567,19 @@ where
 
             Ok(())
         })
+        .on_event(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // In OS service mode, the service runs in a separate process — skip.
+                #[cfg(feature = "desktop-service")]
+                if app.try_state::<DesktopIpcState>().is_some() {
+                    return;
+                }
+                let manager = app.state::<ServiceManagerHandle<R>>();
+                if let Err(e) = manager.stop_blocking() {
+                    log::warn!("Failed to stop background service on app exit: {e}");
+                }
+            }
+        })
         .build()
 }
 
@@ -636,6 +669,14 @@ mod tests {
         is_running(app).await
     }
 
+    /// Verify `get_service_state` command signature is async and generic over `R: Runtime`.
+    #[allow(dead_code)]
+    async fn get_service_state_command_signature<R: Runtime>(
+        app: AppHandle<R>,
+    ) -> Result<models::ServiceStatus, String> {
+        get_service_state(app).await
+    }
+
     // ── Desktop IPC State Tests ─────────────────────────────────────────
 
     /// Verify PersistentIpcClientHandle can be constructed.
@@ -669,6 +710,23 @@ mod tests {
         app: AppHandle<R>,
     ) -> Result<(), String> {
         uninstall_service(app).await
+    }
+
+    // ── On-Event Shutdown Compile-time Test ─────────────────────────────────
+
+    /// Verify the on_event closure accessing ServiceManagerHandle<R> from managed
+    /// state type-checks. Ensures the generic R is properly threaded through in
+    /// the on_event context where stop_blocking() is called synchronously.
+    #[allow(dead_code)]
+    fn on_event_shutdown_closure_type_checks<R: Runtime>(app: &AppHandle<R>) {
+        let _closure = |_app: &AppHandle<R>, event: &tauri::RunEvent| {
+            if let tauri::RunEvent::Exit = event {
+                let manager = _app.state::<ServiceManagerHandle<R>>();
+                if let Err(_e) = manager.stop_blocking() {
+                    log::warn!("bg service shutdown on exit failed: {_e}");
+                }
+            }
+        };
     }
 
     // ── Cancel Listener Tests ───────────────────────────────────────────────

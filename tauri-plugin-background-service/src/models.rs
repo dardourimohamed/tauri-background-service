@@ -61,12 +61,14 @@ pub struct ServiceContext<R: Runtime> {
     pub shutdown: CancellationToken,
 
     /// Text shown in the Android persistent notification.
-    /// `None` on desktop platforms.
-    pub service_label: Option<String>,
+    /// Only available on mobile platforms.
+    #[cfg(mobile)]
+    pub service_label: String,
 
     /// Android foreground service type (e.g. "dataSync", "specialUse").
-    /// `None` on desktop platforms.
-    pub foreground_service_type: Option<String>,
+    /// Only available on mobile platforms.
+    #[cfg(mobile)]
+    pub foreground_service_type: String,
 }
 
 /// Optional startup configuration forwarded from JS through the plugin.
@@ -189,6 +191,36 @@ impl Default for StartConfig {
             foreground_service_type: default_foreground_service_type(),
         }
     }
+}
+
+/// Lifecycle state of the background service.
+///
+/// Exposed via the `get-service-state` command to provide
+/// fine-grained status beyond a simple boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum ServiceState {
+    /// No service has been started, or the last run has fully cleaned up.
+    Idle,
+    /// `init()` is in progress (between `Start` and successful `init()`).
+    Initializing,
+    /// `init()` succeeded; `run()` is executing.
+    Running,
+    /// Service stopped (by `stop()`, natural completion, or error).
+    Stopped,
+}
+
+/// Snapshot of the service lifecycle status.
+///
+/// Returned by the `get-service-state` command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceStatus {
+    /// Current lifecycle state.
+    pub state: ServiceState,
+    /// Last error message, if the service stopped due to an error.
+    pub last_error: Option<String>,
 }
 
 /// Built-in event types emitted by the runner itself.
@@ -915,34 +947,34 @@ mod tests {
 
     use tauri::AppHandle;
 
-    // --- ServiceContext new fields tests ---
+    // --- ServiceContext mobile fields tests ---
 
-    /// Compile-time + runtime test: ServiceContext accepts the new optional fields.
+    /// Compile-time + runtime test: ServiceContext mobile fields are String.
+    #[cfg(mobile)]
     #[allow(dead_code)]
-    fn service_context_new_fields_default_to_none<R: Runtime>(app: AppHandle<R>) {
+    fn service_context_mobile_fields_with_values<R: Runtime>(app: AppHandle<R>) {
         let ctx = ServiceContext {
             notifier: Notifier { app: app.clone() },
             app,
             shutdown: CancellationToken::new(),
-            service_label: None,
-            foreground_service_type: None,
+            service_label: "Syncing".into(),
+            foreground_service_type: "dataSync".into(),
         };
-        assert_eq!(ctx.service_label, None);
-        assert_eq!(ctx.foreground_service_type, None);
+        assert_eq!(ctx.service_label, "Syncing");
+        assert_eq!(ctx.foreground_service_type, "dataSync");
     }
 
-    /// Compile-time + runtime test: ServiceContext carries label and type values.
+    /// Compile-time + runtime test: ServiceContext on desktop has no mobile fields.
+    #[cfg(not(mobile))]
     #[allow(dead_code)]
-    fn service_context_new_fields_with_values<R: Runtime>(app: AppHandle<R>) {
+    fn service_context_desktop_no_mobile_fields<R: Runtime>(app: AppHandle<R>) {
         let ctx = ServiceContext {
             notifier: Notifier { app: app.clone() },
             app,
             shutdown: CancellationToken::new(),
-            service_label: Some("Syncing".into()),
-            foreground_service_type: Some("dataSync".into()),
         };
-        assert_eq!(ctx.service_label.as_deref(), Some("Syncing"));
-        assert_eq!(ctx.foreground_service_type.as_deref(), Some("dataSync"));
+        // Compiles — service_label and foreground_service_type are absent.
+        let _ = ctx;
     }
 
     // --- Foreground service type validation tests ---
@@ -1010,6 +1042,110 @@ mod tests {
         assert!(
             result.is_err(),
             "validation should be case-sensitive: DataSync should fail"
+        );
+    }
+
+    // --- ServiceState serde tests ---
+
+    #[test]
+    fn service_state_idle_serde_roundtrip() {
+        let state = ServiceState::Idle;
+        let json = serde_json::to_string(&state).unwrap();
+        let de: ServiceState = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, ServiceState::Idle);
+    }
+
+    #[test]
+    fn service_state_initializing_serde_roundtrip() {
+        let state = ServiceState::Initializing;
+        let json = serde_json::to_string(&state).unwrap();
+        let de: ServiceState = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, ServiceState::Initializing);
+    }
+
+    #[test]
+    fn service_state_running_serde_roundtrip() {
+        let state = ServiceState::Running;
+        let json = serde_json::to_string(&state).unwrap();
+        let de: ServiceState = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, ServiceState::Running);
+    }
+
+    #[test]
+    fn service_state_stopped_serde_roundtrip() {
+        let state = ServiceState::Stopped;
+        let json = serde_json::to_string(&state).unwrap();
+        let de: ServiceState = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, ServiceState::Stopped);
+    }
+
+    #[test]
+    fn service_state_json_values_are_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&ServiceState::Idle).unwrap(),
+            "\"idle\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ServiceState::Initializing).unwrap(),
+            "\"initializing\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ServiceState::Running).unwrap(),
+            "\"running\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ServiceState::Stopped).unwrap(),
+            "\"stopped\""
+        );
+    }
+
+    // --- ServiceStatus serde tests ---
+
+    #[test]
+    fn service_status_serde_roundtrip_idle() {
+        let status = ServiceStatus {
+            state: ServiceState::Idle,
+            last_error: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let de: ServiceStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.state, ServiceState::Idle);
+        assert_eq!(de.last_error, None);
+    }
+
+    #[test]
+    fn service_status_serde_roundtrip_with_error() {
+        let status = ServiceStatus {
+            state: ServiceState::Stopped,
+            last_error: Some("init failed".into()),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let de: ServiceStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.state, ServiceState::Stopped);
+        assert_eq!(de.last_error, Some("init failed".into()));
+    }
+
+    #[test]
+    fn service_status_json_keys_camel_case() {
+        let status = ServiceStatus {
+            state: ServiceState::Running,
+            last_error: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"state\":"), "state key: {json}");
+        assert!(json.contains("\"lastError\":"), "lastError key: {json}");
+    }
+
+    #[test]
+    fn service_status_json_null_last_error() {
+        let status = ServiceStatus {
+            state: ServiceState::Idle,
+            last_error: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains("\"lastError\":null"),
+            "lastError should be null: {json}"
         );
     }
 }

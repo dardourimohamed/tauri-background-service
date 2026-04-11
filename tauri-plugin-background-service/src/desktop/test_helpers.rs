@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::desktop::ipc::{IpcEvent, IpcMessage};
 use crate::desktop::ipc_server::IpcServer;
+use crate::desktop::transport::{self, TransportStream};
 use crate::error::ServiceError;
 use crate::manager::{manager_loop, ServiceFactory};
 use crate::models::ServiceContext;
@@ -115,16 +116,13 @@ pub fn setup_server_raw(
     (server, path, shutdown)
 }
 
-/// Connect a raw [`UnixStream`] to the given socket path.
-pub async fn connect(path: &PathBuf) -> tokio::net::UnixStream {
-    tokio::net::UnixStream::connect(path).await.unwrap()
+/// Connect a raw [`TransportStream`] to the given socket path.
+pub async fn connect(path: &PathBuf) -> TransportStream {
+    transport::connect(path).await.unwrap()
 }
 
 /// Send an [`IpcRequest`] over a raw stream, wrapped in [`IpcMessage::Request`].
-pub async fn send_request(
-    stream: &mut tokio::net::UnixStream,
-    request: &crate::desktop::ipc::IpcRequest,
-) {
+pub async fn send_request(stream: &mut TransportStream, request: &crate::desktop::ipc::IpcRequest) {
     use tokio::io::AsyncWriteExt;
     let msg = IpcMessage::Request(request.clone());
     let frame = crate::desktop::ipc::encode_frame(&msg).unwrap();
@@ -132,9 +130,7 @@ pub async fn send_request(
 }
 
 /// Read an [`IpcResponse`] from a raw stream (expects [`IpcMessage::Response`] on the wire).
-pub async fn read_response(
-    stream: &mut tokio::net::UnixStream,
-) -> crate::desktop::ipc::IpcResponse {
+pub async fn read_response(stream: &mut TransportStream) -> crate::desktop::ipc::IpcResponse {
     use tokio::io::AsyncReadExt;
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await.unwrap();
@@ -148,7 +144,7 @@ pub async fn read_response(
 }
 
 /// Read an [`IpcEvent`] from a raw stream (expects [`IpcMessage::Event`] on the wire).
-pub async fn read_event(stream: &mut tokio::net::UnixStream) -> crate::desktop::ipc::IpcEvent {
+pub async fn read_event(stream: &mut TransportStream) -> crate::desktop::ipc::IpcEvent {
     use tokio::io::AsyncReadExt;
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await.unwrap();

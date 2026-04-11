@@ -6,4 +6,7 @@ permissions = [
     "allow-start",
     "allow-stop",
     "allow-is-running",
+    "allow-get-service-state",
+    "allow-install-service",
+    "allow-uninstall-service",
 ]

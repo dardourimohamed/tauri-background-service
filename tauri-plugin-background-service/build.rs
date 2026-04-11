@@ -1,4 +1,4 @@
-const COMMANDS: &[&str] = &["start", "stop", "is_running"];
+const COMMANDS: &[&str] = &["start", "stop", "is_running", "get_service_state"];
 
 #[cfg(feature = "desktop-service")]
 const DESKTOP_COMMANDS: &[&str] = &["install_service", "uninstall_service"];

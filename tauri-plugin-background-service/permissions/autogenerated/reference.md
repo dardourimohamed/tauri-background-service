@@ -7,6 +7,9 @@ Default permissions for the background service plugin
 - `allow-start`
 - `allow-stop`
 - `allow-is-running`
+- `allow-get-service-state`
+- `allow-install-service`
+- `allow-uninstall-service`
 
 ## Permission Table
 
@@ -16,6 +19,32 @@ Default permissions for the background service plugin
 <th>Description</th>
 </tr>
 
+
+<tr>
+<td>
+
+`background-service:allow-get-service-state`
+
+</td>
+<td>
+
+Enables the get_service_state command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`background-service:deny-get-service-state`
+
+</td>
+<td>
+
+Denies the get_service_state command without any pre-configured scope.
+
+</td>
+</tr>
 
 <tr>
 <td>

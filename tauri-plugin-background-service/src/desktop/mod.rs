@@ -11,6 +11,13 @@ pub mod ipc;
 pub mod ipc_client;
 pub mod ipc_server;
 pub mod service_manager;
+pub mod transport;
+
+// Platform-specific transport implementation (submodule of transport).
+#[cfg(unix)]
+pub mod transport_unix;
+#[cfg(windows)]
+pub mod transport_windows;
 
 #[cfg(test)]
 pub mod test_helpers;

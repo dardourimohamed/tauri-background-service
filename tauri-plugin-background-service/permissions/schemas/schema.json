@@ -295,6 +295,18 @@
       "type": "string",
       "oneOf": [
         {
+          "description": "Enables the get_service_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-service-state",
+          "markdownDescription": "Enables the get_service_state command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_service_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-service-state",
+          "markdownDescription": "Denies the get_service_state command without any pre-configured scope."
+        },
+        {
           "description": "Enables the install_service command without any pre-configured scope.",
           "type": "string",
           "const": "allow-install-service",
@@ -367,10 +379,10 @@
           "markdownDescription": "Denies the uninstall_service command without any pre-configured scope."
         },
         {
-          "description": "Default permissions for the background service plugin\n#### This default permission set includes:\n\n- `allow-start`\n- `allow-stop`\n- `allow-is-running`",
+          "description": "Default permissions for the background service plugin\n#### This default permission set includes:\n\n- `allow-start`\n- `allow-stop`\n- `allow-is-running`\n- `allow-get-service-state`\n- `allow-install-service`\n- `allow-uninstall-service`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for the background service plugin\n#### This default permission set includes:\n\n- `allow-start`\n- `allow-stop`\n- `allow-is-running`"
+          "markdownDescription": "Default permissions for the background service plugin\n#### This default permission set includes:\n\n- `allow-start`\n- `allow-stop`\n- `allow-is-running`\n- `allow-get-service-state`\n- `allow-install-service`\n- `allow-uninstall-service`"
         }
       ]
     }

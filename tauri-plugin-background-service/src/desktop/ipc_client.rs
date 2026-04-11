@@ -12,14 +12,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tauri::{Emitter, Runtime};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 
 use crate::desktop::ipc::{
-    decode_frame, encode_frame, IpcEvent, IpcMessage, IpcRequest, IpcResponse, MAX_FRAME_SIZE,
+    decode_frame, encode_frame, IpcEvent, IpcMessage, IpcRequest, IpcResponse,
 };
+use crate::desktop::transport::{self, TransportReadHalf, TransportStream, TransportWriteHalf};
 use crate::error::ServiceError;
-use crate::models::{PluginEvent, StartConfig};
+use crate::models::{PluginEvent, ServiceStatus, StartConfig};
 
 /// IPC client for communicating with the headless sidecar service.
 ///
@@ -31,15 +30,13 @@ use crate::models::{PluginEvent, StartConfig};
 /// frames and converted to [`PluginEvent`] for emission via the Tauri event
 /// system.
 pub struct IpcClient {
-    stream: UnixStream,
+    stream: TransportStream,
 }
 
 impl IpcClient {
     /// Connect to the sidecar's IPC socket at the given path.
     pub async fn connect(path: PathBuf) -> Result<Self, ServiceError> {
-        let stream = UnixStream::connect(&path)
-            .await
-            .map_err(|e| ServiceError::Ipc(format!("connect failed: {e}")))?;
+        let stream = transport::connect(&path).await?;
         Ok(Self { stream })
     }
 
@@ -76,6 +73,24 @@ impl IpcClient {
                 .data
                 .and_then(|d| d.get("running").and_then(|v| v.as_bool()))
                 .unwrap_or(false))
+        } else {
+            Err(ServiceError::Ipc(
+                response.error.unwrap_or_else(|| "unknown error".into()),
+            ))
+        }
+    }
+
+    /// Query the current service lifecycle state.
+    pub async fn get_state(&mut self) -> Result<ServiceStatus, ServiceError> {
+        let (response, _events) = self.send_and_read(&IpcRequest::GetState).await?;
+        if response.ok {
+            response
+                .data
+                .ok_or_else(|| ServiceError::Ipc("missing data in GetState response".into()))
+                .and_then(|d| {
+                    serde_json::from_value::<ServiceStatus>(d)
+                        .map_err(|e| ServiceError::Ipc(format!("deserialize GetState: {e}")))
+                })
         } else {
             Err(ServiceError::Ipc(
                 response.error.unwrap_or_else(|| "unknown error".into()),
@@ -150,10 +165,9 @@ impl IpcClient {
     async fn send_request(&mut self, request: &IpcRequest) -> Result<(), ServiceError> {
         let msg = IpcMessage::Request(request.clone());
         let frame = encode_frame(&msg).map_err(|e| ServiceError::Ipc(format!("encode: {e}")))?;
-        self.stream
-            .write_all(&frame)
+        transport::write_frame(&mut self.stream, &frame)
             .await
-            .map_err(|e| ServiceError::Ipc(format!("send request: {e}")))?;
+            .map_err(ServiceError::Ipc)?;
         Ok(())
     }
 
@@ -162,25 +176,9 @@ impl IpcClient {
     /// Returns the payload bytes only (no length prefix).
     /// Returns `None` if the connection was closed cleanly.
     async fn read_frame(&mut self) -> Result<Option<Vec<u8>>, ServiceError> {
-        let mut len_buf = [0u8; 4];
-        match self.stream.read_exact(&mut len_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(ServiceError::Ipc(format!("read frame: {e}"))),
-        }
-        let len = u32::from_be_bytes(len_buf) as usize;
-        if len > MAX_FRAME_SIZE {
-            return Err(ServiceError::Ipc(format!("frame too large: {len}")));
-        }
-        if len == 0 {
-            return Ok(None);
-        }
-        let mut payload = vec![0u8; len];
-        self.stream
-            .read_exact(&mut payload)
+        transport::read_frame(&mut self.stream)
             .await
-            .map_err(|e| ServiceError::Ipc(format!("read payload: {e}")))?;
-        Ok(Some(payload))
+            .map_err(ServiceError::Ipc)
     }
 }
 
@@ -206,6 +204,9 @@ enum IpcCommand {
     },
     IsRunning {
         reply: tokio::sync::oneshot::Sender<Result<bool, ServiceError>>,
+    },
+    GetState {
+        reply: tokio::sync::oneshot::Sender<Result<ServiceStatus, ServiceError>>,
     },
 }
 
@@ -293,6 +294,18 @@ impl PersistentIpcClientHandle {
             .map_err(|_| ServiceError::Ipc("command dropped".into()))?
     }
 
+    /// Query the current service lifecycle state through the persistent connection.
+    pub async fn get_state(&self) -> Result<ServiceStatus, ServiceError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(IpcCommand::GetState { reply: reply_tx })
+            .await
+            .map_err(|_| ServiceError::Ipc("persistent client shut down".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| ServiceError::Ipc("command dropped".into()))?
+    }
+
     /// Returns `true` if the persistent client is currently connected to the
     /// headless sidecar, `false` otherwise.
     pub fn is_connected(&self) -> bool {
@@ -326,7 +339,7 @@ async fn persistent_client_loop<R: Runtime>(
                 connected.store(false, std::sync::atomic::Ordering::Relaxed);
                 break;
             }
-            connect_result = UnixStream::connect(&socket_path) => {
+            connect_result = transport::connect(&socket_path) => {
                 match connect_result {
                     Ok(stream) => {
                         log::info!("Persistent IPC client connected");
@@ -372,12 +385,12 @@ async fn persistent_client_loop<R: Runtime>(
 ///   When a response frame arrives, it forwards it via a shared oneshot channel.
 /// - The main loop receives commands from `cmd_rx` and sends requests.
 async fn run_persistent_connection<R: Runtime>(
-    stream: UnixStream,
+    stream: TransportStream,
     app: &tauri::AppHandle<R>,
     cmd_rx: &mut tokio::sync::mpsc::Receiver<IpcCommand>,
     connected: &Arc<AtomicBool>,
 ) -> Result<(), ServiceError> {
-    let (read_half, mut write_half) = stream.into_split();
+    let (read_half, mut write_half) = transport::split(stream);
 
     // Shared slot for the reader task to deliver response frames.
     let response_slot: std::sync::Arc<
@@ -487,6 +500,28 @@ async fn run_persistent_connection<R: Runtime>(
                         };
                         let _ = reply.send(result);
                     }
+                    IpcCommand::GetState { reply } => {
+                        let rx = prepare_response_slot(&response_slot).await;
+                        if let Err(e) = send_request_to(&mut write_half, &IpcRequest::GetState).await {
+                            let _ = reply.send(Err(e));
+                            break Err(ServiceError::Ipc("send failed".into()));
+                        }
+                        let response = await_response(rx).await;
+                        let result = match response {
+                            Ok(resp) if resp.ok => resp
+                                .data
+                                .ok_or_else(|| ServiceError::Ipc("missing data in GetState response".into()))
+                                .and_then(|d| {
+                                    serde_json::from_value::<ServiceStatus>(d)
+                                        .map_err(|e| ServiceError::Ipc(format!("deserialize GetState: {e}")))
+                                }),
+                            Ok(resp) => Err(ServiceError::Ipc(
+                                resp.error.unwrap_or_else(|| "unknown error".into()),
+                            )),
+                            Err(e) => Err(e),
+                        };
+                        let _ = reply.send(result);
+                    }
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
@@ -504,15 +539,14 @@ async fn run_persistent_connection<R: Runtime>(
 
 /// Send an IPC request frame through a write half.
 async fn send_request_to(
-    write_half: &mut tokio::net::unix::OwnedWriteHalf,
+    write_half: &mut TransportWriteHalf,
     request: &IpcRequest,
 ) -> Result<(), ServiceError> {
     let msg = IpcMessage::Request(request.clone());
     let frame = encode_frame(&msg).map_err(|e| ServiceError::Ipc(format!("encode: {e}")))?;
-    write_half
-        .write_all(&frame)
+    transport::write_frame(write_half, &frame)
         .await
-        .map_err(|e| ServiceError::Ipc(format!("send: {e}")))?;
+        .map_err(ServiceError::Ipc)?;
     Ok(())
 }
 
@@ -557,27 +591,11 @@ async fn await_response(
 ///
 /// Returns the payload bytes only (no length prefix).
 async fn read_frame_from(
-    read_half: &mut tokio::net::unix::OwnedReadHalf,
+    read_half: &mut TransportReadHalf,
 ) -> Result<Option<Vec<u8>>, ServiceError> {
-    let mut len_buf = [0u8; 4];
-    match read_half.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(ServiceError::Ipc(format!("read frame: {e}"))),
-    }
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME_SIZE {
-        return Err(ServiceError::Ipc(format!("frame too large: {len}")));
-    }
-    if len == 0 {
-        return Ok(None);
-    }
-    let mut payload = vec![0u8; len];
-    read_half
-        .read_exact(&mut payload)
+    transport::read_frame(read_half)
         .await
-        .map_err(|e| ServiceError::Ipc(format!("read payload: {e}")))?;
-    Ok(Some(payload))
+        .map_err(ServiceError::Ipc)
 }
 
 #[cfg(test)]
@@ -636,6 +654,66 @@ mod tests {
         client.start(StartConfig::default()).await.unwrap();
         let running = client.is_running().await.unwrap();
         assert!(running, "should be running after start");
+
+        shutdown.cancel();
+    }
+
+    // -- GetState returns ServiceStatus ------------------------------------------
+
+    #[tokio::test]
+    async fn ipc_client_get_state_initial() {
+        let (path, shutdown, _event_tx) = setup_server();
+        let mut client = IpcClient::connect(path).await.unwrap();
+
+        let status = client.get_state().await.unwrap();
+        assert!(
+            matches!(status.state, crate::models::ServiceState::Idle),
+            "expected Idle, got {:?}",
+            status.state
+        );
+        assert_eq!(status.last_error, None);
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn ipc_client_get_state_after_start() {
+        let (path, shutdown, _event_tx) = setup_server();
+        let mut client = IpcClient::connect(path).await.unwrap();
+
+        client.start(StartConfig::default()).await.unwrap();
+
+        // Poll until Running — Start replies at Initializing, spawned task
+        // transitions to Running asynchronously.
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let s = client.get_state().await.unwrap();
+                if matches!(s.state, crate::models::ServiceState::Running) {
+                    return s;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for Running state");
+        assert_eq!(status.last_error, None);
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn ipc_client_get_state_after_stop() {
+        let (path, shutdown, _event_tx) = setup_server();
+        let mut client = IpcClient::connect(path).await.unwrap();
+
+        client.start(StartConfig::default()).await.unwrap();
+        client.stop().await.unwrap();
+        let status = client.get_state().await.unwrap();
+        assert!(
+            matches!(status.state, crate::models::ServiceState::Stopped),
+            "expected Stopped, got {:?}",
+            status.state
+        );
 
         shutdown.cancel();
     }
@@ -905,7 +983,7 @@ mod tests {
         let path = crate::desktop::test_helpers::unique_socket_path();
 
         // Create a minimal "server" that accepts one connection then drops it.
-        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let listener = transport::bind(path.clone()).unwrap();
         let path_clone = path.clone();
 
         let client_handle =
@@ -1110,6 +1188,49 @@ mod tests {
         shutdown.cancel();
     }
 
+    // -- GetState through persistent client --
+
+    #[tokio::test]
+    async fn persistent_client_get_state() {
+        let (path, shutdown, _event_tx) = setup_server();
+        let app = tauri::test::mock_app();
+
+        let handle = PersistentIpcClientHandle::spawn(path, app.handle().clone());
+
+        // Give the background task time to connect.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let status = handle.get_state().await.unwrap();
+        assert!(
+            matches!(status.state, crate::models::ServiceState::Idle),
+            "expected Idle, got {:?}",
+            status.state
+        );
+
+        handle.start(StartConfig::default()).await.unwrap();
+
+        // Poll until Running — race between Start reply (Initializing) and
+        // spawned task transition to Running.
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let s = handle.get_state().await.unwrap();
+                if matches!(s.state, crate::models::ServiceState::Running) {
+                    return s;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for Running state");
+        assert!(
+            matches!(status.state, crate::models::ServiceState::Running),
+            "expected Running, got {:?}",
+            status.state
+        );
+
+        shutdown.cancel();
+    }
+
     // -- Fix: Timeout prevents permanent hang on unresponsive server --
 
     /// Verify the persistent client returns an error (not hang) when the
@@ -1121,7 +1242,7 @@ mod tests {
     #[tokio::test]
     async fn persistent_client_timeout_on_unresponsive_server() {
         let path = crate::desktop::test_helpers::unique_socket_path();
-        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let listener = transport::bind(path.clone()).unwrap();
 
         // Server that accepts the connection but never responds.
         let server_handle = tokio::spawn(async move {
@@ -1194,7 +1315,7 @@ mod tests {
         path: &std::path::Path,
         frames: Vec<IpcMessage>,
     ) -> tokio::task::JoinHandle<()> {
-        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        let listener = transport::bind(path.to_path_buf()).unwrap();
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1337,7 +1458,7 @@ mod tests {
     async fn is_connected_false_after_server_shutdown() {
         let path = crate::desktop::test_helpers::unique_socket_path();
         let path_clone = path.clone();
-        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let listener = transport::bind(path.clone()).unwrap();
 
         // Server that accepts a connection, waits briefly, then drops
         // everything (stream + listener), preventing reconnection.
@@ -1553,6 +1674,70 @@ mod tests {
         );
 
         shutdown2.cancel();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  C3: ZERO-LENGTH FRAME REJECTION TESTS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Verify that receiving a zero-length frame (\x00\x00\x00\x00) from the
+    /// server produces an error, not `Ok(None)`. Zero-length frames are
+    /// protocol violations and must be rejected explicitly.
+    #[tokio::test]
+    async fn ipc_client_rejects_zero_length_frame() {
+        let path = crate::desktop::test_helpers::unique_socket_path();
+        let listener = transport::bind(path.clone()).unwrap();
+
+        // Server that sends a zero-length frame immediately after accepting.
+        let server_handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            use tokio::io::AsyncWriteExt;
+            stream.write_all(&[0u8; 4]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        let mut client = IpcClient::connect(path.clone()).await.unwrap();
+
+        // Reading a frame should return an error, not Ok(None)
+        let result = client.read_frame().await;
+        assert!(
+            result.is_err(),
+            "zero-length frame should return error, got {:?}",
+            result
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("zero-length frame"),
+            "Error should mention 'zero-length frame': {err}"
+        );
+
+        server_handle.abort();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Verify that an actual EOF (connection drop) still returns `Ok(None)`.
+    /// This is the "clean close" case — distinct from a zero-length frame.
+    #[tokio::test]
+    async fn ipc_client_eof_returns_ok_none() {
+        let path = crate::desktop::test_helpers::unique_socket_path();
+        let listener = transport::bind(path.clone()).unwrap();
+
+        // Server that accepts a connection then immediately drops it.
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+
+        let mut client = IpcClient::connect(path.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Reading a frame should return Ok(None) for clean EOF
+        let result = client.read_frame().await;
+        assert!(result.is_ok(), "EOF should return Ok, got {:?}", result);
+        assert!(result.unwrap().is_none(), "EOF should return Ok(None)");
+
+        server_handle.abort();
+        let _ = std::fs::remove_file(&path);
     }
 
     /// send_and_read collects multiple consecutive events before the response.

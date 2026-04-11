@@ -8,7 +8,7 @@
 //! from the crate root. Items that are `pub` only for the iOS lifecycle bridge
 //! are marked `#[doc(hidden)]`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, Emitter, Runtime};
@@ -16,7 +16,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::ServiceError;
-use crate::models::{validate_foreground_service_type, PluginEvent, ServiceContext, StartConfig};
+use crate::models::{
+    validate_foreground_service_type, PluginEvent, ServiceContext,
+    ServiceState as ServiceLifecycle, ServiceStatus, StartConfig,
+};
 use crate::notifier::Notifier;
 use crate::service_trait::BackgroundService;
 
@@ -72,6 +75,9 @@ pub enum ManagerCommand<R: Runtime> {
     IsRunning {
         reply: oneshot::Sender<bool>,
     },
+    GetState {
+        reply: oneshot::Sender<ServiceStatus>,
+    },
     SetOnComplete {
         callback: OnCompleteCallback,
     },
@@ -126,6 +132,20 @@ impl<R: Runtime> ServiceManagerHandle<R> {
             .map_err(|_| ServiceError::Runtime("manager actor dropped reply".into()))?
     }
 
+    /// Stop the running background service synchronously.
+    ///
+    /// Uses `blocking_send` so this can be called from synchronous contexts
+    /// (e.g., a Tauri `on_event` closure). Returns `NotRunning` if no
+    /// service is active.
+    pub fn stop_blocking(&self) -> Result<(), ServiceError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .blocking_send(ManagerCommand::Stop { reply })
+            .map_err(|_| ServiceError::Runtime("manager actor shut down".into()))?;
+        rx.blocking_recv()
+            .map_err(|_| ServiceError::Runtime("manager actor dropped reply".into()))?
+    }
+
     /// Check whether a background service is currently running.
     pub async fn is_running(&self) -> bool {
         let (reply, rx) = oneshot::channel();
@@ -151,12 +171,36 @@ impl<R: Runtime> ServiceManagerHandle<R> {
             .send(ManagerCommand::SetOnComplete { callback })
             .await;
     }
+
+    /// Get the current service lifecycle status.
+    pub async fn get_state(&self) -> ServiceStatus {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(ManagerCommand::GetState { reply })
+            .await
+            .is_err()
+        {
+            return ServiceStatus {
+                state: ServiceLifecycle::Idle,
+                last_error: None,
+            };
+        }
+        rx.await.unwrap_or(ServiceStatus {
+            state: ServiceLifecycle::Idle,
+            last_error: None,
+        })
+    }
 }
 
 // ─── Actor State ───────────────────────────────────────────────────────
 
 /// Internal state owned exclusively by the actor task.
 struct ServiceState<R: Runtime> {
+    /// Fast path: `true` when a service task is active.
+    /// Set by `handle_start`, cleared by `handle_stop` or task cleanup.
+    /// Avoids acquiring the Mutex for status-only queries.
+    is_running: Arc<AtomicBool>,
     /// Cancellation token: `Some` means a service is running.
     /// Shared with the spawned service task via `Arc<Mutex<>>` so it can
     /// clear the slot when the task finishes.
@@ -187,6 +231,12 @@ struct ServiceState<R: Runtime> {
     ios_requires_external_power: bool,
     /// iOS BGProcessingTask requires network connectivity (default false).
     ios_requires_network_connectivity: bool,
+    /// Current lifecycle state of the service.
+    /// Shared with spawned task for transitions (Initializing→Running→Stopped).
+    lifecycle_state: Arc<Mutex<ServiceLifecycle>>,
+    /// Last error message from init/run failure.
+    /// Shared with spawned task for error capture.
+    last_error: Arc<Mutex<Option<String>>>,
 }
 
 // ─── Actor Loop ────────────────────────────────────────────────────────
@@ -217,6 +267,7 @@ pub async fn manager_loop<R: Runtime>(
     ios_requires_network_connectivity: bool,
 ) {
     let mut state = ServiceState {
+        is_running: Arc::new(AtomicBool::new(false)),
         token: Arc::new(Mutex::new(None)),
         generation: Arc::new(AtomicU64::new(0)),
         on_complete: None,
@@ -228,6 +279,8 @@ pub async fn manager_loop<R: Runtime>(
         ios_earliest_processing_begin_minutes,
         ios_requires_external_power,
         ios_requires_network_connectivity,
+        lifecycle_state: Arc::new(Mutex::new(ServiceLifecycle::Idle)),
+        last_error: Arc::new(Mutex::new(None)),
     };
 
     while let Some(cmd) = rx.recv().await {
@@ -239,13 +292,20 @@ pub async fn manager_loop<R: Runtime>(
                 let _ = reply.send(handle_stop(&mut state));
             }
             ManagerCommand::IsRunning { reply } => {
-                let _ = reply.send(state.token.lock().unwrap().is_some());
+                let _ = reply.send(state.is_running.load(Ordering::SeqCst));
             }
             ManagerCommand::SetOnComplete { callback } => {
                 state.on_complete = Some(callback);
             }
             ManagerCommand::SetMobile { mobile } => {
                 state.mobile = Some(mobile);
+            }
+            ManagerCommand::GetState { reply } => {
+                let status = ServiceStatus {
+                    state: *state.lifecycle_state.lock().unwrap(),
+                    last_error: state.last_error.lock().unwrap().clone(),
+                };
+                let _ = reply.send(status);
             }
         }
     }
@@ -273,12 +333,19 @@ fn handle_start<R: Runtime>(
     }
 
     // Validate foreground service type against the allowlist.
-    validate_foreground_service_type(&config.foreground_service_type)?;
+    // Only relevant on mobile (Android foreground service types).
+    // On desktop the type is ignored — no OS enforcement mechanism.
+    if cfg!(mobile) {
+        validate_foreground_service_type(&config.foreground_service_type)?;
+    }
 
     let token = CancellationToken::new();
     let shutdown = token.clone();
     *guard = Some(token);
     let my_gen = state.generation.fetch_add(1, Ordering::Release) + 1;
+    state.is_running.store(true, Ordering::SeqCst);
+    *state.lifecycle_state.lock().unwrap() = ServiceLifecycle::Initializing;
+    *state.last_error.lock().unwrap() = None;
 
     drop(guard);
 
@@ -306,6 +373,8 @@ fn handle_start<R: Runtime>(
         ) {
             // Rollback: clear the token we just set.
             state.token.lock().unwrap().take();
+            state.is_running.store(false, Ordering::SeqCst);
+            *state.lifecycle_state.lock().unwrap() = ServiceLifecycle::Idle;
             // Rollback: restore the callback we took.
             state.on_complete = captured_callback;
             return Err(e);
@@ -315,26 +384,20 @@ fn handle_start<R: Runtime>(
     // Shared refs for the spawned task's cleanup logic.
     let token_ref = state.token.clone();
     let gen_ref = state.generation.clone();
+    let is_running_ref = state.is_running.clone();
+    let lifecycle_ref = state.lifecycle_state.clone();
+    let last_error_ref = state.last_error.clone();
 
     let mut service = (state.factory)();
-
-    // On mobile, surface the label/type so the service can display them
-    // in notifications. On desktop, they're irrelevant — set to None.
-    let (service_label, foreground_service_type) = if cfg!(mobile) {
-        (
-            Some(config.service_label),
-            Some(config.foreground_service_type),
-        )
-    } else {
-        (None, None)
-    };
 
     let ctx = ServiceContext {
         notifier: Notifier { app: app.clone() },
         app: app.clone(),
         shutdown,
-        service_label,
-        foreground_service_type,
+        #[cfg(mobile)]
+        service_label: config.service_label,
+        #[cfg(mobile)]
+        foreground_service_type: config.foreground_service_type,
     };
 
     // Use tauri::async_runtime::spawn() instead of tokio::spawn() because
@@ -352,12 +415,29 @@ fn handle_start<R: Runtime>(
             // Clear token only if generation hasn't advanced.
             if gen_ref.load(Ordering::Acquire) == my_gen {
                 token_ref.lock().unwrap().take();
+                is_running_ref.store(false, Ordering::SeqCst);
+                // Initializing → Stopped on init failure.
+                {
+                    let mut lc = lifecycle_ref.lock().unwrap();
+                    if *lc == ServiceLifecycle::Initializing {
+                        *lc = ServiceLifecycle::Stopped;
+                    }
+                }
+                *last_error_ref.lock().unwrap() = Some(e.to_string());
             }
             // Fire callback with false on init failure.
             if let Some(cb) = captured_callback {
                 cb(false);
             }
             return;
+        }
+
+        // Initializing → Running after successful init (generation + state guarded).
+        if gen_ref.load(Ordering::Acquire) == my_gen {
+            let mut lc = lifecycle_ref.lock().unwrap();
+            if *lc == ServiceLifecycle::Initializing {
+                *lc = ServiceLifecycle::Running;
+            }
         }
 
         // Emit Started
@@ -396,6 +476,20 @@ fn handle_start<R: Runtime>(
         // Clear token only if generation hasn't advanced.
         if gen_ref.load(Ordering::Acquire) == my_gen {
             token_ref.lock().unwrap().take();
+            is_running_ref.store(false, Ordering::SeqCst);
+            // → Stopped on run completion (generation guarded).
+            {
+                let mut lc = lifecycle_ref.lock().unwrap();
+                if matches!(
+                    *lc,
+                    ServiceLifecycle::Initializing | ServiceLifecycle::Running
+                ) {
+                    *lc = ServiceLifecycle::Stopped;
+                }
+            }
+            if let Err(ref e) = result {
+                *last_error_ref.lock().unwrap() = Some(e.to_string());
+            }
         }
     });
 
@@ -411,6 +505,9 @@ fn handle_stop<R: Runtime>(state: &mut ServiceState<R>) -> Result<(), ServiceErr
     match guard.take() {
         Some(token) => {
             token.cancel();
+            state.is_running.store(false, Ordering::SeqCst);
+            *state.lifecycle_state.lock().unwrap() = ServiceLifecycle::Stopped;
+            *state.last_error.lock().unwrap() = None;
             drop(guard);
             // Stop mobile keepalive after token cancellation.
             if let Some(ref mobile) = state.mobile {
@@ -913,6 +1010,52 @@ mod tests {
         // If we get here without panicking, the test passes.
     }
 
+    // ── N2: is_running returns false after natural completion ────────
+
+    #[tokio::test]
+    async fn is_running_false_after_natural_completion() {
+        // Use a service that yields during run() so the is_running check
+        // doesn't race with immediate completion.
+        struct YieldingService;
+
+        #[async_trait]
+        impl BackgroundService<tauri::test::MockRuntime> for YieldingService {
+            async fn init(
+                &mut self,
+                _ctx: &ServiceContext<tauri::test::MockRuntime>,
+            ) -> Result<(), ServiceError> {
+                Ok(())
+            }
+
+            async fn run(
+                &mut self,
+                _ctx: &ServiceContext<tauri::test::MockRuntime>,
+            ) -> Result<(), ServiceError> {
+                // Sleep long enough for the caller to observe is_running=true,
+                // then complete naturally (no cancellation).
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                Ok(())
+            }
+        }
+
+        let handle = setup_manager_with_factory(Box::new(|| Box::new(YieldingService)));
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        assert!(
+            send_is_running(&handle).await,
+            "should be running immediately after start"
+        );
+
+        // Wait for the service to complete naturally (no stop).
+        wait_until_stopped(&handle, 2000).await;
+
+        assert!(
+            !send_is_running(&handle).await,
+            "is_running should be false after natural completion"
+        );
+    }
+
     // ── AC10 (Step 3): Generation guard prevents stale cleanup ───────
 
     #[tokio::test]
@@ -1226,19 +1369,22 @@ mod tests {
 
     /// Service that captures `service_label` and `foreground_service_type`
     /// from the `ServiceContext` it receives in `init()`.
+    /// Only compiled on mobile where those fields exist.
+    #[cfg(mobile)]
     struct ContextCapturingService {
         captured_label: Arc<std::sync::Mutex<Option<String>>>,
         captured_fst: Arc<std::sync::Mutex<Option<String>>>,
     }
 
+    #[cfg(mobile)]
     #[async_trait]
     impl BackgroundService<tauri::test::MockRuntime> for ContextCapturingService {
         async fn init(
             &mut self,
             ctx: &ServiceContext<tauri::test::MockRuntime>,
         ) -> Result<(), ServiceError> {
-            *self.captured_label.lock().unwrap() = ctx.service_label.clone();
-            *self.captured_fst.lock().unwrap() = ctx.foreground_service_type.clone();
+            *self.captured_label.lock().unwrap() = Some(ctx.service_label.clone());
+            *self.captured_fst.lock().unwrap() = Some(ctx.foreground_service_type.clone());
             Ok(())
         }
 
@@ -1251,14 +1397,15 @@ mod tests {
         }
     }
 
-    // ── AC (Step 11): ServiceContext fields are None on desktop ────────
+    // ── AC (Step 11): ServiceContext fields are populated on mobile ────
 
+    #[cfg(mobile)]
     #[tokio::test]
-    async fn service_context_fields_none_on_desktop() {
+    async fn service_context_fields_populated_on_mobile() {
         let captured_label: Arc<std::sync::Mutex<Option<String>>> =
-            Arc::new(std::sync::Mutex::new(Some("initial".into())));
+            Arc::new(std::sync::Mutex::new(None));
         let captured_fst: Arc<std::sync::Mutex<Option<String>>> =
-            Arc::new(std::sync::Mutex::new(Some("initial".into())));
+            Arc::new(std::sync::Mutex::new(None));
         let cl = captured_label.clone();
         let cf = captured_fst.clone();
 
@@ -1272,28 +1419,39 @@ mod tests {
         }));
         let app = tauri::test::mock_app();
 
-        send_start(&handle, app.handle().clone()).await.unwrap();
+        let config = StartConfig {
+            service_label: "Syncing".into(),
+            foreground_service_type: "dataSync".into(),
+        };
+
+        send_start_with_config(&handle, config, app.handle().clone())
+            .await
+            .unwrap();
 
         // Give the spawned task time to run init() (which captures the values).
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        // On desktop (cfg!(mobile) == false), both fields should be None
-        assert!(
-            captured_label.lock().unwrap().is_none(),
-            "service_label should be None on desktop"
+        // On mobile, both fields should be populated as Strings
+        assert_eq!(
+            captured_label.lock().unwrap().as_deref(),
+            Some("Syncing"),
+            "service_label should be 'Syncing' on mobile"
         );
-        assert!(
-            captured_fst.lock().unwrap().is_none(),
-            "foreground_service_type should be None on desktop"
+        assert_eq!(
+            captured_fst.lock().unwrap().as_deref(),
+            Some("dataSync"),
+            "foreground_service_type should be 'dataSync' on mobile"
         );
 
         send_stop(&handle).await.unwrap();
     }
 
-    // ── AC: handle_start rejects invalid foreground_service_type ────────
+    // ── S1: handle_start accepts invalid foreground_service_type on desktop ──
 
     #[tokio::test]
-    async fn handle_start_rejects_invalid_foreground_service_type() {
+    async fn handle_start_accepts_invalid_foreground_service_type_on_desktop() {
+        // On desktop (cfg!(mobile) == false), the foreground_service_type
+        // validation is skipped. An arbitrary string should succeed.
         let handle = setup_manager();
         let app = tauri::test::mock_app();
 
@@ -1304,15 +1462,15 @@ mod tests {
 
         let result = send_start_with_config(&handle, config, app.handle().clone()).await;
         assert!(
-            matches!(result, Err(ServiceError::Platform(ref msg)) if msg.contains("bogusType")),
-            "start with invalid fg type should return Platform error mentioning the type: {result:?}"
+            result.is_ok(),
+            "start with invalid fg type should succeed on desktop: {result:?}"
+        );
+        assert!(
+            send_is_running(&handle).await,
+            "service should be running after start with invalid type on desktop"
         );
 
-        // Service should NOT be running after rejection.
-        assert!(
-            !send_is_running(&handle).await,
-            "service should not be running after invalid type rejection"
-        );
+        send_stop(&handle).await.unwrap();
     }
 
     // ── handle_start accepts all valid foreground_service_types ────────
@@ -1337,6 +1495,214 @@ mod tests {
             // Stop for cleanup
             send_stop(&handle).await.unwrap();
         }
+    }
+
+    // ── State transition helpers ────────────────────────────────────────
+
+    async fn send_get_state(
+        handle: &ServiceManagerHandle<tauri::test::MockRuntime>,
+    ) -> ServiceStatus {
+        let (tx, rx) = oneshot::channel();
+        handle
+            .cmd_tx
+            .send(ManagerCommand::GetState { reply: tx })
+            .await
+            .unwrap();
+        rx.await.unwrap()
+    }
+
+    // ── State transition: initial state is Idle ───────────────────────
+
+    #[tokio::test]
+    async fn get_state_returns_idle_initially() {
+        let handle = setup_manager();
+        let status = send_get_state(&handle).await;
+        assert_eq!(status.state, ServiceLifecycle::Idle);
+        assert_eq!(status.last_error, None);
+    }
+
+    // ── State transition: Idle → Initializing → Running → Stopped ─────
+
+    #[tokio::test]
+    async fn lifecycle_idle_to_running_to_stopped() {
+        // Use BlockingService so we can reliably observe the Running state.
+        let handle = setup_manager();
+        let app = tauri::test::mock_app();
+
+        // Idle initially
+        let status = send_get_state(&handle).await;
+        assert_eq!(status.state, ServiceLifecycle::Idle);
+
+        // Start — transitions to Initializing, then Running after init()
+        send_start(&handle, app.handle().clone()).await.unwrap();
+
+        // Small delay for spawned task to complete init() → Running
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let status = send_get_state(&handle).await;
+        assert_eq!(status.state, ServiceLifecycle::Running);
+
+        // Stop → Stopped
+        send_stop(&handle).await.unwrap();
+        let status = send_get_state(&handle).await;
+        assert_eq!(status.state, ServiceLifecycle::Stopped);
+        assert_eq!(status.last_error, None);
+    }
+
+    // ── State transition: Idle → Initializing → Stopped on init failure ─
+
+    #[tokio::test]
+    async fn lifecycle_init_failure_sets_stopped_with_error() {
+        let handle = setup_manager_with_factory(Box::new(|| Box::new(FailingInitService)));
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+
+        // Wait for init failure to propagate
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let status = send_get_state(&handle).await;
+        assert_eq!(status.state, ServiceLifecycle::Stopped);
+        assert!(
+            status.last_error.is_some(),
+            "last_error should be set on init failure"
+        );
+        assert!(
+            status.last_error.unwrap().contains("init error"),
+            "error should mention init error"
+        );
+    }
+
+    // ── State transition: explicit stop sets Stopped, clears last_error ─
+
+    #[tokio::test]
+    async fn lifecycle_explicit_stop_sets_stopped_clears_error() {
+        let handle = setup_manager();
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let status = send_get_state(&handle).await;
+        assert_eq!(status.state, ServiceLifecycle::Running);
+
+        send_stop(&handle).await.unwrap();
+
+        let status = send_get_state(&handle).await;
+        assert_eq!(status.state, ServiceLifecycle::Stopped);
+        assert_eq!(
+            status.last_error, None,
+            "explicit stop should clear last_error"
+        );
+    }
+
+    // ── State transition: restart clears stale last_error ─────────────
+
+    #[tokio::test]
+    async fn restart_clears_stale_last_error() {
+        // Step 1: start with a service whose init() fails → Stopped + last_error set
+        let handle = setup_manager_with_factory(Box::new(|| Box::new(FailingInitService)));
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let status = send_get_state(&handle).await;
+        assert_eq!(status.state, ServiceLifecycle::Stopped);
+        assert!(
+            status.last_error.is_some(),
+            "should have error after init failure"
+        );
+
+        // Step 2: restart with a succeeding service — last_error must be cleared
+        // We can't swap the factory, but we CAN verify the field is cleared
+        // by starting again with the same failing service and checking that
+        // handle_start resets last_error before the spawn.
+        // Instead, use a two-phase factory: first fails, then succeeds.
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = call_count.clone();
+        let handle2 = setup_manager_with_factory(Box::new(move || {
+            let n = count_clone.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                Box::new(FailingInitService)
+            } else {
+                Box::new(ImmediateSuccessService)
+            }
+        }));
+        let app2 = tauri::test::mock_app();
+
+        // First start: init fails
+        send_start(&handle2, app2.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let status = send_get_state(&handle2).await;
+        assert_eq!(status.state, ServiceLifecycle::Stopped);
+        assert!(
+            status.last_error.is_some(),
+            "first run should set last_error"
+        );
+
+        // Second start: succeeds — last_error must be None
+        send_start(&handle2, app2.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let status = send_get_state(&handle2).await;
+        // After successful init + run completion, state is Stopped (natural completion)
+        // but last_error should be cleared by handle_start
+        assert_eq!(
+            status.last_error, None,
+            "last_error must be cleared on restart, not stale from previous failure"
+        );
+    }
+
+    // ── get_state via ServiceManagerHandle method ─────────────────────
+
+    #[tokio::test]
+    async fn get_state_handle_method_returns_idle() {
+        let handle = setup_manager();
+        let status = handle.get_state().await;
+        assert_eq!(status.state, ServiceLifecycle::Idle);
+        assert_eq!(status.last_error, None);
+    }
+
+    // ── stop_blocking sends Stop command and returns success from running ─
+
+    #[tokio::test]
+    async fn stop_blocking_returns_success_from_running() {
+        let handle = Arc::new(setup_manager());
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        assert!(send_is_running(&handle).await);
+
+        // Must call stop_blocking from outside the async runtime.
+        let h = handle.clone();
+        let result = tokio::task::spawn_blocking(move || h.stop_blocking())
+            .await
+            .expect("spawn_blocking panicked");
+        assert!(
+            result.is_ok(),
+            "stop_blocking should succeed from running: {result:?}"
+        );
+        assert!(
+            !send_is_running(&handle).await,
+            "should not be running after stop_blocking"
+        );
+    }
+
+    // ── stop_blocking returns NotRunning when idle ───────────────────────
+
+    #[tokio::test]
+    async fn stop_blocking_returns_not_running_when_idle() {
+        let handle = Arc::new(setup_manager());
+
+        let h = handle.clone();
+        let result = tokio::task::spawn_blocking(move || h.stop_blocking())
+            .await
+            .expect("spawn_blocking panicked");
+        assert!(
+            matches!(result, Err(ServiceError::NotRunning)),
+            "stop_blocking should return NotRunning when idle: {result:?}"
+        );
     }
 
     #[tokio::test]

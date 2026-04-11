@@ -25,6 +25,8 @@ pub enum IpcRequest {
     Stop,
     /// Query whether a background service is currently running.
     IsRunning,
+    /// Query the current service lifecycle state.
+    GetState,
 }
 
 /// IPC response sent from the headless service to the GUI process.
@@ -205,6 +207,26 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(
             json.contains("\"type\":\"isRunning\""),
+            "Tagged JSON: {json}"
+        );
+    }
+
+    // --- IpcRequest::GetState serde tests ---
+
+    #[test]
+    fn ipc_request_get_state_serde_roundtrip() {
+        let req = IpcRequest::GetState;
+        let json = serde_json::to_string(&req).unwrap();
+        let de: IpcRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(de, IpcRequest::GetState));
+    }
+
+    #[test]
+    fn ipc_request_get_state_json_tag() {
+        let req = IpcRequest::GetState;
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("\"type\":\"getState\""),
             "Tagged JSON: {json}"
         );
     }

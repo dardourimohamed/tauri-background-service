@@ -63,14 +63,18 @@ mod tests {
     }
 
     /// Compile-time test: ServiceContext can be constructed with the real Notifier type.
+    /// On mobile, includes service_label and foreground_service_type (String).
+    /// On desktop, those fields are absent (#[cfg(mobile)]).
     #[allow(dead_code)]
     fn service_context_constructs<R: Runtime>(app: AppHandle<R>) {
         let _ctx = ServiceContext {
             notifier: Notifier { app: app.clone() },
             app,
             shutdown: CancellationToken::new(),
-            service_label: None,
-            foreground_service_type: None,
+            #[cfg(mobile)]
+            service_label: "test".into(),
+            #[cfg(mobile)]
+            foreground_service_type: "dataSync".into(),
         };
     }
 }
