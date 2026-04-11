@@ -106,7 +106,7 @@ class LifecycleServiceInstrumentedTest {
             assertEquals("bg_keepalive", it.id)
             assertEquals(NotificationManager.IMPORTANCE_LOW, it.importance)
             assertEquals("Service Status", it.name.toString())
-            assertFalse("Badge should be disabled", it.shouldShowBadges())
+            assertFalse("Badge should be disabled", it.canShowBadge())
         }
     }
 

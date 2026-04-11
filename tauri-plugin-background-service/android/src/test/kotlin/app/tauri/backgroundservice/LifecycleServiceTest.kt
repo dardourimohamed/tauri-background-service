@@ -10,6 +10,7 @@ import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
@@ -231,7 +232,7 @@ class LifecycleServiceTest {
         assertNotNull(channel)
         assertEquals("bg_keepalive", channel?.id)
         assertEquals(NotificationManager.IMPORTANCE_LOW, channel?.importance)
-        assertFalse("Badge should be disabled", channel?.shouldShowBadges() ?: true)
+        assertFalse("Badge should be disabled", channel?.canShowBadge() ?: true)
     }
 
     // ── buildNotification ──────────────────────────────────────────────

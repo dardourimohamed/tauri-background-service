@@ -159,7 +159,7 @@ class BackgroundServicePluginTest {
         activity.onActivity { act ->
             val shadowActivity = shadowOf(act)
             // No permissions should have been requested
-            assertNull(shadowActivity.nextRequestedPermission)
+            assertNull(shadowActivity.lastRequestedPermission)
         }
     }
 
