@@ -1,8 +1,10 @@
 //! IPC protocol types and framing for desktop OS service mode.
 //!
 //! The desktop OS service uses length-prefixed JSON over Unix domain sockets
-//! (Linux/macOS) or named pipes (Windows) for IPC between the GUI process
-//! and the headless service process.
+//! for IPC between the GUI process and the headless service process.
+//!
+//! **Unix-only** — the IPC transport currently requires Unix domain sockets.
+//! Windows named pipe support is not yet implemented.
 
 use serde::{Deserialize, Serialize};
 
@@ -116,11 +118,7 @@ pub fn socket_path(label: &str) -> Result<std::path::PathBuf, ServiceError> {
     {
         Ok(std::path::PathBuf::from(format!("/tmp/{label}.sock")))
     }
-    #[cfg(windows)]
-    {
-        Ok(std::path::PathBuf::from(format!(r"\\.\pipe\{label}")))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Ok(std::path::PathBuf::from(format!("/tmp/{label}.sock")))
     }

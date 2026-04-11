@@ -1,4 +1,4 @@
-#![doc(html_root_url = "https://docs.rs/tauri-plugin-background-service/0.4.0")]
+#![doc(html_root_url = "https://docs.rs/tauri-plugin-background-service/0.4.1")]
 
 //! # tauri-plugin-background-service
 //!
@@ -94,7 +94,7 @@ pub use models::{
 pub use notifier::Notifier;
 pub use service_trait::BackgroundService;
 
-#[cfg(feature = "desktop-service")]
+#[cfg(all(feature = "desktop-service", unix))]
 pub use desktop::headless::headless_main;
 
 // ─── Internal Imports ────────────────────────────────────────────────────────
@@ -233,7 +233,7 @@ fn ios_spawn_cancel_listener<R: Runtime>(_app: &AppHandle<R>, _timeout_secs: u64
 #[tauri::command]
 async fn start<R: Runtime>(app: AppHandle<R>, config: StartConfig) -> Result<(), String> {
     // OS service mode: route through persistent IPC client.
-    #[cfg(feature = "desktop-service")]
+    #[cfg(all(feature = "desktop-service", unix))]
     if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
         return ipc_state
             .client
@@ -275,7 +275,7 @@ async fn start<R: Runtime>(app: AppHandle<R>, config: StartConfig) -> Result<(),
 #[tauri::command]
 async fn stop<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     // OS service mode: route through persistent IPC client.
-    #[cfg(feature = "desktop-service")]
+    #[cfg(all(feature = "desktop-service", unix))]
     if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
         return ipc_state.client.stop().await.map_err(|e| e.to_string());
     }
@@ -297,7 +297,7 @@ async fn stop<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
 #[tauri::command]
 async fn is_running<R: Runtime>(app: AppHandle<R>) -> bool {
     // OS service mode: route through persistent IPC client.
-    #[cfg(feature = "desktop-service")]
+    #[cfg(all(feature = "desktop-service", unix))]
     if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
         return ipc_state.client.is_running().await.unwrap_or(false);
     }
@@ -319,7 +319,7 @@ async fn is_running<R: Runtime>(app: AppHandle<R>) -> bool {
 #[tauri::command]
 async fn get_service_state<R: Runtime>(app: AppHandle<R>) -> Result<models::ServiceStatus, String> {
     // OS service mode: route through persistent IPC client.
-    #[cfg(feature = "desktop-service")]
+    #[cfg(all(feature = "desktop-service", unix))]
     if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
         return ipc_state
             .client
@@ -339,7 +339,7 @@ async fn get_service_state<R: Runtime>(app: AppHandle<R>) -> Result<models::Serv
 ///
 /// When present as managed state, the `start`/`stop`/`is_running` commands
 /// route through the persistent IPC client instead of the in-process actor loop.
-#[cfg(feature = "desktop-service")]
+#[cfg(all(feature = "desktop-service", unix))]
 struct DesktopIpcState {
     client: desktop::ipc_client::PersistentIpcClientHandle,
 }
@@ -460,7 +460,7 @@ where
             let ios_requires_network_connectivity = config.ios_requires_network_connectivity;
 
             // Mode dispatch: spawn in-process actor or configure IPC for OS service.
-            #[cfg(feature = "desktop-service")]
+            #[cfg(all(feature = "desktop-service", unix))]
             if config.desktop_service_mode == "osService" {
                 // OS service mode: spawn persistent IPC client.
                 let label = desktop::service_manager::derive_service_label(
@@ -475,6 +475,22 @@ where
                 app.manage(DesktopIpcState { client });
             } else {
                 // In-process mode (default): spawn the actor loop.
+                let factory = boxed_factory;
+                tauri::async_runtime::spawn(manager_loop(
+                    cmd_rx,
+                    factory,
+                    ios_safety_timeout_secs,
+                    ios_processing_safety_timeout_secs,
+                    ios_earliest_refresh_begin_minutes,
+                    ios_earliest_processing_begin_minutes,
+                    ios_requires_external_power,
+                    ios_requires_network_connectivity,
+                ));
+            }
+
+            #[cfg(all(feature = "desktop-service", not(unix)))]
+            {
+                // On non-Unix platforms, only in-process mode is available.
                 let factory = boxed_factory;
                 tauri::async_runtime::spawn(manager_loop(
                     cmd_rx,
@@ -570,7 +586,7 @@ where
         .on_event(|app, event| {
             if let tauri::RunEvent::Exit = event {
                 // In OS service mode, the service runs in a separate process — skip.
-                #[cfg(feature = "desktop-service")]
+                #[cfg(all(feature = "desktop-service", unix))]
                 if app.try_state::<DesktopIpcState>().is_some() {
                     return;
                 }
@@ -680,7 +696,7 @@ mod tests {
     // ── Desktop IPC State Tests ─────────────────────────────────────────
 
     /// Verify PersistentIpcClientHandle can be constructed.
-    #[cfg(feature = "desktop-service")]
+    #[cfg(all(feature = "desktop-service", unix))]
     #[tokio::test]
     async fn desktop_ipc_state_with_persistent_client() {
         use desktop::ipc_client::PersistentIpcClientHandle;
@@ -718,7 +734,7 @@ mod tests {
     /// state type-checks. Ensures the generic R is properly threaded through in
     /// the on_event context where stop_blocking() is called synchronously.
     #[allow(dead_code)]
-    fn on_event_shutdown_closure_type_checks<R: Runtime>(app: &AppHandle<R>) {
+    fn on_event_shutdown_closure_type_checks<R: Runtime>(_app: &AppHandle<R>) {
         let _closure = |_app: &AppHandle<R>, event: &tauri::RunEvent| {
             if let tauri::RunEvent::Exit = event {
                 let manager = _app.state::<ServiceManagerHandle<R>>();
