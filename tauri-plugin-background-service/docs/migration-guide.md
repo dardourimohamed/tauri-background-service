@@ -17,7 +17,6 @@ Version 0.2 adds **iOS BGProcessingTask support** and a **desktop OS service mod
 | `desktopServiceLabel` config | Desktop | Custom label for the OS service |
 | `installService()` | Desktop | TypeScript API to install OS service |
 | `uninstallService()` | Desktop | TypeScript API to uninstall OS service |
-| `serviceStatus()` | Desktop | TypeScript API to query OS service status |
 
 ### Required iOS Changes
 

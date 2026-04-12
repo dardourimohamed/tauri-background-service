@@ -214,6 +214,7 @@ iOS background execution is **best-effort**. The plugin uses `BGTaskScheduler` t
 <key>BGTaskSchedulerPermittedIdentifiers</key>
 <array>
     <string>$(PRODUCT_BUNDLE_IDENTIFIER).bg-refresh</string>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER).bg-processing</string>
 </array>
 <key>UIBackgroundModes</key>
 <array>

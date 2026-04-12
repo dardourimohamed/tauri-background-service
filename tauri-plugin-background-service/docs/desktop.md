@@ -135,7 +135,7 @@ Enable the `desktop-service` feature in your app's `Cargo.toml`:
 tauri-plugin-background-service = { version = "0.5", features = ["desktop-service"] }
 ```
 
-This pulls in the `service-manager` crate and adds three additional Tauri commands: `install_service`, `uninstall_service`, and `service_status`.
+This pulls in the `service-manager` crate and adds three additional Tauri commands: `install_service`, `uninstall_service`, and `get_service_state`.
 
 ### Configuration
 
