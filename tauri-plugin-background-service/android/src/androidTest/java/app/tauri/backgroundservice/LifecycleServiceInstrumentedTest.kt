@@ -52,6 +52,20 @@ class LifecycleServiceInstrumentedTest {
         prefs.edit().clear().apply()
     }
 
+    private fun waitUntil(
+        timeoutMs: Long = 5_000L,
+        intervalMs: Long = 100L,
+        condition: () -> Boolean
+    ) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (!condition()) {
+            if (System.currentTimeMillis() > deadline) {
+                throw AssertionError("Condition not met within ${timeoutMs}ms")
+            }
+            Thread.sleep(intervalMs)
+        }
+    }
+
     private fun startForegroundService(label: String, type: String = "dataSync") {
         val intent = Intent(context, LifecycleService::class.java).apply {
             action = LifecycleService.ACTION_START
@@ -63,7 +77,7 @@ class LifecycleServiceInstrumentedTest {
         } else {
             context.startService(intent)
         }
-        Thread.sleep(1000)
+        waitUntil { LifecycleService.isRunning }
     }
 
     private fun stopService() {
@@ -72,7 +86,7 @@ class LifecycleServiceInstrumentedTest {
                 action = LifecycleService.ACTION_STOP
             }
         )
-        Thread.sleep(1000)
+        waitUntil(timeoutMs = 3_000L) { !LifecycleService.isRunning }
     }
 
     // ── Foreground notification appears ────────────────────────────────

@@ -9,8 +9,9 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.After
 import org.junit.Assert.*
+import org.junit.Assume
 import org.junit.Before
-import org.junit.Ignore
+import org.junit.BeforeClass
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -25,10 +26,21 @@ import org.junit.runner.RunWith
  * the permission grant/revoke is skipped.
  */
 @RunWith(AndroidJUnit4::class)
-@Ignore("Waydroid kills the instrumentation process on pm revoke. " +
-    "Foreground service notifications are exempt from POST_NOTIFICATIONS — " +
-    "this test passes on real devices/emulators.")
 class PermissionDenialTest {
+
+    companion object {
+        @BeforeClass
+        @JvmStatic
+        fun skipOnWaydroid() {
+            Assume.assumeFalse(
+                "Waydroid cannot revoke permissions at runtime",
+                Build.FINGERPRINT.contains("waydroid", ignoreCase = true)
+            )
+        }
+    }
+
+    private fun isWaydroid(): Boolean =
+        Build.FINGERPRINT.contains("waydroid", ignoreCase = true)
 
     private lateinit var context: Context
     private lateinit var prefs: SharedPreferences
