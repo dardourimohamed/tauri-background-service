@@ -99,6 +99,18 @@ fn main() {
 }
 ```
 
+### 3. Add plugin configuration
+
+In your `tauri.conf.json`, add the plugin configuration. It can be empty:
+
+```json
+{
+  "plugins": {
+    "background-service": {}
+  }
+}
+```
+
 ### ServiceContext
 
 The `ServiceContext<R>` passed to `init()` and `run()` provides:

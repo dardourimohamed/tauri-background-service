@@ -128,6 +128,20 @@ fn main() {
 
 > **Checkpoint:** The app compiles and launches. The service is registered but not yet started.
 
+## Add Plugin Configuration
+
+In your `tauri.conf.json`, add the plugin configuration. It can be empty — the plugin uses defaults:
+
+```json
+{
+  "plugins": {
+    "background-service": {}
+  }
+}
+```
+
+> **Checkpoint:** Run `cargo check` — Tauri validates plugin configuration at build time.
+
 ## Add Permissions
 
 Create or update a capabilities file in `src-tauri/capabilities/` (e.g., `default.json`) to grant the necessary permissions:

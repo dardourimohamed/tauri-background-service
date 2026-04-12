@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-04-12
+
+### Changed
+
+- Add plugin configuration step (`tauri.conf.json`) to all documentation
+
 ## [0.5.0] - 2026-04-12
 
 ### Changed
@@ -115,7 +121,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Notifier` helper for fire-and-forget local notifications
 - `StartConfig` with configurable `serviceLabel` and `foregroundServiceType`
 
-[Unreleased]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.5.0...HEAD
+[Unreleased]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.5.1...HEAD
+[0.5.1]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.5.0...plugin-v0.5.1
 [0.5.0]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.4.1...plugin-v0.5.0
 [0.4.1]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.4.0...plugin-v0.4.1
 [0.4.0]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.3.1...plugin-v0.4.0

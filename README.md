@@ -97,7 +97,19 @@ fn main() {
 }
 ```
 
-### 3. Use the TypeScript API
+### 3. Add plugin configuration
+
+In your `tauri.conf.json`, add the plugin configuration. It can be empty:
+
+```json
+{
+  "plugins": {
+    "background-service": {}
+  }
+}
+```
+
+### 4. Use the TypeScript API
 
 ```typescript
 import {
