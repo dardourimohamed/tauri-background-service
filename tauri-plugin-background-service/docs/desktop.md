@@ -135,7 +135,7 @@ Enable the `desktop-service` feature in your app's `Cargo.toml`:
 tauri-plugin-background-service = { version = "0.5", features = ["desktop-service"] }
 ```
 
-This pulls in the `service-manager` crate and adds three additional Tauri commands: `install_service`, `uninstall_service`, and `get_service_state`.
+This pulls in the `service-manager` crate and adds two additional Tauri commands: `install_service` and `uninstall_service`.
 
 ### Configuration
 
@@ -199,21 +199,16 @@ Configure Tauri to bundle the sidecar via `externalBin` in `tauri.conf.json`.
 
 ### TypeScript API
 
-When the `desktop-service` feature is enabled, three additional functions are available:
+When the `desktop-service` feature is enabled, two additional functions are available:
 
 ```typescript
 import {
   installService,
   uninstallService,
-  getServiceState,
 } from 'tauri-plugin-background-service';
 
 // Install the OS service
 await installService();
-
-// Check service state
-const status = await getServiceState();
-console.log(status.state); // 'idle' | 'initializing' | 'running' | 'stopped'
 
 // Uninstall the OS service
 await uninstallService();
