@@ -36,7 +36,7 @@ thiserror = "2"
 log = "0.4"
 async-trait = "0.1"
 libc = "0.2"
-backon = { version = "~1.5", optional = true }
+backon = { version = "~1.6", optional = true }
 service-manager = { version = "0.11", optional = true }
 
 [build-dependencies]
