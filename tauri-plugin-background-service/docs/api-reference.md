@@ -208,10 +208,10 @@ pub enum ServiceError {
     #[error("Plugin invoke error: {0}")]
     PluginInvoke(String),
     #[cfg(feature = "desktop-service")]
-    #[error("Service install error: {0}")]
+    #[error("Service installation failed: {0}")]
     ServiceInstall(String),
     #[cfg(feature = "desktop-service")]
-    #[error("Service uninstall error: {0}")]
+    #[error("Service uninstallation failed: {0}")]
     ServiceUninstall(String),
     #[cfg(feature = "desktop-service")]
     #[error("IPC error: {0}")]
