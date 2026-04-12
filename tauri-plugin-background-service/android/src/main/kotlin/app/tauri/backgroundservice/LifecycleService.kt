@@ -61,6 +61,12 @@ class LifecycleService : Service() {
         startForegroundTyped(NOTIF_ID, buildNotification(label), mapServiceType(serviceType))
         isRunning = true
 
+        // Persist config for OS restart detection
+        getSharedPreferences("bg_service", Context.MODE_PRIVATE).edit()
+            .putString("bg_service_label", label)
+            .putString("bg_service_type", serviceType)
+            .apply()
+
         return START_STICKY
     }
 

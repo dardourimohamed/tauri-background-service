@@ -1,5 +1,6 @@
 package app.tauri.backgroundservice
 
+import android.app.Activity
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.*
@@ -22,6 +23,9 @@ import org.robolectric.annotation.Config
  */
 @RunWith(RobolectricTestRunner::class)
 class BackgroundServicePluginTest {
+
+    /** Concrete Activity for Robolectric's ActivityScenario. */
+    class TestActivity : Activity()
 
     private lateinit var context: Context
     private lateinit var prefs: android.content.SharedPreferences
@@ -154,7 +158,7 @@ class BackgroundServicePluginTest {
         // The load() method should skip the request entirely.
         // Verify by checking no permission request is pending.
         val activity = androidx.test.core.app.ActivityScenario.launch(
-            android.app.Activity::class.java
+            TestActivity::class.java
         )
         activity.onActivity { act ->
             val shadowActivity = shadowOf(act)
@@ -167,7 +171,7 @@ class BackgroundServicePluginTest {
     @Config(sdk = [33]) // TIRAMISU — should request permission if not granted
     fun loadRequestsPermissionsOnApi33WhenNotGranted() {
         val activity = androidx.test.core.app.ActivityScenario.launch(
-            android.app.Activity::class.java
+            TestActivity::class.java
         )
         activity.onActivity { act ->
             // Deny the permission first

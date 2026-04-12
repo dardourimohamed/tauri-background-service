@@ -41,6 +41,7 @@ class LifecycleServiceTest {
     // ── onStartCommand: ACTION_STOP ────────────────────────────────────
 
     @Test
+    @Config(sdk = [33])
     fun onStartCommand_actionStop_clearsPrefsAndReturnsNotSticky() {
         // Set up initial state
         prefs.edit()
@@ -71,7 +72,7 @@ class LifecycleServiceTest {
     // ── onStartCommand: normal start ──────────────────────────────────
 
     @Test
-    @Config(sdk = [29]) // API 29+ for startForeground with service type
+    @Config(sdk = [33]) // API 29+ for startForeground with service type
     fun onStartCommand_normalStart_setsIsRunningAndReturnsSticky() {
         prefs.edit().clear().apply()
 
@@ -98,7 +99,7 @@ class LifecycleServiceTest {
     }
 
     @Test
-    @Config(sdk = [29])
+    @Config(sdk = [33])
     fun onStartCommand_normalStart_createsNotificationChannel() {
         prefs.edit().clear().apply()
 
@@ -126,7 +127,7 @@ class LifecycleServiceTest {
     }
 
     @Test
-    @Config(sdk = [29])
+    @Config(sdk = [33])
     fun onStartCommand_normalStart_defaultLabelWhenExtraMissing() {
         prefs.edit().clear().apply()
 
@@ -148,10 +149,37 @@ class LifecycleServiceTest {
         LifecycleService.isRunning = false
     }
 
+    @Test
+    @Config(sdk = [33])
+    fun onStartCommand_normalStart_persistConfigToSharedPreferences() {
+        prefs.edit().clear().apply()
+
+        val intent = Intent(context, LifecycleService::class.java).apply {
+            action = LifecycleService.ACTION_START
+            putExtra(LifecycleService.EXTRA_LABEL, "Syncing")
+            putExtra(LifecycleService.EXTRA_SERVICE_TYPE, "dataSync")
+        }
+
+        val service = Robolectric.buildService(LifecycleService::class.java)
+            .withIntent(intent)
+            .create()
+            .get()
+
+        service.onStartCommand(intent, 0, 0)
+
+        // After a normal start, the service must persist its config so that
+        // handleOsRestart can detect it after an OS-killed restart.
+        assertEquals("Syncing", prefs.getString("bg_service_label", null))
+        assertEquals("dataSync", prefs.getString("bg_service_type", null))
+
+        // Cleanup
+        LifecycleService.isRunning = false
+    }
+
     // ── handleOsRestart: with stored label ────────────────────────────
 
     @Test
-    @Config(sdk = [29])
+    @Config(sdk = [33])
     fun handleOsRestart_withLabel_setsAutoStartFlag() {
         prefs.edit()
             .putString("bg_service_label", "Syncing")
@@ -184,6 +212,7 @@ class LifecycleServiceTest {
     // ── handleOsRestart: without stored label ──────────────────────────
 
     @Test
+    @Config(sdk = [33])
     fun handleOsRestart_withoutLabel_returnsNotSticky() {
         prefs.edit().clear().apply()
 
@@ -196,7 +225,7 @@ class LifecycleServiceTest {
     // ── onDestroy: resets state ────────────────────────────────────────
 
     @Test
-    @Config(sdk = [29])
+    @Config(sdk = [33])
     fun onDestroy_resetsRunningState() {
         prefs.edit().clear().apply()
 
@@ -221,6 +250,7 @@ class LifecycleServiceTest {
     // ── createChannel ─────────────────────────────────────────────────
 
     @Test
+    @Config(sdk = [33])
     fun createChannel_createsCorrectChannel() {
         val service = Robolectric.buildService(LifecycleService::class.java).create().get()
         val method: Method = LifecycleService::class.java.getDeclaredMethod("createChannel")
@@ -238,6 +268,7 @@ class LifecycleServiceTest {
     // ── buildNotification ──────────────────────────────────────────────
 
     @Test
+    @Config(sdk = [33])
     fun buildNotification_hasCorrectContent() {
         val service = Robolectric.buildService(LifecycleService::class.java).create().get()
         val method: Method = LifecycleService::class.java.getDeclaredMethod(
