@@ -25,7 +25,7 @@ Add the plugin to your app's `Cargo.toml`:
 [dependencies]
 tauri = { version = "2" }
 tauri-plugin-notification = "2"
-tauri-plugin-background-service = "0.2"
+tauri-plugin-background-service = "0.5"
 ```
 
 ### npm (TypeScript API)
@@ -104,11 +104,16 @@ import {
   startService,
   stopService,
   isServiceRunning,
+  getServiceState,
   onPluginEvent,
 } from 'tauri-plugin-background-service';
 
 // Start the service
 await startService({ serviceLabel: 'Syncing data' });
+
+// Query detailed service state
+const status = await getServiceState();
+console.log(status.state); // 'idle' | 'initializing' | 'running' | 'stopped'
 
 // Listen to lifecycle events
 const unlisten = await onPluginEvent((event) => {

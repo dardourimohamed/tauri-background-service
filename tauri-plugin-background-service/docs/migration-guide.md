@@ -59,7 +59,7 @@ To use the desktop OS service mode:
 
 ```toml
 [dependencies]
-tauri-plugin-background-service = { version = "0.2", features = ["desktop-service"] }
+tauri-plugin-background-service = { version = "0.5", features = ["desktop-service"] }
 ```
 
 2. Configure in `tauri.conf.json`:
@@ -82,6 +82,82 @@ tauri-plugin-background-service = { version = "0.2", features = ["desktop-servic
 - Existing `BackgroundService<R>` trait implementations
 - Existing `PluginConfig` fields (`iosSafetyTimeoutSecs`, `iosCancelListenerTimeoutSecs`)
 - Android foreground service behavior
+
+## 0.4 → 0.5 Migration
+
+There are **no breaking changes** in 0.5. All 0.4 code continues to work unchanged.
+
+### What's New
+
+| Feature | Platform | Description |
+|---------|----------|-------------|
+| Documentation overhaul | All | All docs updated to reflect current API |
+
+### No Action Required
+
+All existing APIs, configurations, and behavior are unchanged from 0.4.
+
+## 0.3 → 0.4 Migration
+
+There are **no breaking changes** in 0.4. All 0.3 code continues to work unchanged.
+
+### What's New
+
+| Feature | Platform | Description |
+|---------|----------|-------------|
+| `ServiceState` enum | All | Fine-grained lifecycle states: Idle, Initializing, Running, Stopped |
+| `ServiceStatus` struct | All | State + optional last error |
+| `getServiceState()` | All | TypeScript API to query detailed service state |
+| `get_service_state` command | All | Rust Tauri command |
+| Platform-specific `ServiceContext` | All | `service_label` and `foreground_service_type` are now `String` (mobile only, behind `#[cfg(mobile)]`) |
+| IPC transport layer | Desktop | Length-prefixed JSON frames for sidecar communication |
+
+### New API: getServiceState()
+
+If you were using `isServiceRunning()` for a simple boolean check, you can now get more detail:
+
+```typescript
+// Before (0.3): simple boolean
+const running = await isServiceRunning();
+
+// After (0.4): detailed state
+const status = await getServiceState();
+console.log(status.state); // 'idle' | 'initializing' | 'running' | 'stopped'
+```
+
+### No Action Required For
+
+- Existing `startService()` / `stopService()` / `isServiceRunning()` calls
+- Existing `BackgroundService<R>` trait implementations
+- Existing `PluginConfig` fields
+
+## 0.2 → 0.3 Migration
+
+There are **no breaking changes** in 0.3. All 0.2 code continues to work unchanged.
+
+### What's New
+
+| Feature | Platform | Description |
+|---------|----------|-------------|
+| 14 foreground service types | Android | Expanded from 2 to 14 valid `foregroundServiceType` values |
+| `validate_foreground_service_type()` | Android | Rejects invalid types at Rust and Kotlin layers |
+| Enhanced desktop IPC | Desktop | Persistent client with exponential backoff |
+
+### New Foreground Service Types
+
+If you were using custom string values for `foregroundServiceType`, they may now be rejected by the validation function. Use only the 14 valid types:
+
+```
+dataSync, mediaPlayback, phoneCall, location, connectedDevice,
+mediaProjection, camera, microphone, health, remoteMessaging,
+systemExempted, shortService, specialUse, mediaProcessing
+```
+
+### No Action Required For
+
+- Existing `"dataSync"` or `"specialUse"` configurations
+- Existing `startService()` / `stopService()` / `isServiceRunning()` calls
+- Existing `BackgroundService<R>` trait implementations
 
 ## Change Type Classification
 

@@ -25,7 +25,7 @@ Add the plugin to your app's `Cargo.toml`:
 [dependencies]
 tauri = { version = "2" }
 tauri-plugin-notification = "2"
-tauri-plugin-background-service = "0.2"
+tauri-plugin-background-service = "0.5"
 ```
 
 ### npm (TypeScript API)
@@ -114,14 +114,22 @@ import {
   startService,
   stopService,
   isServiceRunning,
+  getServiceState,
   onPluginEvent,
+  type ServiceState,
+  type ServiceStatus,
 } from 'tauri-plugin-background-service';
 
 // Start the service (optionally configure the Android notification label)
 await startService({ serviceLabel: 'Syncing data' });
 
-// Check status
+// Check if running (simple boolean)
 const running = await isServiceRunning();
+
+// Query detailed service state
+const status = await getServiceState();
+console.log(status.state); // 'idle' | 'initializing' | 'running' | 'stopped'
+console.log(status.lastError); // null or error message
 
 // Listen to lifecycle events
 const unlisten = await onPluginEvent((event) => {
@@ -145,6 +153,44 @@ await stopService();
 unlisten();
 ```
 
+### Desktop Service API
+
+When the `desktop-service` Cargo feature is enabled:
+
+```typescript
+import {
+  installService,
+  uninstallService,
+} from 'tauri-plugin-background-service';
+
+// Install as OS-level daemon (systemd / launchd)
+await installService();
+
+// Uninstall the OS service
+await uninstallService();
+```
+
+### Foreground Service Types
+
+The `foregroundServiceType` parameter in `StartConfig` accepts these values:
+
+| Type | Use Case |
+|------|----------|
+| `"dataSync"` (default) | Data synchronization, file uploads/downloads |
+| `"mediaPlayback"` | Audio/video playback |
+| `"phoneCall"` | Ongoing phone calls |
+| `"location"` | Location tracking |
+| `"connectedDevice"` | Communication with external devices |
+| `"mediaProjection"` | Screen sharing/recording |
+| `"camera"` | Camera access |
+| `"microphone"` | Microphone access |
+| `"health"` | Health/fitness data |
+| `"remoteMessaging"` | Push messaging |
+| `"systemExempted"` | System-critical operations |
+| `"shortService"` | Short-lived tasks (< 3 minutes) |
+| `"specialUse"` | Custom use cases (requires Play Console justification) |
+| `"mediaProcessing"` | Media transcoding/processing |
+
 ### Permissions
 
 Add these to your app's capability configuration:
@@ -154,9 +200,17 @@ Add these to your app's capability configuration:
   "permissions": [
     "background-service:allow-start",
     "background-service:allow-stop",
-    "background-service:allow-is-running"
+    "background-service:allow-is-running",
+    "background-service:allow-get-service-state"
   ]
 }
+```
+
+For desktop service mode, also add:
+
+```json
+"background-service:allow-install-service",
+"background-service:allow-uninstall-service"
 ```
 
 ## Platform Notes
@@ -167,7 +221,7 @@ The plugin uses a Foreground Service with a persistent notification to keep the 
 
 - `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_DATA_SYNC` permissions
 - `POST_NOTIFICATIONS` runtime permission (requested automatically on Android 13+)
-- `foregroundServiceType="dataSync"` on the service declaration
+- `foregroundServiceType="dataSync"` on the service declaration (see [Android Guide](./docs/android.md) for all 14 valid types)
 - `stopWithTask="false"` ensures the service survives when the user swipes the app away
 - `START_STICKY` causes the OS to restart the service if killed under memory pressure
 
@@ -194,6 +248,12 @@ While the app is foregrounded, your `run()` loop executes continuously. When bac
 ### Desktop (Windows, macOS, Linux)
 
 No special OS integration is needed. The service runs as a standard Tokio task and continues as long as the app process is alive.
+
+For OS-level daemon mode (systemd / launchd), enable the `desktop-service` Cargo feature:
+
+```toml
+tauri-plugin-background-service = { version = "0.5", features = ["desktop-service"] }
+```
 
 ## Links
 

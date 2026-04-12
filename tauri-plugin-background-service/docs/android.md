@@ -70,10 +70,22 @@ await startService({
 
 ### Available Types
 
-| Type | Android Constant | Use Case |
-|------|-----------------|----------|
-| `"dataSync"` (default) | `FOREGROUND_SERVICE_TYPE_DATA_SYNC` | Data synchronization, file uploads/downloads, API polling |
-| `"specialUse"` | `FOREGROUND_SERVICE_TYPE_SPECIAL_USE` | Custom use cases not covered by other types. Requires justification in Google Play Console. |
+| Type | Android Constant | Required Permission | Use Case |
+|------|-----------------|---------------------|----------|
+| `"dataSync"` (default) | `FOREGROUND_SERVICE_TYPE_DATA_SYNC` | `FOREGROUND_SERVICE_DATA_SYNC` | Data synchronization, file uploads/downloads, API polling |
+| `"mediaPlayback"` | `FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK` | `FOREGROUND_SERVICE_MEDIA_PLAYBACK` | Audio/video playback |
+| `"phoneCall"` | `FOREGROUND_SERVICE_TYPE_PHONE_CALL` | `FOREGROUND_SERVICE_PHONE_CALL` | Ongoing phone calls |
+| `"location"` | `FOREGROUND_SERVICE_TYPE_LOCATION` | `FOREGROUND_SERVICE_LOCATION` | Location tracking |
+| `"connectedDevice"` | `FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE` | `FOREGROUND_SERVICE_CONNECTED_DEVICE` | Communication with external devices (BLE, USB) |
+| `"mediaProjection"` | `FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION` | `FOREGROUND_SERVICE_MEDIA_PROJECTION` | Screen sharing/recording |
+| `"camera"` | `FOREGROUND_SERVICE_TYPE_CAMERA` | `FOREGROUND_SERVICE_CAMERA` | Camera access |
+| `"microphone"` | `FOREGROUND_SERVICE_TYPE_MICROPHONE` | `FOREGROUND_SERVICE_MICROPHONE` | Microphone access |
+| `"health"` | `FOREGROUND_SERVICE_TYPE_HEALTH` | `FOREGROUND_SERVICE_HEALTH` | Health/fitness data |
+| `"remoteMessaging"` | `FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING` | `FOREGROUND_SERVICE_REMOTE_MESSAGING` | Push messaging |
+| `"systemExempted"` | `FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED` | `FOREGROUND_SERVICE_SYSTEM_EXEMPTED` | System-critical operations |
+| `"shortService"` | `FOREGROUND_SERVICE_TYPE_SHORT_SERVICE` | `FOREGROUND_SERVICE_SHORT_SERVICE` | Short-lived tasks (< 3 minutes) |
+| `"specialUse"` | `FOREGROUND_SERVICE_TYPE_SPECIAL_USE` | `FOREGROUND_SERVICE_SPECIAL_USE` | Custom use cases (requires Play Console justification) |
+| `"mediaProcessing"` | `FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING` | `FOREGROUND_SERVICE_MEDIA_PROCESSING` | Media transcoding/processing |
 
 Unrecognized type strings fall back to `FOREGROUND_SERVICE_TYPE_DATA_SYNC` with a warning logged to logcat.
 

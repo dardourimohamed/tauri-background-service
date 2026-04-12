@@ -132,7 +132,7 @@ Enable the `desktop-service` feature in your app's `Cargo.toml`:
 
 ```toml
 [dependencies]
-tauri-plugin-background-service = { version = "0.2", features = ["desktop-service"] }
+tauri-plugin-background-service = { version = "0.5", features = ["desktop-service"] }
 ```
 
 This pulls in the `service-manager` crate and adds three additional Tauri commands: `install_service`, `uninstall_service`, and `service_status`.
@@ -205,14 +205,15 @@ When the `desktop-service` feature is enabled, three additional functions are av
 import {
   installService,
   uninstallService,
-  serviceStatus,
+  getServiceState,
 } from 'tauri-plugin-background-service';
 
 // Install the OS service
 await installService();
 
-// Check service status
-const status = await serviceStatus(); // "running" | "stopped" | "not-installed"
+// Check service state
+const status = await getServiceState();
+console.log(status.state); // 'idle' | 'initializing' | 'running' | 'stopped'
 
 // Uninstall the OS service
 await uninstallService();
@@ -228,7 +229,7 @@ Add the desktop service permissions to your capabilities:
     "background-service:default",
     "background-service:allow-install-service",
     "background-service:allow-uninstall-service",
-    "background-service:allow-service-status"
+    "background-service:allow-get-service-state"
   ]
 }
 ```
@@ -237,6 +238,28 @@ Add the desktop service permissions to your capabilities:
 
 | Platform | Service Manager | Socket Path |
 |----------|----------------|-------------|
-| Linux | systemd (user unit) | `/tmp/{label}.sock` |
+| Linux | systemd (user unit) | `$XDG_RUNTIME_DIR/{label}.sock` |
 | macOS | launchd (user agent) | `/tmp/{label}.sock` |
 | Windows | Windows Service | `\\.\pipe\{label}` |
+
+## IPC Transport Layer
+
+In `osService` mode, the GUI process communicates with the sidecar via an IPC transport layer using length-prefixed JSON frames over Unix sockets (Linux/macOS) or Windows named pipes.
+
+### Protocol
+
+- **Framing:** Length-prefixed JSON frames (4-byte little-endian length prefix + JSON payload)
+- **Max frame size:** 16 MB
+- **Encoding:** UTF-8 JSON
+
+### Message Types
+
+| Type | Direction | Purpose |
+|------|-----------|---------|
+| `IpcRequest` | Client → Server | `Start`, `Stop`, `IsRunning`, `GetState` commands |
+| `IpcResponse` | Server → Client | Command results |
+| `IpcEvent` | Server → Client | Streaming events (started, stopped, error) |
+
+### Persistent Client
+
+The IPC client maintains a persistent connection with exponential backoff reconnect. If the sidecar is temporarily unavailable, the client retries automatically without dropping pending requests.

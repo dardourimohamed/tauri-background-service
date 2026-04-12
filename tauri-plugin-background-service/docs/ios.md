@@ -116,7 +116,19 @@ Set to `0` (default) for no timeout, or a positive value in seconds to cap proce
 
 ## Timeout Configuration
 
-The plugin has two configurable timeout values set via `PluginConfig` in your Tauri plugin configuration:
+The plugin has several configurable values set via `PluginConfig` in your Tauri plugin configuration:
+
+### All iOS PluginConfig Fields
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `iosSafetyTimeoutSecs` | `f64` | `28.0` | Safety timeout for `BGAppRefreshTask` expiration handler |
+| `iosCancelListenerTimeoutSecs` | `u64` | `14400` | Cancel listener max wait in seconds (4 hours) |
+| `iosProcessingSafetyTimeoutSecs` | `f64` | `0.0` | Safety timeout for `BGProcessingTask` (`0.0` = no cap) |
+| `iosEarliestRefreshBeginMinutes` | `f64` | `15.0` | Min delay (minutes) before `BGAppRefreshTask` is scheduled |
+| `iosEarliestProcessingBeginMinutes` | `f64` | `15.0` | Min delay (minutes) before `BGProcessingTask` is scheduled |
+| `iosRequiresExternalPower` | `bool` | `false` | Whether `BGProcessingTask` requires charging |
+| `iosRequiresNetworkConnectivity` | `bool` | `false` | Whether `BGProcessingTask` requires network |
 
 ### `iosSafetyTimeoutSecs`
 
@@ -148,7 +160,11 @@ In your Tauri plugin configuration (`tauri.conf.json` or equivalent):
         "background-service": {
             "iosSafetyTimeoutSecs": 20.0,
             "iosCancelListenerTimeoutSecs": 7200,
-            "iosProcessingSafetyTimeoutSecs": 600
+            "iosProcessingSafetyTimeoutSecs": 600,
+            "iosEarliestRefreshBeginMinutes": 15.0,
+            "iosEarliestProcessingBeginMinutes": 30.0,
+            "iosRequiresExternalPower": true,
+            "iosRequiresNetworkConnectivity": false
         }
     }
 }

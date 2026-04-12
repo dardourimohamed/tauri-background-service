@@ -75,22 +75,24 @@ pub struct ServiceContext<R: Runtime> {
     pub notifier: Notifier<R>,
     pub app: tauri::AppHandle<R>,
     pub shutdown: CancellationToken,
-    pub service_label: Option<String>,
-    pub foreground_service_type: Option<String>,
+    #[cfg(mobile)]
+    pub service_label: String,
+    #[cfg(mobile)]
+    pub foreground_service_type: String,
 }
 ```
 
 #### Fields
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `notifier` | `Notifier<R>` | Fire a local notification. Works on all platforms. |
-| `app` | `tauri::AppHandle<R>` | Emit events to the JS UI layer, access managed state. |
-| `shutdown` | `CancellationToken` | Cancelled when `stopService()` is called. Always use in `tokio::select!` within `run()`. |
-| `service_label` | `Option<String>` | Text shown in the Android persistent notification. Always `Some(...)` — uses the `StartConfig` default (`"Service running"`) if not overridden. Meaningful on Android only. |
-| `foreground_service_type` | `Option<String>` | Android foreground service type (e.g. `"dataSync"`, `"specialUse"`). Always `Some(...)` — uses the `StartConfig` default (`"dataSync"`) if not overridden. Meaningful on Android only. |
+| Field | Type | Platforms | Description |
+|-------|------|-----------|-------------|
+| `notifier` | `Notifier<R>` | All | Fire a local notification. Works on all platforms. |
+| `app` | `tauri::AppHandle<R>` | All | Emit events to the JS UI layer, access managed state. |
+| `shutdown` | `CancellationToken` | All | Cancelled when `stopService()` is called. Always use in `tokio::select!` within `run()`. |
+| `service_label` | `String` | Mobile only | Text shown in the Android persistent notification. Uses the `StartConfig` default (`"Service running"`) if not overridden. |
+| `foreground_service_type` | `String` | Mobile only | Android foreground service type (e.g. `"dataSync"`, `"specialUse"`). Uses the `StartConfig` default (`"dataSync"`) if not overridden. |
 
-> **Platform behavior:** Both fields are always `Some(...)` on all platforms because the plugin wraps `StartConfig` values unconditionally (manager.rs:257-263). The values have semantic effect only on Android (foreground service notification label and type).
+> **Platform behavior:** `service_label` and `foreground_service_type` are `String` (not `Option<String>`) and only available on mobile platforms, guarded by `#[cfg(mobile)]`. They always contain a value because `StartConfig` provides defaults.
 
 ---
 
@@ -112,7 +114,7 @@ pub struct StartConfig {
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `service_label` | `String` | Optional | `"Service running"` | Text shown in the Android persistent foreground notification. Ignored on desktop. |
-| `foreground_service_type` | `String` | Optional | `"dataSync"` | Android foreground service type. Common values: `"dataSync"` (default), `"specialUse"`. Ignored on non-Android platforms. |
+| `foreground_service_type` | `String` | Optional | `"dataSync"` | Android foreground service type. Valid values: `"dataSync"`, `"mediaPlayback"`, `"phoneCall"`, `"location"`, `"connectedDevice"`, `"mediaProjection"`, `"camera"`, `"microphone"`, `"health"`, `"remoteMessaging"`, `"systemExempted"`, `"shortService"`, `"specialUse"`, `"mediaProcessing"`. Ignored on non-Android platforms. |
 
 #### JSON format
 
@@ -138,6 +140,10 @@ pub struct PluginConfig {
     pub ios_safety_timeout_secs: f64,
     pub ios_cancel_listener_timeout_secs: u64,
     pub ios_processing_safety_timeout_secs: f64,
+    pub ios_earliest_refresh_begin_minutes: f64,
+    pub ios_earliest_processing_begin_minutes: f64,
+    pub ios_requires_external_power: bool,
+    pub ios_requires_network_connectivity: bool,
     // Behind #[cfg(feature = "desktop-service")]:
     // pub desktop_service_mode: String,
     // pub desktop_service_label: Option<String>,
@@ -151,6 +157,10 @@ pub struct PluginConfig {
 | `ios_safety_timeout_secs` | `f64` | Optional | `28.0` | iOS safety timeout for the BGAppRefreshTask expiration handler. iOS only. |
 | `ios_cancel_listener_timeout_secs` | `u64` | Optional | `14400` | iOS cancel listener timeout in seconds (4 hours). iOS only. |
 | `ios_processing_safety_timeout_secs` | `f64` | Optional | `0.0` | iOS safety timeout for BGProcessingTask. `0.0` means no cap (iOS manages lifetime). iOS only. |
+| `ios_earliest_refresh_begin_minutes` | `f64` | Optional | `15.0` | Minimum delay (in minutes) before iOS schedules a `BGAppRefreshTask`. iOS only. |
+| `ios_earliest_processing_begin_minutes` | `f64` | Optional | `15.0` | Minimum delay (in minutes) before iOS schedules a `BGProcessingTask`. iOS only. |
+| `ios_requires_external_power` | `bool` | Optional | `false` | Whether `BGProcessingTask` requires the device to be charging. iOS only. |
+| `ios_requires_network_connectivity` | `bool` | Optional | `false` | Whether `BGProcessingTask` requires network connectivity. iOS only. |
 | `desktop_service_mode` | `String` | Optional | `"inProcess"` | Desktop service mode: `"inProcess"` (default) or `"osService"`. Desktop only, requires `desktop-service` feature. |
 | `desktop_service_label` | `Option<String>` | Optional | Auto-derived | Custom label for the OS service. Desktop only, requires `desktop-service` feature. |
 
@@ -163,6 +173,10 @@ pub struct PluginConfig {
       "iosSafetyTimeoutSecs": 25.0,
       "iosCancelListenerTimeoutSecs": 7200,
       "iosProcessingSafetyTimeoutSecs": 600,
+      "iosEarliestRefreshBeginMinutes": 15.0,
+      "iosEarliestProcessingBeginMinutes": 30.0,
+      "iosRequiresExternalPower": true,
+      "iosRequiresNetworkConnectivity": false,
       "desktopServiceMode": "osService",
       "desktopServiceLabel": "com.example.myapp.background"
     }
@@ -190,6 +204,18 @@ pub enum ServiceError {
     Runtime(String),
     #[error("Platform error: {0}")]
     Platform(String),
+    #[cfg(mobile)]
+    #[error("Plugin invoke error: {0}")]
+    PluginInvoke(String),
+    #[cfg(feature = "desktop-service")]
+    #[error("Service install error: {0}")]
+    ServiceInstall(String),
+    #[cfg(feature = "desktop-service")]
+    #[error("Service uninstall error: {0}")]
+    ServiceUninstall(String),
+    #[cfg(feature = "desktop-service")]
+    #[error("IPC error: {0}")]
+    Ipc(String),
 }
 ```
 
@@ -202,6 +228,7 @@ pub enum ServiceError {
 | `Init(String)` | Error message | `init()` returned an error. |
 | `Runtime(String)` | Error message | `run()` returned an error, or the actor channel closed. |
 | `Platform(String)` | Error message | OS-specific failure (e.g. Android foreground service denied, iOS BGTask rejected, mobile keepalive failure). |
+| `PluginInvoke(String)` | Error message | Mobile plugin invoke failed (Kotlin/Swift bridge error). Mobile only, behind `#[cfg(mobile)]`. |
 | `ServiceInstall(String)` | Error message | Desktop service installation failed. Requires `desktop-service` feature. |
 | `ServiceUninstall(String)` | Error message | Desktop service uninstallation failed. Requires `desktop-service` feature. |
 | `Ipc(String)` | Error message | Desktop IPC communication error (socket connection, framing). Requires `desktop-service` feature. |
@@ -261,6 +288,72 @@ impl<R: Runtime> Notifier<R> {
 ```rust
 ctx.notifier.show("Sync Complete", "All data uploaded successfully");
 ```
+
+---
+
+### `ServiceState`
+
+Enum representing the lifecycle state of the background service. Marked `#[non_exhaustive]`.
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum ServiceState {
+    Idle,
+    Initializing,
+    Running,
+    Stopped,
+}
+```
+
+#### Variants
+
+| Variant | JSON value | Description |
+|---------|-----------|-------------|
+| `Idle` | `"idle"` | No service has been started, or the service has been stopped and fully cleaned up. |
+| `Initializing` | `"initializing"` | `init()` is currently running. |
+| `Running` | `"running"` | `run()` is actively executing. |
+| `Stopped` | `"stopped"` | The service has stopped (completed, cancelled, or errored). |
+
+---
+
+### `ServiceStatus`
+
+Struct returned by the `get_service_state` command. Provides the current state and an optional last error message.
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceStatus {
+    pub state: ServiceState,
+    pub last_error: Option<String>,
+}
+```
+
+#### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `state` | `ServiceState` | Current lifecycle state of the service. |
+| `last_error` | `Option<String>` | Error message from the last failure, if any. `None` if no error has occurred. |
+
+---
+
+### `get_service_state` command
+
+Tauri command that queries the current service state. Exposed as `getServiceState()` in TypeScript.
+
+```rust
+#[tauri::command]
+pub async fn get_service_state(
+    state: tauri::State<'_, ServiceManagerHandle<R>>,
+) -> Result<ServiceStatus, String>
+```
+
+#### Returns
+
+`Result<ServiceStatus, String>` — the current service state and optional last error.
 
 ---
 
@@ -345,11 +438,13 @@ import {
   startService,
   stopService,
   isServiceRunning,
+  getServiceState,
   onPluginEvent,
   installService,
   uninstallService,
-  serviceStatus,
   type StartConfig,
+  type ServiceState,
+  type ServiceStatus,
   type PluginEvent,
 } from 'tauri-plugin-background-service';
 ```
@@ -500,12 +595,12 @@ await uninstallService();
 
 ---
 
-### `serviceStatus()` (Desktop only)
+### `getServiceState()`
 
-Query the current status of the OS-level daemon service. Requires the `desktop-service` Cargo feature.
+Query the detailed state of the background service, including the lifecycle state and any last error.
 
 ```typescript
-async function serviceStatus(): Promise<string>
+async function getServiceState(): Promise<ServiceStatus>
 ```
 
 #### Parameters
@@ -514,13 +609,35 @@ None.
 
 #### Returns
 
-`Promise<string>` — one of `"running"`, `"stopped"`, or `"not-installed"`.
+`Promise<ServiceStatus>` — an object with `state` and `lastError` fields.
 
 #### Example
 
 ```typescript
-const status = await serviceStatus();
-console.log(status); // "running" | "stopped" | "not-installed"
+const status = await getServiceState();
+console.log(status.state);     // 'idle' | 'initializing' | 'running' | 'stopped'
+console.log(status.lastError); // null or error message string
+```
+
+---
+
+### `ServiceState` (TypeScript)
+
+String literal union representing the service lifecycle state.
+
+```typescript
+type ServiceState = 'idle' | 'initializing' | 'running' | 'stopped';
+```
+
+---
+
+### `ServiceStatus` (TypeScript)
+
+```typescript
+interface ServiceStatus {
+  state: ServiceState;
+  lastError: string | null;
+}
 ```
 
 ---
@@ -577,16 +694,13 @@ interface StartConfig {
   /** Text shown in the Android persistent foreground notification */
   serviceLabel?: string;
   /**
-   * Android foreground service type. Valid values: "dataSync" (default), "specialUse".
+   * Android foreground service type. Valid values: "dataSync" (default),
+   * "mediaPlayback", "phoneCall", "location", "connectedDevice",
+   * "mediaProjection", "camera", "microphone", "health", "remoteMessaging",
+   * "systemExempted", "shortService", "specialUse", "mediaProcessing".
    * Ignored on non-Android platforms.
    */
   foregroundServiceType?: string;
-  /**
-   * Desktop service mode. "in-process" (default) runs in the app process,
-   * "os-service" routes through IPC to the OS daemon.
-   * Desktop only, requires desktop-service feature.
-   */
-  mode?: "in-process" | "os-service";
 }
 ```
 
@@ -595,8 +709,7 @@ interface StartConfig {
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `serviceLabel` | `string` | Optional | `"Service running"` | Text shown in the Android persistent notification. |
-| `foregroundServiceType` | `string` | Optional | `"dataSync"` | Android foreground service type. `"dataSync"` for data sync, `"specialUse"` for custom use cases. Ignored on non-Android platforms. |
-| `mode` | `"in-process" \| "os-service"` | Optional | `"in-process"` | Desktop service mode. `"in-process"` runs as a standard Tokio task; `"os-service"` routes through IPC to the OS-level daemon sidecar. |
+| `foregroundServiceType` | `string` | Optional | `"dataSync"` | Android foreground service type. See [Android Guide](./android.md) for all 14 valid types and their required permissions. Ignored on non-Android platforms. |
 
 ---
 

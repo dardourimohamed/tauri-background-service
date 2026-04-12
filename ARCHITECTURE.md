@@ -20,11 +20,15 @@ Everything else is the user's responsibility. The plugin does not provide retry 
 tauri-plugin-background-service/src/
 ├── lib.rs              Plugin entry point, Tauri commands, iOS helpers
 ├── manager.rs          Actor loop, command handlers, MobileKeepalive trait
-├── models.rs           StartConfig, PluginConfig, PluginEvent, ServiceContext
+├── models.rs           StartConfig, PluginConfig, PluginEvent, ServiceContext, ServiceState, ServiceStatus
 ├── error.rs            ServiceError enum
 ├── service_trait.rs    BackgroundService<R> trait
 ├── notifier.rs         Notifier wrapper over tauri-plugin-notification
-└── mobile.rs           MobileLifecycle: Rust→Kotlin/Swift bridge
+├── mobile.rs           MobileLifecycle: Rust→Kotlin/Swift bridge
+└── desktop/            Desktop OS service mode (behind desktop-service feature)
+    ├── mod.rs          Desktop module entry point
+    ├── ipc.rs          IPC transport: length-prefixed JSON framing, client/server
+    └── service_manager.rs  OS service management via service-manager crate
 ```
 
 ```mermaid
@@ -100,6 +104,7 @@ The actor receives `ManagerCommand` variants and dispatches:
 | `Start` | `handle_start` | Rejects if `AlreadyRunning`. Creates token, increments generation, starts keepalive, spawns service task. |
 | `Stop` | `handle_stop` | Cancels the token, stops keepalive. Returns `NotRunning` if idle. |
 | `IsRunning` | inline | Checks if `token` slot is `Some`. |
+| `GetState` | inline | Returns `ServiceStatus` with current state and optional last error. |
 | `SetOnComplete` | inline | Stores callback for capture at next spawn. |
 | `SetMobile` | inline | Stores `Arc<dyn MobileKeepalive>` for mobile keepalive. |
 
@@ -224,3 +229,81 @@ Events use a tagged JSON format (`#[serde(tag = "type")]`) with `camelCase` fiel
 **Decision:** If `start_keepalive()` fails during `handle_start`, the token slot is cleared and the `on_complete` callback is restored to its pre-start state before returning the error.
 
 **Rationale:** `handle_start` modifies three pieces of state: the token slot, the generation counter, and the callback slot. The generation counter is harmless to increment (it only grows). But the token and callback represent allocated resources — leaving a dangling token would make `IsRunning` return `true` for a service that never started, and losing the callback would silently break iOS `completeBgTask`. Rollback ensures the actor returns to a clean idle state on failure.
+
+## IPC Transport Layer
+
+The `desktop-service` feature adds an IPC transport layer for communication between the GUI process and a sidecar daemon. The transport uses length-prefixed JSON frames over Unix domain sockets (Linux/macOS) or Windows named pipes.
+
+### Protocol
+
+- **Framing:** 4-byte little-endian length prefix + UTF-8 JSON payload
+- **Max frame size:** 16 MB
+- **Transport:** Unix domain socket (Linux/macOS) or Windows named pipe
+
+### Socket Paths
+
+| Platform | Path |
+|----------|------|
+| Linux | `$XDG_RUNTIME_DIR/{label}.sock` |
+| macOS | `/tmp/{label}.sock` |
+| Windows | `\\.\pipe\{label}` |
+
+### Message Types
+
+| Type | Direction | Variants |
+|------|-----------|----------|
+| `IpcRequest` | Client → Server | `Start`, `Stop`, `IsRunning`, `GetState` |
+| `IpcResponse` | Server → Client | Command result with optional error |
+| `IpcEvent` | Server → Client | Streaming events (started, stopped, error) |
+
+### Persistent Client
+
+The `IpcClient` maintains a persistent connection with exponential backoff reconnect using the `backon` crate. If the sidecar is temporarily unavailable, the client retries automatically without dropping pending requests.
+
+## Desktop Service Mode
+
+The `desktop-service` Cargo feature enables running the background service as an OS-level daemon via the `service-manager` crate. In this mode, the service survives app restarts and runs independently of the GUI process.
+
+### Architecture
+
+The sidecar binary (`headless_main`) binds to the IPC socket and runs the `BackgroundService` in-process:
+
+```
+GUI process:
+  → IpcClient connects to socket
+  → Sends IpcRequest (Start/Stop/IsRunning/GetState)
+  → Receives IpcResponse + IpcEvent
+
+Sidecar process:
+  → IpcServer binds to socket
+  → Translates requests to ManagerCommand
+  → Runs BackgroundService in-process
+  → Streams events back to connected clients
+```
+
+### Feature Flag
+
+Enabled via `Cargo.toml`:
+
+```toml
+tauri-plugin-background-service = { version = "0.5", features = ["desktop-service"] }
+```
+
+This pulls in `service-manager` 0.11 and `backon` ~1.5, and adds three Tauri commands: `install_service`, `uninstall_service`, and a desktop IPC client module.
+
+## Service State Query
+
+The `GetState` command (added in v0.4) provides fine-grained service lifecycle state beyond the boolean `IsRunning`.
+
+### ServiceState Enum
+
+| Variant | Meaning |
+|---------|---------|
+| `Idle` | No service started, or fully cleaned up after stop |
+| `Initializing` | `init()` is currently running |
+| `Running` | `run()` is actively executing |
+| `Stopped` | Service has stopped (completed, cancelled, or errored) |
+
+### ServiceStatus Struct
+
+Carries the current `ServiceState` and an optional `last_error: Option<String>` from the most recent failure. This allows clients to distinguish between a clean stop and an error-induced stop.

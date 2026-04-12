@@ -22,7 +22,7 @@ Add the plugin and its notification dependency to your app's `Cargo.toml`:
 
 ```toml
 [dependencies]
-tauri-plugin-background-service = "0.2"
+tauri-plugin-background-service = "0.5"
 tauri-plugin-notification = "2"
 ```
 
@@ -143,13 +143,14 @@ Create or update a capabilities file in `src-tauri/capabilities/` (e.g., `defaul
 }
 ```
 
-The `background-service:default` permission grants access to all three commands:
+The `background-service:default` permission grants access to all commands:
 
 | Command | Permission |
 |---------|------------|
 | Start service | `allow-start` |
 | Stop service | `allow-stop` |
 | Check if running | `allow-is-running` |
+| Query service state | `allow-get-service-state` |
 
 To grant permissions individually instead:
 
@@ -157,7 +158,8 @@ To grant permissions individually instead:
 "permissions": [
   "background-service:allow-start",
   "background-service:allow-stop",
-  "background-service:allow-is-running"
+  "background-service:allow-is-running",
+  "background-service:allow-get-service-state"
 ]
 ```
 
@@ -172,6 +174,7 @@ import {
   startService,
   stopService,
   isServiceRunning,
+  getServiceState,
   onPluginEvent,
 } from "tauri-plugin-background-service";
 
