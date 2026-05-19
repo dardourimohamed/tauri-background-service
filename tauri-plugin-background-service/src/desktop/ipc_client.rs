@@ -18,6 +18,8 @@ use crate::desktop::ipc::{
 };
 use crate::desktop::transport::{self, TransportReadHalf, TransportStream, TransportWriteHalf};
 use crate::error::ServiceError;
+#[cfg(test)]
+use crate::models::StopReason;
 use crate::models::{PluginEvent, ServiceStatus, StartConfig};
 
 /// IPC client for communicating with the headless sidecar service.
@@ -966,11 +968,11 @@ mod tests {
     #[test]
     fn ipc_event_to_plugin_event_stopped() {
         let event = IpcEvent::Stopped {
-            reason: "cancelled".into(),
+            reason: StopReason::UserStop,
         };
         let plugin = ipc_event_to_plugin_event(event);
         match plugin {
-            PluginEvent::Stopped { reason } => assert_eq!(reason, "cancelled"),
+            PluginEvent::Stopped { reason } => assert_eq!(reason, StopReason::UserStop),
             other => panic!("Expected Stopped, got {other:?}"),
         }
     }
@@ -1093,7 +1095,7 @@ mod tests {
 
         // Simulate relay broadcasting Stopped
         let _ = event_tx.send(IpcEvent::Stopped {
-            reason: "cancelled".into(),
+            reason: StopReason::UserStop,
         });
 
         // Read the Stopped event BEFORE any other request
@@ -1141,7 +1143,7 @@ mod tests {
         // Stop — simulate relay broadcasting Stopped
         client.stop().await.unwrap();
         let _ = event_tx.send(IpcEvent::Stopped {
-            reason: "cancelled".into(),
+            reason: StopReason::UserStop,
         });
         let stopped_ipc = tokio::time::timeout(Duration::from_millis(500), client.read_event())
             .await
@@ -1151,7 +1153,7 @@ mod tests {
         let stopped_plugin = ipc_event_to_plugin_event(stopped_ipc);
         match stopped_plugin {
             PluginEvent::Stopped { reason } => {
-                assert_eq!(reason, "cancelled", "Expected 'cancelled' reason");
+                assert_eq!(reason, StopReason::UserStop, "Expected UserStop reason");
             }
             other => panic!("Expected PluginEvent::Stopped, got {other:?}"),
         }
@@ -2001,7 +2003,7 @@ mod tests {
                     message: "warning".into(),
                 }),
                 IpcMessage::Event(IpcEvent::Stopped {
-                    reason: "cancelled".into(),
+                    reason: StopReason::UserStop,
                 }),
                 IpcMessage::Response(IpcResponse {
                     ok: true,

@@ -19,6 +19,8 @@ use crate::desktop::ipc::{encode_frame, IpcEvent, IpcMessage, IpcRequest, IpcRes
 use crate::desktop::transport::{self, TransportListener, TransportReadHalf, TransportStream};
 use crate::error::ServiceError;
 use crate::manager::ManagerCommand;
+#[cfg(test)]
+use crate::models::StopReason;
 
 /// Error type for reading IPC frames from a stream.
 #[non_exhaustive]
@@ -777,7 +779,7 @@ mod tests {
 
         // Simulate relay broadcasting Stopped
         let _ = event_tx.send(IpcEvent::Stopped {
-            reason: "cancelled".into(),
+            reason: StopReason::UserStop,
         });
         let event = tokio::time::timeout(Duration::from_millis(500), read_event(&mut stream))
             .await

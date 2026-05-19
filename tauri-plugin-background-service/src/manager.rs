@@ -19,7 +19,7 @@ use crate::desired_state::DesiredStateBackend;
 use crate::error::ServiceError;
 use crate::models::{
     validate_foreground_service_type, LifecycleMode, PluginEvent, ServiceContext,
-    ServiceState as ServiceLifecycle, ServiceStatus, StartConfig,
+    ServiceState as ServiceLifecycle, ServiceStatus, StartConfig, StopReason,
 };
 use crate::notifier::Notifier;
 use crate::service_trait::BackgroundService;
@@ -532,7 +532,7 @@ fn handle_start<R: Runtime>(
                 let _ = app.emit(
                     "background-service://event",
                     PluginEvent::Stopped {
-                        reason: "completed".into(),
+                        reason: StopReason::TaskCompleted,
                     },
                 );
             }

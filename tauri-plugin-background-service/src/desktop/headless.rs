@@ -30,6 +30,8 @@ use crate::desktop::ipc::{socket_path, IpcEvent};
 use crate::desktop::ipc_server::IpcServer;
 use crate::manager::manager_loop;
 use crate::models::PluginEvent;
+#[cfg(test)]
+use crate::models::StopReason;
 use crate::service_trait::BackgroundService;
 
 /// Parsed CLI arguments for the headless sidecar.
@@ -321,7 +323,7 @@ mod tests {
     #[test]
     fn plugin_event_maps_to_ipc_event_stopped() {
         let plugin_event = PluginEvent::Stopped {
-            reason: "completed".into(),
+            reason: StopReason::TaskCompleted,
         };
         let json = serde_json::to_string(&plugin_event).unwrap();
         let parsed: PluginEvent = serde_json::from_str(&json).unwrap();
@@ -331,7 +333,7 @@ mod tests {
             PluginEvent::Error { message } => IpcEvent::Error { message },
         };
         match ipc_event {
-            IpcEvent::Stopped { reason } => assert_eq!(reason, "completed"),
+            IpcEvent::Stopped { reason } => assert_eq!(reason, StopReason::TaskCompleted),
             other => panic!("Expected Stopped, got {other:?}"),
         }
     }

@@ -481,15 +481,77 @@ pub struct OsServiceStatus {
     pub last_error: Option<String>,
 }
 
+/// Reason why the background service stopped.
+///
+/// Structured stop reasons that distinguish between user-initiated stops,
+/// platform-imposed terminations, and natural task completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum StopReason {
+    /// User called stopService().
+    UserStop,
+    /// Application is shutting down gracefully.
+    AppStop,
+    /// Platform killed the service due to a timeout (e.g. Android FGS timeout).
+    PlatformTimeout,
+    /// Platform expired the background execution window (e.g. iOS BGTask).
+    PlatformExpiration,
+    /// User pressed stop on the native notification.
+    NativeNotificationStop,
+    /// OS restarted the service after a reboot.
+    OsRestart,
+    /// Service recovered after device boot.
+    BootRecovery,
+    /// Service's run() returned Ok(()) naturally.
+    TaskCompleted,
+    /// Service's run() returned an error.
+    Error,
+}
+
+impl<'de> serde::Deserialize<'de> for StopReason {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "userStop" => Ok(Self::UserStop),
+            "appStop" => Ok(Self::AppStop),
+            "platformTimeout" => Ok(Self::PlatformTimeout),
+            "platformExpiration" => Ok(Self::PlatformExpiration),
+            "nativeNotificationStop" => Ok(Self::NativeNotificationStop),
+            "osRestart" => Ok(Self::OsRestart),
+            "bootRecovery" => Ok(Self::BootRecovery),
+            "taskCompleted" => Ok(Self::TaskCompleted),
+            "error" => Ok(Self::Error),
+            // Legacy string mappings for backward compatibility
+            "completed" => Ok(Self::TaskCompleted),
+            "cancelled" | "user" => Ok(Self::UserStop),
+            _ => Err(serde::de::Error::unknown_variant(
+                &s,
+                &[
+                    "userStop",
+                    "appStop",
+                    "platformTimeout",
+                    "platformExpiration",
+                    "nativeNotificationStop",
+                    "osRestart",
+                    "bootRecovery",
+                    "taskCompleted",
+                    "error",
+                ],
+            )),
+        }
+    }
+}
+
 /// Built-in event types emitted by the runner itself.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 #[non_exhaustive]
 pub enum PluginEvent {
     /// init() completed successfully
     Started,
     /// run() returned or was cancelled
-    Stopped { reason: String },
+    Stopped { reason: StopReason },
     /// init() or run() returned an error
     Error { message: String },
 }
@@ -737,12 +799,12 @@ mod tests {
     #[test]
     fn plugin_event_stopped_serde_roundtrip() {
         let event = PluginEvent::Stopped {
-            reason: "cancelled".into(),
+            reason: StopReason::UserStop,
         };
         let json = serde_json::to_string(&event).unwrap();
         let de: PluginEvent = serde_json::from_str(&json).unwrap();
         match de {
-            PluginEvent::Stopped { reason } => assert_eq!(reason, "cancelled"),
+            PluginEvent::Stopped { reason } => assert_eq!(reason, StopReason::UserStop),
             other => panic!("Expected Stopped, got {other:?}"),
         }
     }
@@ -770,11 +832,14 @@ mod tests {
     #[test]
     fn plugin_event_stopped_json_keys_camel_case() {
         let event = PluginEvent::Stopped {
-            reason: "done".into(),
+            reason: StopReason::TaskCompleted,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"type\":\"stopped\""), "Tag: {json}");
-        assert!(json.contains("\"reason\":\"done\""), "Reason: {json}");
+        assert!(
+            json.contains("\"reason\":\"taskCompleted\""),
+            "Reason: {json}"
+        );
     }
 
     #[test]
@@ -785,6 +850,138 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"type\":\"error\""), "Tag: {json}");
         assert!(json.contains("\"message\":\"oops\""), "Message: {json}");
+    }
+
+    // --- StopReason tests ---
+
+    #[test]
+    fn stop_reason_all_variants_serialize_to_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&StopReason::UserStop).unwrap(),
+            "\"userStop\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StopReason::AppStop).unwrap(),
+            "\"appStop\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StopReason::PlatformTimeout).unwrap(),
+            "\"platformTimeout\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StopReason::PlatformExpiration).unwrap(),
+            "\"platformExpiration\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StopReason::NativeNotificationStop).unwrap(),
+            "\"nativeNotificationStop\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StopReason::OsRestart).unwrap(),
+            "\"osRestart\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StopReason::BootRecovery).unwrap(),
+            "\"bootRecovery\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StopReason::TaskCompleted).unwrap(),
+            "\"taskCompleted\""
+        );
+        assert_eq!(
+            serde_json::to_string(&StopReason::Error).unwrap(),
+            "\"error\""
+        );
+    }
+
+    #[test]
+    fn stop_reason_roundtrip_all_variants() {
+        for variant in [
+            StopReason::UserStop,
+            StopReason::AppStop,
+            StopReason::PlatformTimeout,
+            StopReason::PlatformExpiration,
+            StopReason::NativeNotificationStop,
+            StopReason::OsRestart,
+            StopReason::BootRecovery,
+            StopReason::TaskCompleted,
+            StopReason::Error,
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let de: StopReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(de, variant, "roundtrip failed for {variant:?}");
+        }
+    }
+
+    #[test]
+    fn stop_reason_legacy_completed_maps_to_task_completed() {
+        let json = "\"completed\"";
+        let de: StopReason = serde_json::from_str(json).unwrap();
+        assert_eq!(de, StopReason::TaskCompleted);
+    }
+
+    #[test]
+    fn stop_reason_legacy_cancelled_maps_to_user_stop() {
+        let json = "\"cancelled\"";
+        let de: StopReason = serde_json::from_str(json).unwrap();
+        assert_eq!(de, StopReason::UserStop);
+    }
+
+    #[test]
+    fn stop_reason_legacy_user_maps_to_user_stop() {
+        let json = "\"user\"";
+        let de: StopReason = serde_json::from_str(json).unwrap();
+        assert_eq!(de, StopReason::UserStop);
+    }
+
+    #[test]
+    fn stop_reason_unknown_variant_returns_error() {
+        let json = "\"unknownReason\"";
+        let result = serde_json::from_str::<StopReason>(json);
+        assert!(
+            result.is_err(),
+            "unknown variant should fail to deserialize"
+        );
+    }
+
+    #[test]
+    fn plugin_event_stopped_with_stop_reason_roundtrip() {
+        let event = PluginEvent::Stopped {
+            reason: StopReason::TaskCompleted,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let de: PluginEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            de,
+            PluginEvent::Stopped {
+                reason: StopReason::TaskCompleted
+            }
+        );
+    }
+
+    #[test]
+    fn plugin_event_stopped_legacy_reason_deserializes() {
+        // Simulates receiving a legacy event with reason "completed"
+        let json = r#"{"type":"stopped","reason":"completed"}"#;
+        let de: PluginEvent = serde_json::from_str(json).unwrap();
+        match de {
+            PluginEvent::Stopped { reason } => {
+                assert_eq!(reason, StopReason::TaskCompleted);
+            }
+            other => panic!("Expected Stopped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_event_stopped_legacy_cancelled_deserializes() {
+        let json = r#"{"type":"stopped","reason":"cancelled"}"#;
+        let de: PluginEvent = serde_json::from_str(json).unwrap();
+        match de {
+            PluginEvent::Stopped { reason } => {
+                assert_eq!(reason, StopReason::UserStop);
+            }
+            other => panic!("Expected Stopped, got {other:?}"),
+        }
     }
 
     // --- StartConfig foreground_service_type tests ---

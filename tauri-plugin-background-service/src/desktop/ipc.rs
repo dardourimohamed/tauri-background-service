@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::ServiceError;
+use crate::models::StopReason;
 
 /// Maximum allowed frame size (16 MB).
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
@@ -64,7 +65,7 @@ pub enum IpcEvent {
     /// Service started successfully.
     Started,
     /// Service stopped.
-    Stopped { reason: String },
+    Stopped { reason: StopReason },
     /// Service encountered an error.
     Error { message: String },
 }
@@ -316,12 +317,12 @@ mod tests {
     #[test]
     fn ipc_event_stopped_serde_roundtrip() {
         let event = IpcEvent::Stopped {
-            reason: "cancelled".into(),
+            reason: StopReason::UserStop,
         };
         let json = serde_json::to_string(&event).unwrap();
         let de: IpcEvent = serde_json::from_str(&json).unwrap();
         match de {
-            IpcEvent::Stopped { reason } => assert_eq!(reason, "cancelled"),
+            IpcEvent::Stopped { reason } => assert_eq!(reason, StopReason::UserStop),
             other => panic!("Expected Stopped, got {other:?}"),
         }
     }
@@ -329,11 +330,14 @@ mod tests {
     #[test]
     fn ipc_event_stopped_json_keys() {
         let event = IpcEvent::Stopped {
-            reason: "done".into(),
+            reason: StopReason::TaskCompleted,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"type\":\"stopped\""), "Tag: {json}");
-        assert!(json.contains("\"reason\":\"done\""), "Reason: {json}");
+        assert!(
+            json.contains("\"reason\":\"taskCompleted\""),
+            "Reason: {json}"
+        );
     }
 
     #[test]
@@ -399,13 +403,15 @@ mod tests {
     #[test]
     fn ipc_frame_encode_decode_event() {
         let event = IpcEvent::Stopped {
-            reason: "done".into(),
+            reason: StopReason::TaskCompleted,
         };
         let msg = IpcMessage::Event(event);
         let encoded = encode_frame(&msg).unwrap();
         let decoded = decode_frame(&encoded[4..]).unwrap();
         match decoded {
-            IpcMessage::Event(IpcEvent::Stopped { reason }) => assert_eq!(reason, "done"),
+            IpcMessage::Event(IpcEvent::Stopped { reason }) => {
+                assert_eq!(reason, StopReason::TaskCompleted)
+            }
             other => panic!("Expected Event(Stopped), got {other:?}"),
         }
     }
@@ -470,14 +476,14 @@ mod tests {
     #[test]
     fn ipc_message_event_roundtrip() {
         let msg = IpcMessage::Event(IpcEvent::Stopped {
-            reason: "cancelled".into(),
+            reason: StopReason::UserStop,
         });
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"kind\":\"event\""), "kind tag: {json}");
         let de: IpcMessage = serde_json::from_str(&json).unwrap();
         match de {
             IpcMessage::Event(IpcEvent::Stopped { reason }) => {
-                assert_eq!(reason, "cancelled");
+                assert_eq!(reason, StopReason::UserStop);
             }
             other => panic!("Expected Event, got {other:?}"),
         }
