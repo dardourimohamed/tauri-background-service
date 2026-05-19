@@ -116,7 +116,6 @@ use crate::manager::MobileKeepalive;
 #[cfg(mobile)]
 use mobile::MobileLifecycle;
 
-#[cfg(mobile)]
 use std::sync::Arc;
 
 // ─── iOS Plugin Binding ──────────────────────────────────────────────────────
@@ -888,6 +887,20 @@ where
             let ios_requires_external_power = config.ios_requires_external_power;
             let ios_requires_network_connectivity = config.ios_requires_network_connectivity;
 
+            // Desktop: construct file-backed desired-state persistence backend.
+            #[cfg(not(mobile))]
+            let desired_state_backend: Option<Arc<dyn desired_state::DesiredStateBackend>> = {
+                match app.path().app_data_dir() {
+                    Ok(data_dir) => Some(Arc::new(desired_state::FileDesiredStateBackend::new(data_dir))),
+                    Err(e) => {
+                        log::warn!("Failed to get app data dir for desired-state persistence: {e}");
+                        None
+                    }
+                }
+            };
+            #[cfg(mobile)]
+            let desired_state_backend: Option<Arc<dyn desired_state::DesiredStateBackend>> = None;
+
             // Mode dispatch: spawn in-process actor or configure IPC for OS service.
             #[cfg(all(feature = "desktop-service", unix))]
             if config.desktop_service_mode == "osService" {
@@ -914,7 +927,7 @@ where
                     ios_earliest_processing_begin_minutes,
                     ios_requires_external_power,
                     ios_requires_network_connectivity,
-                    None,
+                    desired_state_backend,
                 ));
             }
 
@@ -931,7 +944,7 @@ where
                     ios_earliest_processing_begin_minutes,
                     ios_requires_external_power,
                     ios_requires_network_connectivity,
-                    None,
+                    desired_state_backend,
                 ));
             }
 
@@ -947,7 +960,7 @@ where
                     ios_earliest_processing_begin_minutes,
                     ios_requires_external_power,
                     ios_requires_network_connectivity,
-                    None,
+                    desired_state_backend,
                 ));
             }
 
