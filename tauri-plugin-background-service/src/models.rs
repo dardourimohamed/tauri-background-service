@@ -715,6 +715,10 @@ pub struct PendingTaskInfo {
     pub identifier: String,
     /// Epoch timestamp (seconds) when the task was received by the native layer.
     pub received_at: f64,
+    /// Epoch timestamp (seconds) when the pending task was consumed by the Rust
+    /// auto-start logic. `None` until `clear_pending_bg_task` is called.
+    #[serde(default)]
+    pub consumed_at: Option<f64>,
 }
 
 /// iOS scheduling status returned by the native layer.
@@ -2900,6 +2904,7 @@ mod tests {
             task_kind: "refresh".into(),
             identifier: "com.example.app.bg-refresh".into(),
             received_at: 1700000000.123,
+            consumed_at: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         let de: PendingTaskInfo = serde_json::from_str(&json).unwrap();
@@ -2912,11 +2917,13 @@ mod tests {
             task_kind: "processing".into(),
             identifier: "test-id".into(),
             received_at: 123456.0,
+            consumed_at: Some(123500.0),
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"taskKind\":"), "{json}");
         assert!(json.contains("\"identifier\":"), "{json}");
         assert!(json.contains("\"receivedAt\":"), "{json}");
+        assert!(json.contains("\"consumedAt\":"), "{json}");
     }
 
     #[test]
@@ -2927,6 +2934,7 @@ mod tests {
         assert_eq!(info.task_kind, "refresh");
         assert_eq!(info.identifier, "com.example.bg-refresh");
         assert!((info.received_at - 1700000000.456).abs() < f64::EPSILON);
+        assert_eq!(info.consumed_at, None);
     }
 
     #[test]
@@ -2935,6 +2943,28 @@ mod tests {
         let info: PendingTaskInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.task_kind, "processing");
         assert_eq!(info.identifier, "com.example.bg-processing");
+        assert_eq!(info.consumed_at, None);
+    }
+
+    #[test]
+    fn pending_task_info_consumed_at_roundtrip() {
+        let info = PendingTaskInfo {
+            task_kind: "refresh".into(),
+            identifier: "com.example.bg-refresh".into(),
+            received_at: 1700000000.0,
+            consumed_at: Some(1700000060.5),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"consumedAt\":1700000060.5"), "{json}");
+        let de: PendingTaskInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.consumed_at, Some(1700000060.5));
+    }
+
+    #[test]
+    fn pending_task_info_consumed_at_null_deserializes_to_none() {
+        let json = r#"{"taskKind":"refresh","identifier":"id","receivedAt":1.0,"consumedAt":null}"#;
+        let info: PendingTaskInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.consumed_at, None);
     }
 
     // --- LifecycleState tests ---

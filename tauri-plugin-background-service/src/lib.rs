@@ -1057,16 +1057,16 @@ where
                                 });
 
                                 log::info!("iOS: auto-starting service for pending BGTask");
+                                let _ = mobile.clear_pending_bg_task();
                             } else {
-                                log::warn!("iOS: failed to parse stored start config");
+                                log::warn!("iOS: failed to parse stored start config — preserving pending task info for diagnostics");
                             }
                         } else {
                             log::info!(
                                 "iOS: pending BGTask but desired_running is false, skipping auto-start"
                             );
+                            let _ = mobile.clear_pending_bg_task();
                         }
-
-                        let _ = mobile.clear_pending_bg_task();
                     }
                     Ok(None) => {
                         // No pending BGTask — normal launch.

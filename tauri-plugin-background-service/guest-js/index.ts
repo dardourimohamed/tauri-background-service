@@ -102,6 +102,8 @@ export interface PendingTaskInfo {
   identifier: string;
   /** Epoch timestamp (seconds) when the task was received. */
   receivedAt: number;
+  /** Epoch timestamp (seconds) when the pending task was consumed by auto-start. */
+  consumedAt?: number | null;
 }
 
 /**
