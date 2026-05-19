@@ -1,8 +1,47 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-# JAVA_HOME must point to JDK 21+ (JDK 25 is incompatible with Gradle 8.x)
-export JAVA_HOME="/home/med/.local/java/jdk-21.0.10+7"
+# ── Preflight Validation ─────────────────────────────────────────────
+errors=0
+
+# JAVA_HOME: must be JDK 21+ (JDK 25 is incompatible with Gradle 8.x)
+if [ -z "${JAVA_HOME:-}" ]; then
+    echo "ERROR: JAVA_HOME is not set. Install JDK 21+ and export JAVA_HOME." >&2
+    errors=$((errors + 1))
+elif [ ! -x "$JAVA_HOME/bin/java" ]; then
+    echo "ERROR: JAVA_HOME ($JAVA_HOME) does not contain a valid JDK (missing bin/java)." >&2
+    errors=$((errors + 1))
+else
+    java_version=$("$JAVA_HOME/bin/java" -version 2>&1 | head -1)
+    echo "JAVA_HOME: $JAVA_HOME ($java_version)"
+fi
+
+# waydroid
+if ! command -v waydroid &>/dev/null; then
+    echo "ERROR: 'waydroid' not found in PATH." >&2
+    errors=$((errors + 1))
+else
+    echo "waydroid: $(command -v waydroid)"
+fi
+
+# adb
+if ! command -v adb &>/dev/null; then
+    echo "ERROR: 'adb' not found in PATH." >&2
+    errors=$((errors + 1))
+else
+    echo "adb: $(command -v adb)"
+fi
+
+if [ "$errors" -gt 0 ]; then
+    echo >&2
+    echo "Preflight failed with $errors error(s). Fix the above issues and re-run." >&2
+    exit 1
+fi
+
+echo "Preflight passed."
+echo
+
+# ── Build & Deploy ───────────────────────────────────────────────────
 
 # Start Waydroid if not running
 if ! waydroid status | grep -q "RUNNING"; then
