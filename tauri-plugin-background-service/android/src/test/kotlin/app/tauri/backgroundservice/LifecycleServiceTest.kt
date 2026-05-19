@@ -1302,4 +1302,72 @@ class LifecycleServiceTest {
 
         LifecycleService.isRunning = false
     }
+
+    // ── startForegroundTyped: exception handling ─────────────────────────
+
+    @Test
+    @Config(sdk = [33])
+    fun startForegroundTyped_returnsTrueOnSuccess() {
+        prefs.edit().clear().apply()
+        val service = Robolectric.buildService(LifecycleService::class.java)
+            .create().get()
+
+        val method = LifecycleService::class.java.getDeclaredMethod(
+            "startForegroundTyped", Int::class.java, Notification::class.java, Int::class.java
+        )
+        method.isAccessible = true
+        val notification = Notification()
+        val result = method.invoke(service, 1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) as Boolean
+        assertTrue("Should return true on success", result)
+
+        LifecycleService.isRunning = false
+    }
+
+    @Test
+    fun persistStartForegroundError_persistsToDurableState() {
+        DurableState.clear(context)
+        val service = LifecycleService()
+        val method = LifecycleService::class.java.getDeclaredMethod(
+            "persistStartForegroundError", String::class.java, String::class.java
+        )
+        method.isAccessible = true
+        // Need to attach service to context for DurableState.load to work
+        // Use Robolectric to create a service attached to context
+        val robolectricService = Robolectric.buildService(LifecycleService::class.java)
+            .create().get()
+
+        method.invoke(robolectricService, "missing_permission", "Missing FOREGROUND_SERVICE permission")
+
+        val state = DurableState.load(context)
+        assertNotNull("lastPlatformError should be set", state.lastPlatformError)
+        assertTrue("Error should contain code",
+            state.lastPlatformError!!.contains("missing_permission"))
+        assertTrue("Error should contain message",
+            state.lastPlatformError!!.contains("FOREGROUND_SERVICE"))
+    }
+
+    @Test
+    fun persistStartForegroundError_preservesOtherFields() {
+        DurableState.save(context, DurableState(
+            desiredRunning = true,
+            lastServiceLabel = "Syncing",
+            lastServiceType = "dataSync",
+            lastStartEpochMs = 12345L,
+        ))
+
+        val robolectricService = Robolectric.buildService(LifecycleService::class.java)
+            .create().get()
+        val method = LifecycleService::class.java.getDeclaredMethod(
+            "persistStartForegroundError", String::class.java, String::class.java
+        )
+        method.isAccessible = true
+        method.invoke(robolectricService, "fgs_restricted", "Not allowed")
+
+        val state = DurableState.load(context)
+        assertTrue("desiredRunning should be preserved", state.desiredRunning)
+        assertEquals("Syncing", state.lastServiceLabel)
+        assertEquals("dataSync", state.lastServiceType)
+        assertEquals(12345L, state.lastStartEpochMs)
+        assertTrue("lastPlatformError should be set", state.lastPlatformError!!.contains("fgs_restricted"))
+    }
 }

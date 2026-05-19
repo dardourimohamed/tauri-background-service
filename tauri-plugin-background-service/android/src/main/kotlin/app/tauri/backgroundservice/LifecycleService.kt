@@ -104,7 +104,10 @@ class LifecycleService : Service() {
         val label = intent.getStringExtra(EXTRA_LABEL) ?: "Service running"
         val serviceType = intent.getStringExtra(EXTRA_SERVICE_TYPE) ?: "dataSync"
         createChannel()
-        startForegroundTyped(notifId(), buildNotification(label), mapServiceType(serviceType))
+        if (!startForegroundTyped(notifId(), buildNotification(label), mapServiceType(serviceType))) {
+            isRunning = false
+            return START_NOT_STICKY
+        }
         isRunning = true
 
         // Persist config for OS restart detection
@@ -202,7 +205,9 @@ class LifecycleService : Service() {
 
         // Must call startForeground immediately (Android 12+ requirement)
         createChannel()
-        startForegroundTyped(notifId(), buildNotification("Restarting..."), mapServiceType(serviceType))
+        if (!startForegroundTyped(notifId(), buildNotification("Restarting..."), mapServiceType(serviceType))) {
+            return START_NOT_STICKY
+        }
         isRunning = true
         autoRestarting = true
 
@@ -219,12 +224,34 @@ class LifecycleService : Service() {
         return START_STICKY
     }
 
-    private fun startForegroundTyped(notifId: Int, notification: Notification, serviceType: Int) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(notifId, notification, serviceType)
-        } else {
-            startForeground(notifId, notification)
+    private fun startForegroundTyped(notifId: Int, notification: Notification, serviceType: Int): Boolean {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(notifId, notification, serviceType)
+            } else {
+                startForeground(notifId, notification)
+            }
+            return true
+        } catch (e: android.app.ForegroundServiceStartNotAllowedException) {
+            persistStartForegroundError("fgs_restricted",
+                "Foreground service start not allowed by OS: ${e.message}")
+        } catch (e: SecurityException) {
+            persistStartForegroundError("missing_permission",
+                "Missing foreground service permission: ${e.message}")
+        } catch (e: Exception) {
+            persistStartForegroundError("start_failed",
+                "Failed to start foreground service: ${e.message}")
         }
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+        return false
+    }
+
+    private fun persistStartForegroundError(code: String, message: String) {
+        val previous = DurableState.load(this)
+        DurableState.save(this, previous.copy(
+            lastPlatformError = "$code: $message"
+        ))
     }
 
     private fun mapServiceType(type: String): Int {

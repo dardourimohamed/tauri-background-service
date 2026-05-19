@@ -191,8 +191,13 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
         ): String? {
             if (!validate) return null
             if (allowedTypes.contains(requestedType)) return null
-            return "foreground service type '$requestedType' is not in the configured allowlist $allowedTypes. " +
-                "Add it to androidForegroundServiceTypes in your plugin config."
+            return org.json.JSONObject().apply {
+                put("code", "fgs_type_not_allowed")
+                put("message", "Foreground service type '$requestedType' is not in the configured allowlist $allowedTypes. " +
+                    "Add it to androidForegroundServiceTypes in your plugin config.")
+                put("invalidType", requestedType)
+                put("validOptions", org.json.JSONArray(allowedTypes))
+            }.toString()
         }
     }
 }

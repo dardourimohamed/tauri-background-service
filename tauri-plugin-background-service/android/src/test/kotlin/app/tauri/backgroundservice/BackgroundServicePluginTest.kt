@@ -206,8 +206,9 @@ class BackgroundServicePluginTest {
             "location", allowedTypes, true
         )
         assertNotNull(result)
-        assertTrue("error should mention the type", result!!.contains("location"))
-        assertTrue("error should mention allowed types", result.contains("dataSync"))
+        val json = org.json.JSONObject(result!!)
+        assertEquals("fgs_type_not_allowed", json.getString("code"))
+        assertEquals("location", json.getString("invalidType"))
     }
 
     @Test
@@ -245,6 +246,53 @@ class BackgroundServicePluginTest {
             "dataSync", emptyList(), true
         )
         assertNotNull(result)
+    }
+
+    // ── Structured FGS validation error format ────────────────────────────
+
+    @Test
+    fun validateFgsType_structuredError_hasCodeField() {
+        val result = BackgroundServicePlugin.validateForegroundServiceType(
+            "location", listOf("dataSync"), true
+        )
+        assertNotNull(result)
+        val json = org.json.JSONObject(result!!)
+        assertEquals("fgs_type_not_allowed", json.getString("code"))
+    }
+
+    @Test
+    fun validateFgsType_structuredError_hasMessageField() {
+        val result = BackgroundServicePlugin.validateForegroundServiceType(
+            "location", listOf("dataSync"), true
+        )
+        assertNotNull(result)
+        val json = org.json.JSONObject(result!!)
+        val message = json.getString("message")
+        assertTrue("Message should mention the type", message.contains("location"))
+        assertTrue("Message should mention config key", message.contains("androidForegroundServiceTypes"))
+    }
+
+    @Test
+    fun validateFgsType_structuredError_hasInvalidTypeField() {
+        val result = BackgroundServicePlugin.validateForegroundServiceType(
+            "mediaPlayback", listOf("dataSync", "specialUse"), true
+        )
+        assertNotNull(result)
+        val json = org.json.JSONObject(result!!)
+        assertEquals("mediaPlayback", json.getString("invalidType"))
+    }
+
+    @Test
+    fun validateFgsType_structuredError_hasValidOptionsArray() {
+        val allowed = listOf("dataSync", "specialUse", "location")
+        val result = BackgroundServicePlugin.validateForegroundServiceType(
+            "camera", allowed, true
+        )
+        assertNotNull(result)
+        val json = org.json.JSONObject(result!!)
+        val options = json.getJSONArray("validOptions")
+        val actual = (0 until options.length()).map { options.getString(it) }
+        assertEquals(allowed, actual)
     }
 
     // ── stopKeepalive clears DurableState ─────────────────────────────────
