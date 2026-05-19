@@ -317,4 +317,56 @@ class BackgroundServicePluginTest {
         assertFalse("desiredRunning should be false after clear", loaded.desiredRunning)
         assertEquals("", loaded.lastServiceLabel)
     }
+
+    // ── computePermissionStatus ────────────────────────────────────────────
+
+    @Test
+    fun computePermissionStatus_granted_returnsGranted() {
+        assertEquals("granted",
+            BackgroundServicePlugin.computePermissionStatus(true, false))
+    }
+
+    @Test
+    fun computePermissionStatus_grantedWithRationale_returnsGranted() {
+        // granted takes precedence over rationale
+        assertEquals("granted",
+            BackgroundServicePlugin.computePermissionStatus(true, true))
+    }
+
+    @Test
+    fun computePermissionStatus_notGranted_withRationale_returnsNotDetermined() {
+        assertEquals("notDetermined",
+            BackgroundServicePlugin.computePermissionStatus(false, true))
+    }
+
+    @Test
+    fun computePermissionStatus_notGranted_withoutRationale_returnsDenied() {
+        assertEquals("denied",
+            BackgroundServicePlugin.computePermissionStatus(false, false))
+    }
+
+    // ── loadConfig: requestNotificationPermissionOnLoad ────────────────────
+
+    @Test
+    fun loadConfig_requestNotificationPermissionOnLoad_defaultsToTrue() {
+        val json = org.json.JSONObject()
+        // No androidRequestNotificationPermissionOnLoad key — should default to true
+        assertTrue(json.optBoolean("androidRequestNotificationPermissionOnLoad", true))
+    }
+
+    @Test
+    fun loadConfig_requestNotificationPermissionOnLoad_explicitFalse() {
+        val json = org.json.JSONObject().apply {
+            put("androidRequestNotificationPermissionOnLoad", false)
+        }
+        assertFalse(json.optBoolean("androidRequestNotificationPermissionOnLoad", true))
+    }
+
+    @Test
+    fun loadConfig_requestNotificationPermissionOnLoad_explicitTrue() {
+        val json = org.json.JSONObject().apply {
+            put("androidRequestNotificationPermissionOnLoad", true)
+        }
+        assertTrue(json.optBoolean("androidRequestNotificationPermissionOnLoad", true))
+    }
 }

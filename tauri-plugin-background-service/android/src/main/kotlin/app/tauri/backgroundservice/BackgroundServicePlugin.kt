@@ -35,6 +35,7 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
     private var notificationId: Int = 9001
     private var notificationSmallIcon: String? = null
     private var showStopAction: Boolean = true
+    private var requestNotificationPermissionOnLoad: Boolean = true
 
     private fun prefs() =
         activity.getSharedPreferences("bg_service", Context.MODE_PRIVATE)
@@ -43,7 +44,8 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
         super.load(webView)
         loadConfig()
         // Request POST_NOTIFICATIONS once so Rust's Notifier can fire freely
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+        if (requestNotificationPermissionOnLoad &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             activity.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
             != android.content.pm.PackageManager.PERMISSION_GRANTED
         ) {
@@ -94,6 +96,7 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
         notificationId = json.optInt("androidNotificationId", 9001)
         notificationSmallIcon = json.optString("androidNotificationSmallIcon").ifEmpty { null }
         showStopAction = json.optBoolean("androidShowStopAction", true)
+        requestNotificationPermissionOnLoad = json.optBoolean("androidRequestNotificationPermissionOnLoad", true)
     }
 
     @Command
@@ -177,12 +180,48 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
         invoke.resolve()
     }
 
+    @Command
+    fun getNotificationPermissionStatus(invoke: Invoke) {
+        val status = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            "granted"
+        } else {
+            val isGranted = activity.checkSelfPermission(
+                android.Manifest.permission.POST_NOTIFICATIONS
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            val shouldShowRationale = activity.shouldShowRequestPermissionRationale(
+                android.Manifest.permission.POST_NOTIFICATIONS
+            )
+            computePermissionStatus(isGranted, shouldShowRationale)
+        }
+        val result = JSObject()
+        result.put("status", status)
+        invoke.resolve(result)
+    }
+
+    @Command
+    fun requestNotificationPermission(invoke: Invoke) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            val result = JSObject()
+            result.put("status", "granted")
+            invoke.resolve(result)
+            return
+        }
+        activity.requestPermissions(
+            arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1001)
+        invoke.resolve()
+    }
+
     companion object {
         @Volatile
         internal var onTimeoutEvent: ((String) -> Unit)? = null
 
         @Volatile
         internal var onNativeLifecycleEvent: ((String, String?) -> Unit)? = null
+
+        fun computePermissionStatus(isGranted: Boolean, shouldShowRationale: Boolean): String {
+            if (isGranted) return "granted"
+            return if (shouldShowRationale) "notDetermined" else "denied"
+        }
 
         fun validateForegroundServiceType(
             requestedType: String,
