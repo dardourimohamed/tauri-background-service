@@ -7,7 +7,10 @@
 //! This module is available on all platforms. Platform-specific checks are
 //! gated by `cfg` attributes so they only run on the target platform.
 
-use crate::models::{Platform, SetupIssue, SetupValidationReport};
+use crate::models::{Platform, SetupIssue, SetupValidationReport, Severity};
+
+#[cfg(test)]
+use crate::models::ValidationIssue;
 
 /// Validates background service setup prerequisites for the current platform.
 ///
@@ -97,10 +100,16 @@ impl SetupValidator {
             },
         ];
 
+        let issues: Vec<_> = warnings
+            .iter()
+            .map(|w| w.to_validation_issue(Severity::Warning))
+            .collect();
+
         SetupValidationReport {
             ok: true,
             errors: vec![],
             warnings,
+            issues,
         }
     }
 
@@ -144,10 +153,16 @@ impl SetupValidator {
             },
         ];
 
+        let issues: Vec<_> = warnings
+            .iter()
+            .map(|w| w.to_validation_issue(Severity::Warning))
+            .collect();
+
         SetupValidationReport {
             ok: true,
             errors: vec![],
             warnings,
+            issues,
         }
     }
 
@@ -220,10 +235,21 @@ impl SetupValidator {
             let _ = platform;
         }
 
+        let issues: Vec<_> = errors
+            .iter()
+            .map(|e| e.to_validation_issue(Severity::Error))
+            .chain(
+                warnings
+                    .iter()
+                    .map(|w| w.to_validation_issue(Severity::Warning)),
+            )
+            .collect();
+
         SetupValidationReport {
             ok: errors.is_empty(),
             errors,
             warnings,
+            issues,
         }
     }
 }
@@ -538,6 +564,7 @@ mod tests {
                 platform: Platform::Android,
                 fix: Some("Fix it".into()),
             }],
+            issues: vec![],
         };
         let json = serde_json::to_string(&report).unwrap();
         let de: SetupValidationReport = serde_json::from_str(&json).unwrap();
@@ -558,6 +585,7 @@ mod tests {
                 fix: None,
             }],
             warnings: vec![],
+            issues: vec![],
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"ok\":"), "{json}");
@@ -576,6 +604,7 @@ mod tests {
                 platform: Platform::Linux,
                 fix: None,
             }],
+            issues: vec![],
         };
         assert!(report.ok);
     }
@@ -591,6 +620,7 @@ mod tests {
                 fix: None,
             }],
             warnings: vec![],
+            issues: vec![],
         };
         assert!(!report.ok);
     }
@@ -621,6 +651,7 @@ mod tests {
                 fix: None,
             }],
             warnings: vec![],
+            issues: vec![],
         };
         assert!(!report.ok);
         assert_eq!(report.errors.len(), 1);
@@ -637,8 +668,184 @@ mod tests {
                 platform: Platform::Linux,
                 fix: None,
             }],
+            issues: vec![],
         };
         assert!(report.ok);
         assert!(!report.warnings.is_empty());
+    }
+
+    // ── Structured issues tests ──────────────────────────────────────
+
+    #[test]
+    fn setup_issue_to_validation_issue_error_severity() {
+        let issue = SetupIssue {
+            code: "test".into(),
+            message: "msg".into(),
+            platform: Platform::Linux,
+            fix: Some("fix it".into()),
+        };
+        let vi = issue.to_validation_issue(Severity::Error);
+        assert_eq!(vi.severity, Severity::Error);
+        assert_eq!(vi.code, "test");
+        assert_eq!(vi.message, "msg");
+        assert_eq!(vi.platform, Platform::Linux);
+        assert_eq!(vi.fix, Some("fix it".into()));
+    }
+
+    #[test]
+    fn setup_issue_to_validation_issue_warning_severity() {
+        let issue = SetupIssue {
+            code: "w".into(),
+            message: "warn msg".into(),
+            platform: Platform::Android,
+            fix: None,
+        };
+        let vi = issue.to_validation_issue(Severity::Warning);
+        assert_eq!(vi.severity, Severity::Warning);
+        assert_eq!(vi.code, "w");
+        assert!(vi.fix.is_none());
+    }
+
+    #[test]
+    fn android_issues_populated_with_warning_severity() {
+        let report = SetupValidator::validate(Platform::Android);
+        assert!(
+            !report.issues.is_empty(),
+            "Android should have structured issues"
+        );
+        assert_eq!(
+            report.issues.len(),
+            report.warnings.len(),
+            "issues count should match warnings count (no errors on Android)"
+        );
+        for vi in &report.issues {
+            assert_eq!(
+                vi.severity,
+                Severity::Warning,
+                "All Android issues should be warnings: {:?}",
+                vi.code
+            );
+        }
+    }
+
+    #[test]
+    fn ios_issues_populated_with_warning_severity() {
+        let report = SetupValidator::validate(Platform::Ios);
+        assert!(
+            !report.issues.is_empty(),
+            "iOS should have structured issues"
+        );
+        assert_eq!(
+            report.issues.len(),
+            report.warnings.len(),
+            "issues count should match warnings count (no errors on iOS)"
+        );
+        for vi in &report.issues {
+            assert_eq!(
+                vi.severity,
+                Severity::Warning,
+                "All iOS issues should be warnings: {:?}",
+                vi.code
+            );
+        }
+    }
+
+    #[test]
+    fn windows_issues_empty() {
+        let report = SetupValidator::validate(Platform::Windows);
+        assert!(report.issues.is_empty(), "Windows has no validation issues");
+    }
+
+    #[test]
+    fn unknown_issues_empty() {
+        let report = SetupValidator::validate(Platform::Unknown);
+        assert!(report.issues.is_empty(), "Unknown has no validation issues");
+    }
+
+    #[test]
+    fn desktop_issues_include_errors_and_warnings() {
+        let report = SetupValidator::validate(Platform::Linux);
+        let error_count = report
+            .issues
+            .iter()
+            .filter(|vi| vi.severity == Severity::Error)
+            .count();
+        let warning_count = report
+            .issues
+            .iter()
+            .filter(|vi| vi.severity == Severity::Warning)
+            .count();
+        assert_eq!(
+            error_count,
+            report.errors.len(),
+            "Error issues should match errors count"
+        );
+        assert_eq!(
+            warning_count,
+            report.warnings.len(),
+            "Warning issues should match warnings count"
+        );
+        assert_eq!(
+            report.issues.len(),
+            report.errors.len() + report.warnings.len(),
+            "Total issues = errors + warnings"
+        );
+    }
+
+    #[test]
+    fn all_platforms_issues_match_errors_plus_warnings() {
+        for platform in [
+            Platform::Android,
+            Platform::Ios,
+            Platform::Linux,
+            Platform::Macos,
+            Platform::Windows,
+        ] {
+            let report = SetupValidator::validate(platform);
+            assert_eq!(
+                report.issues.len(),
+                report.errors.len() + report.warnings.len(),
+                "issues count should equal errors + warnings for {:?}",
+                platform
+            );
+        }
+    }
+
+    #[test]
+    fn issues_preserve_codes_from_errors_and_warnings() {
+        let report = SetupValidator::validate(Platform::Android);
+        let error_codes: Vec<&str> = report.errors.iter().map(|e| e.code.as_str()).collect();
+        let warning_codes: Vec<&str> = report.warnings.iter().map(|w| w.code.as_str()).collect();
+        let issue_codes: Vec<&str> = report.issues.iter().map(|i| i.code.as_str()).collect();
+        for code in error_codes.iter().chain(warning_codes.iter()) {
+            assert!(
+                issue_codes.contains(code),
+                "issues should contain code '{}'",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn validation_issue_serde_roundtrip() {
+        let vi = ValidationIssue {
+            severity: Severity::Error,
+            code: "test_code".into(),
+            message: "test message".into(),
+            fix: Some("fix it".into()),
+            platform: Platform::Linux,
+        };
+        let json = serde_json::to_string(&vi).unwrap();
+        let de: ValidationIssue = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.severity, Severity::Error);
+        assert_eq!(de.code, "test_code");
+        assert_eq!(de.message, "test message");
+    }
+
+    #[test]
+    fn report_issues_default_empty_on_deserialize() {
+        let json = r#"{"ok":true,"errors":[],"warnings":[]}"#;
+        let de: SetupValidationReport = serde_json::from_str(json).unwrap();
+        assert!(de.issues.is_empty(), "issues should default to empty");
     }
 }

@@ -799,6 +799,19 @@ pub struct SetupIssue {
     pub fix: Option<String>,
 }
 
+impl SetupIssue {
+    /// Convert this `SetupIssue` into a [`ValidationIssue`] with the given severity.
+    pub fn to_validation_issue(&self, severity: Severity) -> ValidationIssue {
+        ValidationIssue {
+            severity,
+            code: self.code.clone(),
+            message: self.message.clone(),
+            fix: self.fix.clone(),
+            platform: self.platform,
+        }
+    }
+}
+
 /// Result of validating background service setup prerequisites.
 ///
 /// Returned by `validateBackgroundServiceSetup()`. Contains `errors` (blocking
@@ -814,6 +827,13 @@ pub struct SetupValidationReport {
     pub errors: Vec<SetupIssue>,
     /// Non-blocking issues that may cause degraded behavior.
     pub warnings: Vec<SetupIssue>,
+    /// Unified issues with typed severity.
+    ///
+    /// Combines `errors` (as [`Severity::Error`]) and `warnings` (as
+    /// [`Severity::Warning`]) into a single list. Populated automatically
+    /// by [`crate::validator::SetupValidator::validate`].
+    #[serde(default)]
+    pub issues: Vec<ValidationIssue>,
 }
 
 /// A single validation issue found during lifecycle validation.
