@@ -166,6 +166,33 @@ impl<R: Runtime> ServiceManagerHandle<R> {
             .map_err(|_| ServiceError::Runtime("manager actor dropped reply".into()))?
     }
 
+    /// Stop the running background service with a specific reason.
+    ///
+    /// Applies a reason-based desired-state policy: intentional stops
+    /// (UserStop, AppStop, etc.) clear desired state, while platform
+    /// errors and timeouts preserve it for auto-restart recovery.
+    pub async fn stop_with_reason(&self, reason: StopReason) -> Result<(), ServiceError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ManagerCommand::StopWithReason { reason, reply })
+            .await
+            .map_err(|_| ServiceError::Runtime("manager actor shut down".into()))?;
+        rx.await
+            .map_err(|_| ServiceError::Runtime("manager actor dropped reply".into()))?
+    }
+
+    /// Stop the running background service synchronously with a specific reason.
+    ///
+    /// Blocking variant of [`ServiceManagerHandle::stop_with_reason`].
+    pub fn stop_blocking_with_reason(&self, reason: StopReason) -> Result<(), ServiceError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .blocking_send(ManagerCommand::StopWithReason { reason, reply })
+            .map_err(|_| ServiceError::Runtime("manager actor shut down".into()))?;
+        rx.blocking_recv()
+            .map_err(|_| ServiceError::Runtime("manager actor dropped reply".into()))?
+    }
+
     /// Check whether a background service is currently running.
     pub async fn is_running(&self) -> bool {
         let (reply, rx) = oneshot::channel();
@@ -591,26 +618,7 @@ fn handle_start<R: Runtime>(
 /// Takes the token from state and cancels it, then stops mobile keepalive.
 /// Returns `NotRunning` if no service is active.
 fn handle_stop<R: Runtime>(state: &mut ServiceState<R>) -> Result<(), ServiceError> {
-    let mut guard = state.token.lock().unwrap();
-    match guard.take() {
-        Some(token) => {
-            token.cancel();
-            state.is_running.store(false, Ordering::SeqCst);
-            *state.lifecycle_state.lock().unwrap() = ServiceLifecycle::Stopped;
-            *state.last_error.lock().unwrap() = None;
-            drop(guard);
-            // Stop mobile keepalive after token cancellation.
-            if let Some(ref mobile) = state.mobile {
-                if let Err(e) = mobile.stop_keepalive() {
-                    log::warn!("stop_keepalive failed (service already cancelled): {e}");
-                }
-            }
-            // Persist desired_running=false with cleared recovery fields.
-            save_desired_running(state, false, None);
-            Ok(())
-        }
-        None => Err(ServiceError::NotRunning),
-    }
+    handle_stop_with_reason(state, StopReason::UserStop)
 }
 
 /// Handle a `StopWithReason` command.
@@ -632,9 +640,11 @@ fn handle_stop_with_reason<R: Runtime>(
             *state.lifecycle_state.lock().unwrap() = ServiceLifecycle::Stopped;
             *state.last_error.lock().unwrap() = None;
             drop(guard);
-            if let Some(ref mobile) = state.mobile {
-                if let Err(e) = mobile.stop_keepalive() {
-                    log::warn!("stop_keepalive failed: {e}");
+            if should_stop_keepalive(reason) {
+                if let Some(ref mobile) = state.mobile {
+                    if let Err(e) = mobile.stop_keepalive() {
+                        log::warn!("stop_keepalive failed: {e}");
+                    }
                 }
             }
             if should_clear_desired_state(reason) {
@@ -658,6 +668,13 @@ fn should_clear_desired_state(reason: StopReason) -> bool {
             | StopReason::NativeNotificationStop
             | StopReason::TaskCompleted
     )
+}
+
+/// Returns `true` if `stop_keepalive` should be called for the given reason.
+/// `PlatformExpiration` is skipped because the OS has already killed the
+/// background task — calling stop_keepalive would be redundant.
+fn should_stop_keepalive(reason: StopReason) -> bool {
+    !matches!(reason, StopReason::PlatformExpiration)
 }
 
 // ─── Desired-State Helpers ──────────────────────────────────────────────
@@ -2925,6 +2942,220 @@ mod tests {
             mock.stop_called.load(Ordering::Acquire),
             1,
             "stop_keepalive should be called once after StopWithReason"
+        );
+    }
+
+    // ── Step 6 (task fee4): handle_stop delegates to handle_stop_with_reason ──
+
+    #[tokio::test]
+    async fn stop_delegates_to_stop_with_reason_user_stop_clears_desired() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let saves_before = backend.saves.lock().unwrap().len();
+
+        // Plain Stop should behave like StopWithReason(UserStop) — clear desired state
+        send_stop(&handle).await.unwrap();
+
+        let saves = backend.saves.lock().unwrap();
+        assert_eq!(
+            saves.len(),
+            saves_before + 1,
+            "Stop should save desired state (delegates to StopWithReason(UserStop))"
+        );
+        assert!(
+            !saves.last().unwrap().desired_running,
+            "Stop should clear desired_running"
+        );
+    }
+
+    // ── Step 6 (task fee4): ServiceManagerHandle::stop_with_reason ──────────
+
+    #[tokio::test]
+    async fn stop_with_reason_handle_method_stops_service() {
+        let handle = setup_manager();
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        assert!(send_is_running(&handle).await);
+
+        handle.stop_with_reason(StopReason::UserStop).await.unwrap();
+
+        assert!(
+            !send_is_running(&handle).await,
+            "service should be stopped after stop_with_reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_with_reason_handle_method_preserves_desired_for_platform_timeout() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let saves_before = backend.saves.lock().unwrap().len();
+
+        handle
+            .stop_with_reason(StopReason::PlatformTimeout)
+            .await
+            .unwrap();
+
+        let saves = backend.saves.lock().unwrap();
+        assert_eq!(
+            saves.len(),
+            saves_before,
+            "PlatformTimeout should not save new desired state"
+        );
+        assert!(
+            saves.last().unwrap().desired_running,
+            "desired_running should remain true"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_with_reason_handle_method_returns_not_running_when_idle() {
+        let handle = setup_manager();
+
+        let result = handle.stop_with_reason(StopReason::UserStop).await;
+        assert!(
+            matches!(result, Err(ServiceError::NotRunning)),
+            "stop_with_reason should return NotRunning when idle"
+        );
+    }
+
+    // ── Step 6 (task fee4): ServiceManagerHandle::stop_blocking_with_reason ──
+
+    #[tokio::test]
+    async fn stop_blocking_with_reason_stops_service() {
+        let handle = Arc::new(setup_manager());
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        assert!(send_is_running(&handle).await);
+
+        let h = handle.clone();
+        let result =
+            tokio::task::spawn_blocking(move || h.stop_blocking_with_reason(StopReason::AppStop))
+                .await
+                .expect("spawn_blocking panicked");
+
+        assert!(
+            result.is_ok(),
+            "stop_blocking_with_reason should succeed: {result:?}"
+        );
+        assert!(
+            !send_is_running(&handle).await,
+            "service should be stopped after stop_blocking_with_reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_blocking_with_reason_returns_not_running_when_idle() {
+        let handle = Arc::new(setup_manager());
+
+        let h = handle.clone();
+        let result =
+            tokio::task::spawn_blocking(move || h.stop_blocking_with_reason(StopReason::UserStop))
+                .await
+                .expect("spawn_blocking panicked");
+
+        assert!(
+            matches!(result, Err(ServiceError::NotRunning)),
+            "stop_blocking_with_reason should return NotRunning when idle: {result:?}"
+        );
+    }
+
+    // ── Step 6 (task d336): Idempotent stop and PlatformExpiration keepalive ──
+
+    #[tokio::test]
+    async fn stop_with_reason_idempotent_second_returns_not_running() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // First stop succeeds
+        send_stop_with_reason(&handle, StopReason::UserStop)
+            .await
+            .unwrap();
+
+        let saves_after_first = backend.saves.lock().unwrap().len();
+
+        // Second stop returns NotRunning with no additional side effects
+        let result = send_stop_with_reason(&handle, StopReason::UserStop).await;
+        assert!(
+            matches!(result, Err(ServiceError::NotRunning)),
+            "second StopWithReason should return NotRunning: {result:?}"
+        );
+
+        let saves_after_second = backend.saves.lock().unwrap().len();
+        assert_eq!(
+            saves_after_first, saves_after_second,
+            "second StopWithReason should not produce additional desired-state saves"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_with_reason_platform_expiration_skips_stop_keepalive() {
+        let mock = MockMobile::new();
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        send_set_mobile(&handle, mock.clone()).await;
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(
+            mock.stop_called.load(Ordering::Acquire),
+            0,
+            "stop_keepalive should not be called yet"
+        );
+
+        let saves_before = backend.saves.lock().unwrap().len();
+
+        send_stop_with_reason(&handle, StopReason::PlatformExpiration)
+            .await
+            .unwrap();
+
+        assert!(!send_is_running(&handle).await, "service should be stopped");
+        assert_eq!(
+            mock.stop_called.load(Ordering::Acquire),
+            0,
+            "PlatformExpiration should NOT call stop_keepalive"
+        );
+
+        // Desired state should be preserved (not cleared)
+        let saves = backend.saves.lock().unwrap();
+        assert_eq!(
+            saves.len(),
+            saves_before,
+            "PlatformExpiration should not save new desired state"
+        );
+        assert!(
+            saves.last().unwrap().desired_running,
+            "desired_running should remain true"
         );
     }
 }
