@@ -187,6 +187,12 @@ pub struct PluginConfig {
     #[serde(default = "default_true")]
     pub android_show_stop_action: bool,
 
+    /// Whether to automatically request POST_NOTIFICATIONS permission on
+    /// Android API 33+ when the plugin loads. Default: true (backward compat).
+    /// Set to false to manage permission requests explicitly from JS.
+    #[serde(default = "default_true")]
+    pub android_request_notification_permission_on_load: bool,
+
     /// Desktop service mode: "inProcess" (default) or "osService".
     /// Controls whether the background service runs in-process or as a
     /// registered OS service/daemon.
@@ -655,6 +661,7 @@ impl Default for PluginConfig {
             android_notification_id: default_android_notification_id(),
             android_notification_small_icon: None,
             android_show_stop_action: default_true(),
+            android_request_notification_permission_on_load: default_true(),
             #[cfg(feature = "desktop-service")]
             desktop_service_mode: default_desktop_service_mode(),
             #[cfg(feature = "desktop-service")]
@@ -1991,6 +1998,33 @@ mod tests {
             json.contains("androidShowStopAction"),
             "JSON should use camelCase: {json}"
         );
+    }
+
+    // --- PluginConfig android_request_notification_permission_on_load tests ---
+
+    #[test]
+    fn plugin_config_android_request_notification_permission_default() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert!(config.android_request_notification_permission_on_load);
+    }
+
+    #[test]
+    fn plugin_config_android_request_notification_permission_false() {
+        let json = r#"{"androidRequestNotificationPermissionOnLoad":false}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.android_request_notification_permission_on_load);
+    }
+
+    #[test]
+    fn plugin_config_android_request_notification_permission_serde_roundtrip() {
+        let config = PluginConfig {
+            android_request_notification_permission_on_load: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert!(!de.android_request_notification_permission_on_load);
     }
 
     #[test]
