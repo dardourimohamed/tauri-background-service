@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-background-service": "file:../../tauri-plugin-background-service/guest-js",
+    "@tauri-apps/plugin-background-service": "file:../tauri-plugin-background-service/guest-js",
     "@tauri-apps/plugin-notification": "^2"
   },
   "devDependencies": {
