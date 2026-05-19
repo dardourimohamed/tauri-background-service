@@ -162,9 +162,9 @@ async fn ios_set_on_complete_callback<R: Runtime>(_app: &AppHandle<R>) -> Result
 /// cancel listener begins waiting. Sends `Stop` to the actor when cancelled.
 ///
 /// Three outcomes:
-/// 1. **Resolved invoke** (safety timer / expiration) → `Ok(())` → send `Stop`.
+/// 1. **Resolved invoke** (safety timer / expiration) → `Ok(())` → send `StopWithReason(PlatformExpiration)`.
 /// 2. **Timeout** (default: 4h) → call `cancel_cancel_listener` to unblock the
-///    thread, then send `Stop`.
+///    thread, then send `StopWithReason(PlatformTimeout)`.
 /// 3. **Rejected invoke** (explicit stop / natural completion) → `Err` → no action.
 ///
 /// Core cancel listener logic, extracted for testability.
@@ -172,10 +172,10 @@ async fn ios_set_on_complete_callback<R: Runtime>(_app: &AppHandle<R>) -> Result
 /// - `wait_fn`: blocking function simulating `wait_for_cancel` (returns `Ok(())` on resolve,
 ///   `Err` on reject).
 /// - `cancel_fn`: called on timeout to unblock the `wait_fn` thread.
-/// - `cmd_tx`: channel to send `Stop` command on resolve/timeout.
+/// - `cmd_tx`: channel to send `StopWithReason` command on resolve/timeout.
 /// - `timeout_secs`: how long to wait before treating the listener as timed out.
 ///
-/// Returns `true` if a `Stop` was sent, `false` otherwise.
+/// Returns `true` if a `StopWithReason` was sent, `false` otherwise.
 #[allow(dead_code)] // used on iOS + in tests
 async fn run_cancel_listener<R: Runtime>(
     wait_fn: Box<dyn FnOnce() -> Result<(), ServiceError> + Send>,
@@ -187,13 +187,27 @@ async fn run_cancel_listener<R: Runtime>(
     let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), handle).await;
     match result {
         // Resolved invoke (safety timer or expiration) → graceful shutdown
-        Ok(Ok(Ok(()))) | Err(_) => {
-            // On timeout, unblock the spawn_blocking thread first.
-            if result.is_err() {
-                cancel_fn();
-            }
+        Ok(Ok(Ok(()))) => {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            let _ = cmd_tx.send(ManagerCommand::Stop { reply: tx }).await;
+            let _ = cmd_tx
+                .send(ManagerCommand::StopWithReason {
+                    reason: crate::models::StopReason::PlatformExpiration,
+                    reply: tx,
+                })
+                .await;
+            let _ = rx.await;
+            true
+        }
+        // Timeout → unblock the spawn_blocking thread, then graceful shutdown
+        Err(_) => {
+            cancel_fn();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = cmd_tx
+                .send(ManagerCommand::StopWithReason {
+                    reason: crate::models::StopReason::PlatformTimeout,
+                    reply: tx,
+                })
+                .await;
             let _ = rx.await;
             true
         }
@@ -1403,22 +1417,23 @@ mod tests {
     use crate::manager::ManagerCommand;
     use std::sync::atomic::AtomicBool;
 
-    /// Helper: spawn a background task that accepts one Stop command and replies Ok(()).
-    /// Returns a oneshot receiver that yields true if Stop was received.
+    /// Helper: spawn a background task that accepts one StopWithReason command and replies Ok(()).
+    /// Returns a oneshot receiver that yields Some(reason) if StopWithReason was received.
     fn spawn_stop_drain(
         mut cmd_rx: tokio::sync::mpsc::Receiver<ManagerCommand<tauri::test::MockRuntime>>,
-    ) -> tokio::sync::oneshot::Receiver<bool> {
-        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<bool>();
+    ) -> tokio::sync::oneshot::Receiver<Option<crate::models::StopReason>> {
+        let (seen_tx, seen_rx) =
+            tokio::sync::oneshot::channel::<Option<crate::models::StopReason>>();
         tokio::spawn(async move {
             let result =
                 tokio::time::timeout(std::time::Duration::from_secs(2), cmd_rx.recv()).await;
             match result {
-                Ok(Some(ManagerCommand::Stop { reply })) => {
+                Ok(Some(ManagerCommand::StopWithReason { reason, reply })) => {
                     let _ = reply.send(Ok(()));
-                    let _ = seen_tx.send(true);
+                    let _ = seen_tx.send(Some(reason));
                 }
                 _ => {
-                    let _ = seen_tx.send(false);
+                    let _ = seen_tx.send(None);
                 }
             }
         });
@@ -1426,7 +1441,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_listener_resolved_invoke_sends_stop() {
+    async fn cancel_listener_resolved_invoke_sends_stop_with_reason() {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
         let seen = spawn_stop_drain(cmd_rx);
 
@@ -1440,9 +1455,11 @@ mod tests {
         .await;
 
         assert!(stop_sent, "resolved invoke should return true");
-        assert!(
-            seen.await.unwrap(),
-            "Stop command should be sent on resolved invoke"
+        let reason = seen.await.unwrap();
+        assert_eq!(
+            reason,
+            Some(crate::models::StopReason::PlatformExpiration),
+            "StopWithReason(PlatformExpiration) should be sent on resolved invoke"
         );
     }
 
@@ -1461,14 +1478,15 @@ mod tests {
         .await;
 
         assert!(!stop_sent, "rejected invoke should return false");
-        assert!(
-            !seen.await.unwrap(),
-            "Stop command should NOT be sent on rejected invoke"
+        assert_eq!(
+            seen.await.unwrap(),
+            None,
+            "StopWithReason should NOT be sent on rejected invoke"
         );
     }
 
     #[tokio::test]
-    async fn cancel_listener_timeout_sends_stop() {
+    async fn cancel_listener_timeout_sends_stop_with_reason() {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
         let cancel_called = Arc::new(AtomicBool::new(false));
         let cancel_called_clone = cancel_called.clone();
@@ -1498,9 +1516,11 @@ mod tests {
             cancel_called.load(Ordering::SeqCst),
             "cancel_fn should be called on timeout"
         );
-        assert!(
-            seen.await.unwrap(),
-            "Stop command should be sent on timeout"
+        let reason = seen.await.unwrap();
+        assert_eq!(
+            reason,
+            Some(crate::models::StopReason::PlatformTimeout),
+            "StopWithReason(PlatformTimeout) should be sent on timeout"
         );
     }
 
@@ -1520,9 +1540,10 @@ mod tests {
 
         // JoinError is Ok(Err(_)) which falls into the `_ => false` branch
         assert!(!stop_sent, "join error should return false (no stop sent)");
-        assert!(
-            !seen.await.unwrap(),
-            "Stop command should NOT be sent on join error"
+        assert_eq!(
+            seen.await.unwrap(),
+            None,
+            "StopWithReason should NOT be sent on join error"
         );
     }
 
