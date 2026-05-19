@@ -52,6 +52,59 @@ export interface StartConfig {
 /** Service lifecycle state. */
 export type ServiceState = 'idle' | 'initializing' | 'running' | 'stopped';
 
+/** Detailed lifecycle state of the background service. */
+export type LifecycleState =
+  | 'idle'
+  | 'starting'
+  | 'running'
+  | 'stopping'
+  | 'stopped'
+  | 'recovering'
+  | 'recoveryPending'
+  | 'expired'
+  | 'blocked'
+  | 'error';
+
+/** Severity level for a validation issue. */
+export type Severity = 'error' | 'warning' | 'info';
+
+/** A validation issue found during lifecycle setup checks. */
+export interface ValidationIssue {
+  severity: Severity;
+  code: string;
+  message: string;
+  fix?: string;
+  platform: Platform;
+}
+
+/** Reason the service stopped, reported in lifecycle events. */
+export type StopReason =
+  | 'userStop'
+  | 'appStop'
+  | 'platformTimeout'
+  | 'platformExpiration'
+  | 'nativeNotificationStop'
+  | 'osRestart'
+  | 'bootRecovery'
+  | 'taskCompleted'
+  | 'error';
+
+/** Complete snapshot of the background service lifecycle status. */
+export interface LifecycleStatus {
+  state: LifecycleState;
+  desiredRunning: boolean;
+  recoveryEnabled: boolean;
+  recoveryPending: boolean;
+  recoveryReason?: string;
+  lastStartConfig?: StartConfig;
+  lastPlatformState?: string;
+  lastPlatformError?: string;
+  lastError?: string;
+  platform: Platform;
+  capabilities: PlatformCapabilities;
+  issues: ValidationIssue[];
+}
+
 /** Snapshot of the service lifecycle status. */
 export interface ServiceStatus {
   /** Current lifecycle state. */
@@ -282,6 +335,38 @@ export async function disableAutoRestart(): Promise<void> {
  */
 export async function getDesiredServiceState(): Promise<DesiredServiceState | null> {
   return invoke<DesiredServiceState | null>('plugin:background-service|get_desired_service_state');
+}
+
+// ─── Lifecycle API ───────────────────────────────────────────────────
+
+/**
+ * Get a complete snapshot of the background service lifecycle status.
+ *
+ * Returns the current state, recovery intent, platform capabilities,
+ * and any validation issues in a single call.
+ */
+export async function getLifecycleStatus(): Promise<LifecycleStatus> {
+  return invoke<LifecycleStatus>('plugin:background-service|get_lifecycle_status');
+}
+
+/**
+ * Configure recovery behavior for the background service.
+ *
+ * When enabled, the plugin persists the intent to keep the service running
+ * and uses platform-specific recovery mechanisms to restart after process
+ * kill or device reboot.
+ *
+ * @param options.enabled — `true` to enable recovery, `false` to disable.
+ * @param options.config — Optional start config to persist for recovery restarts.
+ */
+export async function configureRecovery(options: {
+  enabled: boolean;
+  config?: StartConfig;
+}): Promise<void> {
+  await invoke('plugin:background-service|configure_recovery', {
+    enabled: options.enabled,
+    config: options.config,
+  });
 }
 
 // ─── Setup Validator ─────────────────────────────────────────────────
