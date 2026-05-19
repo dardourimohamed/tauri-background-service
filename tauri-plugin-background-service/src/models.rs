@@ -76,7 +76,7 @@ pub struct ServiceContext<R: Runtime> {
 #[serde(rename_all = "camelCase")]
 pub struct StartConfig {
     /// Text shown in the Android persistent foreground notification.
-    #[serde(default = "default_label")]
+    #[serde(default = "default_label", alias = "label")]
     pub service_label: String,
 
     /// Android foreground service type (e.g. "dataSync", "specialUse").
@@ -882,6 +882,37 @@ mod tests {
             json.contains("serviceLabel"),
             "JSON should use camelCase: {json}"
         );
+    }
+
+    // --- StartConfig alias tests ---
+
+    #[test]
+    fn start_config_legacy_label_alias_decodes() {
+        let json = r#"{"label":"Legacy name"}"#;
+        let de: StartConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(de.service_label, "Legacy name");
+    }
+
+    #[test]
+    fn start_config_both_label_and_service_label_rejected() {
+        let json = r#"{"serviceLabel":"New name","label":"Old name"}"#;
+        let result = serde_json::from_str::<StartConfig>(json);
+        assert!(result.is_err(), "should reject duplicate field via alias");
+    }
+
+    #[test]
+    fn start_config_unknown_fields_ignored() {
+        let json = r#"{"serviceLabel":"test","unknownField":42,"extra":"data"}"#;
+        let de: StartConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(de.service_label, "test");
+        assert_eq!(de.foreground_service_type, "dataSync");
+    }
+
+    #[test]
+    fn start_config_camel_case_key_still_works() {
+        let json = r#"{"serviceLabel":"Modern name"}"#;
+        let de: StartConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(de.service_label, "Modern name");
     }
 
     // --- PluginEvent tests ---
