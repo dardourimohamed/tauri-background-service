@@ -309,6 +309,47 @@ pub enum ServiceState {
     Stopped,
 }
 
+/// Unified lifecycle state for the background service.
+///
+/// Provides fine-grained visibility into the service's current state,
+/// combining internal state, recovery status, and platform conditions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum LifecycleState {
+    /// No service has been started.
+    Idle,
+    /// Service init() is in progress.
+    Starting,
+    /// Service run() is executing.
+    Running,
+    /// Service is being stopped (cancellation requested).
+    Stopping,
+    /// Service has stopped.
+    Stopped,
+    /// Service is recovering after a platform timeout or expiration.
+    Recovering,
+    /// Recovery is pending (waiting for platform conditions).
+    RecoveryPending,
+    /// Background execution window has expired (e.g. iOS BGTask).
+    Expired,
+    /// Service is blocked by a platform issue (e.g. missing permission).
+    Blocked,
+    /// Service encountered an error.
+    Error,
+}
+
+impl From<ServiceState> for LifecycleState {
+    fn from(state: ServiceState) -> Self {
+        match state {
+            ServiceState::Idle => LifecycleState::Idle,
+            ServiceState::Initializing => LifecycleState::Starting,
+            ServiceState::Running => LifecycleState::Running,
+            ServiceState::Stopped => LifecycleState::Stopped,
+        }
+    }
+}
+
 /// Native platform-side state reported by the OS service layer.
 ///
 /// Reflects the state as observed by the Android foreground service, iOS
@@ -396,6 +437,16 @@ pub enum Platform {
     Macos,
     Linux,
     Unknown,
+}
+
+/// Severity level for a validation issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum Severity {
+    Error,
+    Warning,
+    Info,
 }
 
 /// The lifecycle mechanism used by the plugin on the current platform.
@@ -723,6 +774,49 @@ pub struct SetupValidationReport {
     pub errors: Vec<SetupIssue>,
     /// Non-blocking issues that may cause degraded behavior.
     pub warnings: Vec<SetupIssue>,
+}
+
+/// A single validation issue found during lifecycle validation.
+///
+/// Each issue has a severity level, machine-readable code, human-readable
+/// message, optional fix suggestion, and the platform it applies to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ValidationIssue {
+    pub severity: Severity,
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<String>,
+    pub platform: Platform,
+}
+
+/// Complete snapshot of the background service lifecycle status.
+///
+/// Provides a unified view of service state, desired state, recovery status,
+/// platform capabilities, and validation issues.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct LifecycleStatus {
+    pub state: LifecycleState,
+    pub desired_running: bool,
+    pub recovery_enabled: bool,
+    pub recovery_pending: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_start_config: Option<StartConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_platform_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_platform_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub platform: Platform,
+    pub capabilities: PlatformCapabilities,
+    pub issues: Vec<ValidationIssue>,
 }
 
 #[cfg(test)]
@@ -2841,5 +2935,350 @@ mod tests {
         let info: PendingTaskInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.task_kind, "processing");
         assert_eq!(info.identifier, "com.example.bg-processing");
+    }
+
+    // --- LifecycleState tests ---
+
+    #[test]
+    fn lifecycle_state_all_variants_serde_roundtrip() {
+        for variant in [
+            LifecycleState::Idle,
+            LifecycleState::Starting,
+            LifecycleState::Running,
+            LifecycleState::Stopping,
+            LifecycleState::Stopped,
+            LifecycleState::Recovering,
+            LifecycleState::RecoveryPending,
+            LifecycleState::Expired,
+            LifecycleState::Blocked,
+            LifecycleState::Error,
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let de: LifecycleState = serde_json::from_str(&json).unwrap();
+            assert_eq!(de, variant, "roundtrip failed for {variant:?}");
+        }
+    }
+
+    #[test]
+    fn lifecycle_state_json_values_are_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&LifecycleState::Idle).unwrap(),
+            "\"idle\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleState::Starting).unwrap(),
+            "\"starting\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleState::Running).unwrap(),
+            "\"running\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleState::Stopping).unwrap(),
+            "\"stopping\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleState::Stopped).unwrap(),
+            "\"stopped\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleState::Recovering).unwrap(),
+            "\"recovering\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleState::RecoveryPending).unwrap(),
+            "\"recoveryPending\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleState::Expired).unwrap(),
+            "\"expired\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleState::Blocked).unwrap(),
+            "\"blocked\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleState::Error).unwrap(),
+            "\"error\""
+        );
+    }
+
+    // --- ServiceState → LifecycleState computation tests ---
+
+    #[test]
+    fn service_state_idle_maps_to_lifecycle_idle() {
+        assert_eq!(
+            LifecycleState::from(ServiceState::Idle),
+            LifecycleState::Idle
+        );
+    }
+
+    #[test]
+    fn service_state_initializing_maps_to_lifecycle_starting() {
+        assert_eq!(
+            LifecycleState::from(ServiceState::Initializing),
+            LifecycleState::Starting
+        );
+    }
+
+    #[test]
+    fn service_state_running_maps_to_lifecycle_running() {
+        assert_eq!(
+            LifecycleState::from(ServiceState::Running),
+            LifecycleState::Running
+        );
+    }
+
+    #[test]
+    fn service_state_stopped_maps_to_lifecycle_stopped() {
+        assert_eq!(
+            LifecycleState::from(ServiceState::Stopped),
+            LifecycleState::Stopped
+        );
+    }
+
+    // --- Severity tests ---
+
+    #[test]
+    fn severity_all_variants_serde_roundtrip() {
+        for variant in [Severity::Error, Severity::Warning, Severity::Info] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let de: Severity = serde_json::from_str(&json).unwrap();
+            assert_eq!(de, variant, "roundtrip failed for {variant:?}");
+        }
+    }
+
+    #[test]
+    fn severity_json_values_are_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&Severity::Error).unwrap(),
+            "\"error\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Severity::Warning).unwrap(),
+            "\"warning\""
+        );
+        assert_eq!(serde_json::to_string(&Severity::Info).unwrap(), "\"info\"");
+    }
+
+    // --- ValidationIssue tests ---
+
+    #[test]
+    fn validation_issue_serde_roundtrip() {
+        let issue = ValidationIssue {
+            severity: Severity::Error,
+            code: "ANDROID_MISSING_PERMISSION".into(),
+            message: "Missing FOREGROUND_SERVICE permission".into(),
+            fix: Some("Add FOREGROUND_SERVICE permission to AndroidManifest.xml".into()),
+            platform: Platform::Android,
+        };
+        let json = serde_json::to_string(&issue).unwrap();
+        let de: ValidationIssue = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, issue);
+    }
+
+    #[test]
+    fn validation_issue_without_fix() {
+        let issue = ValidationIssue {
+            severity: Severity::Warning,
+            code: "IOS_SCHEDULER_BUSY".into(),
+            message: "BGTaskScheduler is busy".into(),
+            fix: None,
+            platform: Platform::Ios,
+        };
+        let json = serde_json::to_string(&issue).unwrap();
+        assert!(
+            !json.contains("fix"),
+            "fix should be absent when None: {json}"
+        );
+        let de: ValidationIssue = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, issue);
+    }
+
+    #[test]
+    fn validation_issue_json_keys_camel_case() {
+        let issue = ValidationIssue {
+            severity: Severity::Info,
+            code: "TEST".into(),
+            message: "test".into(),
+            fix: Some("do something".into()),
+            platform: Platform::Linux,
+        };
+        let json = serde_json::to_string(&issue).unwrap();
+        assert!(json.contains("\"severity\":"), "{json}");
+        assert!(json.contains("\"code\":"), "{json}");
+        assert!(json.contains("\"message\":"), "{json}");
+        assert!(json.contains("\"fix\":"), "{json}");
+        assert!(json.contains("\"platform\":"), "{json}");
+    }
+
+    // --- LifecycleStatus tests ---
+
+    #[test]
+    fn lifecycle_status_serde_roundtrip_minimal() {
+        let status = LifecycleStatus {
+            state: LifecycleState::Idle,
+            desired_running: false,
+            recovery_enabled: false,
+            recovery_pending: false,
+            recovery_reason: None,
+            last_start_config: None,
+            last_platform_state: None,
+            last_platform_error: None,
+            last_error: None,
+            platform: Platform::Unknown,
+            capabilities: PlatformCapabilities {
+                platform: Platform::Unknown,
+                lifecycle_mode: LifecycleMode::DesktopInProcess,
+                survives_app_close: LifecycleGuarantee::Unsupported,
+                survives_reboot: LifecycleGuarantee::Unsupported,
+                survives_force_quit: LifecycleGuarantee::Unsupported,
+                background_execution: LifecycleGuarantee::Unsupported,
+                limitations: vec![],
+                required_setup: vec![],
+            },
+            issues: vec![],
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let de: LifecycleStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.state, LifecycleState::Idle);
+        assert!(!de.desired_running);
+        assert!(!de.recovery_enabled);
+        assert!(!de.recovery_pending);
+        assert_eq!(de.recovery_reason, None);
+        assert_eq!(de.last_start_config, None);
+        assert_eq!(de.last_platform_state, None);
+        assert_eq!(de.last_platform_error, None);
+        assert_eq!(de.last_error, None);
+        assert_eq!(de.platform, Platform::Unknown);
+        assert!(de.issues.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_status_optional_fields_absent_when_none() {
+        let status = LifecycleStatus {
+            state: LifecycleState::Idle,
+            desired_running: false,
+            recovery_enabled: false,
+            recovery_pending: false,
+            recovery_reason: None,
+            last_start_config: None,
+            last_platform_state: None,
+            last_platform_error: None,
+            last_error: None,
+            platform: Platform::Unknown,
+            capabilities: PlatformCapabilities {
+                platform: Platform::Unknown,
+                lifecycle_mode: LifecycleMode::DesktopInProcess,
+                survives_app_close: LifecycleGuarantee::Unsupported,
+                survives_reboot: LifecycleGuarantee::Unsupported,
+                survives_force_quit: LifecycleGuarantee::Unsupported,
+                background_execution: LifecycleGuarantee::Unsupported,
+                limitations: vec![],
+                required_setup: vec![],
+            },
+            issues: vec![],
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains("recoveryReason"), "should be absent: {json}");
+        assert!(
+            !json.contains("lastStartConfig"),
+            "should be absent: {json}"
+        );
+        assert!(
+            !json.contains("lastPlatformState"),
+            "should be absent: {json}"
+        );
+        assert!(
+            !json.contains("lastPlatformError"),
+            "should be absent: {json}"
+        );
+        assert!(!json.contains("lastError"), "should be absent: {json}");
+    }
+
+    #[test]
+    fn lifecycle_status_full_roundtrip_with_all_fields() {
+        let status = LifecycleStatus {
+            state: LifecycleState::Running,
+            desired_running: true,
+            recovery_enabled: true,
+            recovery_pending: false,
+            recovery_reason: Some("boot recovery".into()),
+            last_start_config: Some(StartConfig {
+                service_label: "Sync".into(),
+                foreground_service_type: "dataSync".into(),
+            }),
+            last_platform_state: Some("running".into()),
+            last_platform_error: Some("timeout exceeded".into()),
+            last_error: Some("previous crash".into()),
+            platform: Platform::Android,
+            capabilities: PlatformCapabilities {
+                platform: Platform::Android,
+                lifecycle_mode: LifecycleMode::AndroidForegroundService,
+                survives_app_close: LifecycleGuarantee::BestEffort,
+                survives_reboot: LifecycleGuarantee::BestEffort,
+                survives_force_quit: LifecycleGuarantee::Unsupported,
+                background_execution: LifecycleGuarantee::Guaranteed,
+                limitations: vec!["OEM battery optimization".into()],
+                required_setup: vec!["FOREGROUND_SERVICE permission".into()],
+            },
+            issues: vec![ValidationIssue {
+                severity: Severity::Warning,
+                code: "ANDROID_BATTERY_OPTIMIZED".into(),
+                message: "Battery optimization may kill the service".into(),
+                fix: Some("Request REQUEST_IGNORE_BATTERY_OPTIMIZATIONS".into()),
+                platform: Platform::Android,
+            }],
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let de: LifecycleStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.state, LifecycleState::Running);
+        assert!(de.desired_running);
+        assert!(de.recovery_enabled);
+        assert!(!de.recovery_pending);
+        assert_eq!(de.recovery_reason, Some("boot recovery".into()));
+        assert!(de.last_start_config.is_some());
+        assert_eq!(de.last_platform_state, Some("running".into()));
+        assert_eq!(de.last_platform_error, Some("timeout exceeded".into()));
+        assert_eq!(de.last_error, Some("previous crash".into()));
+        assert_eq!(de.platform, Platform::Android);
+        assert_eq!(de.issues.len(), 1);
+    }
+
+    #[test]
+    fn lifecycle_status_json_keys_camel_case() {
+        let status = LifecycleStatus {
+            state: LifecycleState::RecoveryPending,
+            desired_running: true,
+            recovery_enabled: true,
+            recovery_pending: true,
+            recovery_reason: Some("platform timeout".into()),
+            last_start_config: None,
+            last_platform_state: Some("timeout".into()),
+            last_platform_error: None,
+            last_error: None,
+            platform: Platform::Ios,
+            capabilities: PlatformCapabilities {
+                platform: Platform::Ios,
+                lifecycle_mode: LifecycleMode::IosBgTaskScheduler,
+                survives_app_close: LifecycleGuarantee::BestEffort,
+                survives_reboot: LifecycleGuarantee::BestEffort,
+                survives_force_quit: LifecycleGuarantee::Unsupported,
+                background_execution: LifecycleGuarantee::BestEffort,
+                limitations: vec![],
+                required_setup: vec![],
+            },
+            issues: vec![],
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"state\":"), "{json}");
+        assert!(json.contains("\"desiredRunning\":"), "{json}");
+        assert!(json.contains("\"recoveryEnabled\":"), "{json}");
+        assert!(json.contains("\"recoveryPending\":"), "{json}");
+        assert!(json.contains("\"recoveryReason\":"), "{json}");
+        assert!(json.contains("\"lastPlatformState\":"), "{json}");
+        assert!(json.contains("\"platform\":"), "{json}");
+        assert!(json.contains("\"capabilities\":"), "{json}");
+        assert!(json.contains("\"issues\":"), "{json}");
     }
 }
