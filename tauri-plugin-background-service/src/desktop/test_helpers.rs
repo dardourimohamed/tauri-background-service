@@ -98,7 +98,7 @@ pub fn setup_server() -> (PathBuf, CancellationToken, broadcast::Sender<IpcEvent
 /// lifecycle control.
 ///
 /// Returns `(server, socket_path, shutdown_token)`.
-pub fn setup_server_raw(
+pub(crate) fn setup_server_raw(
     factory: ServiceFactory<tauri::test::MockRuntime>,
 ) -> (
     IpcServer<tauri::test::MockRuntime>,

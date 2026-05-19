@@ -98,17 +98,17 @@ mod tests {
 
     #[test]
     fn linger_yes() {
-        assert_eq!(parse_linger_output("Linger=yes").unwrap(), true);
+        assert!(parse_linger_output("Linger=yes").unwrap());
     }
 
     #[test]
     fn linger_no() {
-        assert_eq!(parse_linger_output("Linger=no").unwrap(), false);
+        assert!(!parse_linger_output("Linger=no").unwrap());
     }
 
     #[test]
     fn linger_with_trailing_newline() {
-        assert_eq!(parse_linger_output("Linger=yes\n").unwrap(), true);
+        assert!(parse_linger_output("Linger=yes\n").unwrap());
     }
 
     #[test]

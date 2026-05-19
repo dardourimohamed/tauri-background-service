@@ -1708,7 +1708,7 @@ mod tests {
 
         let mut attempts = builder.build();
         let mut delays = Vec::new();
-        while let Some(d) = attempts.next() {
+        for d in attempts.by_ref() {
             delays.push(d);
         }
 

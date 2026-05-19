@@ -259,7 +259,7 @@ mod tests {
     fn derive_service_label_with_override() {
         let app = tauri::test::mock_app();
         let handle = app.handle();
-        let label = derive_service_label(&handle, Some("my.custom.label"));
+        let label = derive_service_label(handle, Some("my.custom.label"));
         assert_eq!(label, "my.custom.label");
     }
 
@@ -267,7 +267,7 @@ mod tests {
     fn derive_service_label_auto() {
         let app = tauri::test::mock_app();
         let handle = app.handle();
-        let label = derive_service_label(&handle, None);
+        let label = derive_service_label(handle, None);
         assert!(
             label.ends_with(".background-service"),
             "Label should end with .background-service, got: {label}"
