@@ -442,6 +442,8 @@ export interface SetupValidationReport {
   errors: SetupIssue[];
   /** Non-blocking issues that may cause degraded behavior. */
   warnings: SetupIssue[];
+  /** Unified list of all issues with typed severity. */
+  issues: ValidationIssue[];
 }
 
 /**
