@@ -118,6 +118,78 @@ docs(api): document StartConfig defaults
 - **Platform-specific code** should include inline comments explaining platform behavior.
 - **No `#[ignore]` tests** without a documented reason in the test body.
 
+## Native Test Harness
+
+### Android
+
+**Unit tests (Kotlin):**
+```bash
+cd tauri-plugin-background-service/android
+./gradlew :plugin:testDebugUnitTest
+```
+
+**Instrumentation tests (device/emulator required):**
+```bash
+./gradlew :plugin:connectedDebugAndroidTest
+```
+
+**Cross-compile checks:**
+```bash
+cargo check --target aarch64-linux-android
+cargo check --target x86_64-linux-android
+```
+
+### iOS
+
+**Swift build and test (Xcode, macOS only):**
+```bash
+cd tauri-plugin-background-service/ios
+# Build
+xcodebuild build \
+  -scheme TauriPluginBackgroundService \
+  -destination 'platform=iOS Simulator,name=iPhone 16'
+# Run tests
+xcodebuild test \
+  -scheme TauriPluginBackgroundService \
+  -destination 'platform=iOS Simulator,name=iPhone 16'
+```
+
+**Cross-compile check:**
+```bash
+cargo check --target aarch64-apple-ios
+```
+
+### CI
+
+The project runs native tests in CI via the workflow in `.github/workflows/ci.yml`. Key jobs:
+
+| Job | What it checks |
+|-----|---------------|
+| `check-android` | `cargo check --target aarch64-linux-android` |
+| `check-ios` | `cargo check --target aarch64-apple-ios` |
+| `android-test` | Gradle unit tests (`testDebugUnitTest`) |
+| `android-lint` | Android lint (`lintDebug`) |
+| `ios-build` | Swift compile via `xcodebuild build` |
+
+All PRs to `main` must pass these jobs.
+
+## Release Checklist
+
+Before publishing a new version:
+
+- [ ] `cargo test --all-targets --features desktop-service` passes
+- [ ] `cargo clippy --all-targets --features desktop-service -- -D warnings` passes
+- [ ] `cargo check --target aarch64-linux-android` passes
+- [ ] `cargo check --target x86_64-linux-android` passes
+- [ ] `cargo check --target aarch64-apple-ios` passes (macOS only)
+- [ ] `cd guest-js && npm run build` passes
+- [ ] `cd test-app && npm run build` passes
+- [ ] Android unit tests pass (`./gradlew :plugin:testDebugUnitTest`)
+- [ ] iOS Swift build passes (`xcodebuild build`)
+- [ ] Version bumped in `Cargo.toml`, `package.json`, and doc URLs
+- [ ] `CHANGELOG.md` updated with changes
+- [ ] CI pipeline green on `main`
+
 ## License
 
 By contributing to this project, you agree that your contributions will be
