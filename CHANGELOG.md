@@ -7,12 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.5.3] - 2026-05-19
+## [0.6.0] - 2026-05-19
+
+### Added
+
+#### Platform Capabilities
+
+- `PlatformCapabilities` model and `CapabilityProvider` for runtime platform guarantee reporting
+- `get_platform_capabilities` command and `getPlatformCapabilities()` TypeScript API
+- Honest per-platform reporting of background execution guarantees, survival characteristics, and limitations
+
+#### Auto-Restart & Desired State Persistence
+
+- `desired_state` module with `DesiredStateBackend` trait for cross-platform state persistence
+- `enable_auto_restart` / `disable_auto_restart` commands and TypeScript APIs
+- `get_desired_service_state` command to query persisted recovery intent
+- Services persist their desired state for recovery after app restart or device reboot
+- `DesiredState` model with recovery metadata (start config, timestamps, reason)
+
+#### Android Boot Recovery
+
+- `BootReceiver.kt`: handles `ACTION_BOOT_COMPLETED` and `ACTION_MY_PACKAGE_REPLACED` for post-reboot service restart
+- `DurableState.kt`: SharedPreferences persistence for service state across restarts
+- Enhanced `LifecycleService.kt` with auto-restart capabilities and configurable FGS types
+- Android unit tests for boot receiver, durable state, and lifecycle service
+
+#### iOS Background Task Enhancements
+
+- Dual `BGTaskScheduler` support (refresh + processing tasks) with configurable scheduling parameters
+- Configurable safety timeouts for refresh and processing tasks
+- Desired state persistence via `UserDefaults` with auto-start on BGTask launch
+- Pending task detection (`get_pending_bg_task` / `getPendingBgTask()`)
+- Scheduling status reporting (`get_scheduling_status` / `getSchedulingStatus()`)
+- Proper task completion safety to prevent double-completion
+- iOS native unit tests (`BackgroundServicePluginTests.swift`)
+
+#### Setup Validation
+
+- `SetupValidator` and `SetupValidationReport` for checking platform-specific prerequisites
+- `validate_setup` command and `validateBackgroundServiceSetup()` TypeScript API
+- Platform-specific checks: Android manifest entries, iOS plist entries, desktop systemd/sandbox
+
+#### Desktop OS Service Management
+
+- `start_os_service`, `stop_os_service`, `restart_os_service`, `get_os_service_status` commands
+- TypeScript APIs: `startOsService()`, `stopOsService()`, `restartOsService()`, `getOsServiceStatus()`
+- `install_service` / `uninstall_service` commands with binary validation
+- `OsServiceStatus` and `OsServiceInstallState` models
+- Enhanced `DesktopServiceManager` with systemd/launchd lifecycle management
+- Persistent IPC client with auto-reconnection and exponential backoff
+- `wait_for_connected()` for IPC readiness with timeout
+- Environment checks for systemd lingering and macOS sandbox compatibility
+
+#### TypeScript API
+
+- New interfaces: `PlatformCapabilities`, `IOSSchedulingStatus`, `PendingTaskInfo`, `DesiredState`, `SetupValidationReport`, `OsServiceStatus`
+- `normalizeBackgroundServiceError()` for consistent error handling
+
+#### CI & Testing
+
+- GitHub Actions CI workflow (`ci.yml`)
+- Permission descriptors for all new commands (11 new `.toml` files)
+- Comprehensive permission schema updates
+
+#### Documentation
+
+- New docs: `migration-guide.md`, `troubleshooting.md`, `release-checklist.md`
+- Expanded: `api-reference.md`, `android.md`, `ios.md`, `desktop.md`, `getting-started.md`
 
 ### Fixed
 
-- Gate `which_exists` tests behind `desktop-service` feature flag to fix compilation error when the feature is disabled
-- Remove always-true constant assertion in integration test to silence clippy warning
+- Gate `which_exists` tests behind `desktop-service` feature flag to fix compilation when feature is disabled
+- Remove constant assertion in integration test to silence clippy warning
 
 ## [0.5.2] - 2026-04-12
 
@@ -134,8 +200,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Notifier` helper for fire-and-forget local notifications
 - `StartConfig` with configurable `serviceLabel` and `foregroundServiceType`
 
-[Unreleased]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.5.3...HEAD
-[0.5.3]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.5.2...plugin-v0.5.3
+[Unreleased]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.6.0...HEAD
+[0.6.0]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.5.2...plugin-v0.6.0
 [0.5.2]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.5.1...plugin-v0.5.2
 [0.5.1]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.5.0...plugin-v0.5.1
 [0.5.0]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.4.1...plugin-v0.5.0
