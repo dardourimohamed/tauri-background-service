@@ -92,8 +92,9 @@ pub use manager::{manager_loop, OnCompleteCallback, ServiceFactory, ServiceManag
 #[doc(hidden)]
 pub use models::AutoStartConfig;
 pub use models::{
-    IOSSchedulingStatus, PendingTaskInfo, PluginConfig, PluginEvent, ServiceContext, ServiceState,
-    ServiceStatus, SetupIssue, SetupValidationReport, StartConfig,
+    IOSSchedulingStatus, LifecycleState, LifecycleStatus, PendingTaskInfo, Platform,
+    PlatformCapabilities, PluginConfig, PluginEvent, ServiceContext, ServiceState, ServiceStatus,
+    SetupIssue, SetupValidationReport, StartConfig, ValidationIssue,
 };
 pub use notifier::Notifier;
 pub use service_trait::BackgroundService;
@@ -626,6 +627,64 @@ async fn validate_setup<R: Runtime>(
     Ok(validator::SetupValidator::validate(platform))
 }
 
+/// Get the complete lifecycle status of the background service.
+///
+/// Returns a [`LifecycleStatus`] snapshot with current state, desired state,
+/// recovery status, platform capabilities, and validation issues.
+#[tauri::command]
+async fn get_lifecycle_status<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<models::LifecycleStatus, String> {
+    // OS service mode: route through persistent IPC client.
+    #[cfg(all(feature = "desktop-service", unix))]
+    if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
+        return ipc_state
+            .client
+            .get_lifecycle_status()
+            .await
+            .map_err(|e| e.to_string());
+    }
+
+    #[cfg(feature = "desktop-service")]
+    let plugin_config = app.state::<PluginConfig>();
+
+    #[cfg(feature = "desktop-service")]
+    let desktop_mode = Some(plugin_config.desktop_service_mode.as_str());
+    #[cfg(not(feature = "desktop-service"))]
+    let desktop_mode: Option<&str> = None;
+
+    let manager = app.state::<ServiceManagerHandle<R>>();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    manager
+        .cmd_tx
+        .send(ManagerCommand::GetLifecycleStatus {
+            desktop_mode: desktop_mode.map(|s| s.to_string()),
+            reply: tx,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    rx.await.map_err(|e| e.to_string())
+}
+
+/// Configure recovery (auto-restart) for the background service.
+///
+/// When `enabled` is `true`, persists `desired_running=true` with an optional
+/// start config (for recovery after process kill or device reboot).
+/// When `enabled` is `false`, clears the recovery intent.
+#[tauri::command]
+async fn configure_recovery<R: Runtime>(
+    app: AppHandle<R>,
+    enabled: bool,
+    config: Option<StartConfig>,
+) -> Result<(), String> {
+    if enabled {
+        enable_auto_restart(app, config).await
+    } else {
+        disable_auto_restart(app).await
+    }
+}
+
 // ─── Desktop OS Service State & Commands ──────────────────────────────────────
 
 /// Managed state indicating OS service mode via IPC.
@@ -896,6 +955,8 @@ where
             get_desired_service_state,
             native_lifecycle_event,
             validate_setup,
+            get_lifecycle_status,
+            configure_recovery,
             #[cfg(feature = "desktop-service")]
             install_service,
             #[cfg(feature = "desktop-service")]
@@ -1316,6 +1377,24 @@ mod tests {
         event: models::NativeLifecycleEvent,
     ) -> Result<(), String> {
         native_lifecycle_event(app, event).await
+    }
+
+    /// Verify `get_lifecycle_status` command signature is async and generic over `R: Runtime`.
+    #[allow(dead_code)]
+    async fn get_lifecycle_status_command_signature<R: Runtime>(
+        app: AppHandle<R>,
+    ) -> Result<models::LifecycleStatus, String> {
+        get_lifecycle_status(app).await
+    }
+
+    /// Verify `configure_recovery` command signature is async and generic over `R: Runtime`.
+    #[allow(dead_code)]
+    async fn configure_recovery_command_signature<R: Runtime>(
+        app: AppHandle<R>,
+        enabled: bool,
+        config: Option<StartConfig>,
+    ) -> Result<(), String> {
+        configure_recovery(app, enabled, config).await
     }
 
     // ── Desktop IPC State Tests ─────────────────────────────────────────

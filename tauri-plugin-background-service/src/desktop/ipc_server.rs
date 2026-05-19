@@ -439,6 +439,27 @@ async fn handle_request<R: Runtime>(
                 error: None,
             }
         }
+        IpcRequest::GetLifecycleStatus => {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if cmd_tx
+                .send(ManagerCommand::GetLifecycleStatus {
+                    desktop_mode: None,
+                    reply,
+                })
+                .await
+                .is_err()
+            {
+                return error_response("manager shut down");
+            }
+            match rx.await {
+                Ok(status) => IpcResponse {
+                    ok: true,
+                    data: Some(serde_json::to_value(&status).unwrap_or_default()),
+                    error: None,
+                },
+                Err(_) => error_response("manager dropped reply"),
+            }
+        }
     }
 }
 

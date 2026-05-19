@@ -227,6 +227,9 @@ enum IpcCommand {
             Result<crate::models::SetupValidationReport, ServiceError>,
         >,
     },
+    GetLifecycleStatus {
+        reply: tokio::sync::oneshot::Sender<Result<crate::models::LifecycleStatus, ServiceError>>,
+    },
 }
 
 /// Handle to a persistent IPC client that maintains a long-lived connection
@@ -414,6 +417,20 @@ impl PersistentIpcClientHandle {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(IpcCommand::ValidateSetup { reply: reply_tx })
+            .await
+            .map_err(|_| ServiceError::Ipc("persistent client shut down".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| ServiceError::Ipc("command dropped".into()))?
+    }
+
+    /// Get the complete lifecycle status snapshot.
+    pub async fn get_lifecycle_status(
+        &self,
+    ) -> Result<crate::models::LifecycleStatus, ServiceError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(IpcCommand::GetLifecycleStatus { reply: reply_tx })
             .await
             .map_err(|_| ServiceError::Ipc("persistent client shut down".into()))?;
         reply_rx
@@ -700,6 +717,28 @@ async fn run_persistent_connection<R: Runtime>(
                                     Some(d) => serde_json::from_value::<crate::models::SetupValidationReport>(d)
                                         .map_err(|e| ServiceError::Ipc(format!("deserialize ValidateSetup: {e}"))),
                                     None => Err(ServiceError::Ipc("missing ValidateSetup response data".into())),
+                                }
+                            }
+                            Ok(resp) => Err(ServiceError::Ipc(
+                                resp.error.unwrap_or_else(|| "unknown error".into()),
+                            )),
+                            Err(e) => Err(e),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    IpcCommand::GetLifecycleStatus { reply } => {
+                        let rx = prepare_response_slot(&response_slot).await;
+                        if let Err(e) = send_request_to(&mut write_half, &IpcRequest::GetLifecycleStatus).await {
+                            let _ = reply.send(Err(e));
+                            break Err(ServiceError::Ipc("send failed".into()));
+                        }
+                        let response = await_response(rx).await;
+                        let result = match response {
+                            Ok(resp) if resp.ok => {
+                                match resp.data {
+                                    Some(d) => serde_json::from_value::<crate::models::LifecycleStatus>(d)
+                                        .map_err(|e| ServiceError::Ipc(format!("deserialize GetLifecycleStatus: {e}"))),
+                                    None => Err(ServiceError::Ipc("missing GetLifecycleStatus response data".into())),
                                 }
                             }
                             Ok(resp) => Err(ServiceError::Ipc(

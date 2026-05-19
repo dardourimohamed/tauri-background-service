@@ -295,6 +295,18 @@
       "type": "string",
       "oneOf": [
         {
+          "description": "Enables the configure_recovery command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-configure-recovery",
+          "markdownDescription": "Enables the configure_recovery command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the configure_recovery command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-configure-recovery",
+          "markdownDescription": "Denies the configure_recovery command without any pre-configured scope."
+        },
+        {
           "description": "Enables the disable_auto_restart command without any pre-configured scope.",
           "type": "string",
           "const": "allow-disable-auto-restart",
@@ -329,6 +341,18 @@
           "type": "string",
           "const": "deny-get-desired-service-state",
           "markdownDescription": "Denies the get_desired_service_state command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_lifecycle_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-lifecycle-status",
+          "markdownDescription": "Enables the get_lifecycle_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_lifecycle_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-lifecycle-status",
+          "markdownDescription": "Denies the get_lifecycle_status command without any pre-configured scope."
         },
         {
           "description": "Enables the get_os_service_status command without any pre-configured scope.",

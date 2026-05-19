@@ -18,8 +18,9 @@ use tokio_util::sync::CancellationToken;
 use crate::desired_state::DesiredStateBackend;
 use crate::error::ServiceError;
 use crate::models::{
-    validate_foreground_service_type, LifecycleMode, PluginEvent, ServiceContext,
-    ServiceState as ServiceLifecycle, ServiceStatus, StartConfig, StopReason,
+    validate_foreground_service_type, LifecycleMode, LifecycleState, LifecycleStatus, PluginEvent,
+    ServiceContext, ServiceState as ServiceLifecycle, ServiceStatus, StartConfig, StopReason,
+    ValidationIssue,
 };
 use crate::notifier::Notifier;
 use crate::service_trait::BackgroundService;
@@ -108,6 +109,10 @@ pub enum ManagerCommand<R: Runtime> {
     NativeLifecycleEvent {
         event: crate::models::NativeLifecycleEvent,
         reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
+    GetLifecycleStatus {
+        desktop_mode: Option<String>,
+        reply: oneshot::Sender<LifecycleStatus>,
     },
 }
 
@@ -446,6 +451,12 @@ pub async fn manager_loop<R: Runtime>(
             ManagerCommand::NativeLifecycleEvent { event, reply } => {
                 let reason = event.to_stop_reason();
                 let _ = reply.send(handle_stop_with_reason(&mut state, reason));
+            }
+            ManagerCommand::GetLifecycleStatus {
+                desktop_mode,
+                reply,
+            } => {
+                let _ = reply.send(build_lifecycle_status(&state, desktop_mode.as_deref()));
             }
         }
     }
@@ -787,6 +798,73 @@ fn handle_get_desired_state<R: Runtime>(
         .desired_state
         .as_ref()
         .and_then(|backend| backend.load().ok())
+}
+
+/// Compose a [`LifecycleStatus`] snapshot from the actor's current state.
+///
+/// Gathers: service lifecycle state → `LifecycleState`, desired-state fields
+/// from the persistence backend, platform capabilities, and validation issues.
+fn build_lifecycle_status<R: Runtime>(
+    state: &ServiceState<R>,
+    desktop_mode: Option<&str>,
+) -> LifecycleStatus {
+    let lifecycle_state: LifecycleState = (*state.lifecycle_state.lock().unwrap()).into();
+    let last_error = state.last_error.lock().unwrap().clone();
+
+    // Load desired-state fields.
+    let desired = state.desired_state.as_ref().and_then(|b| b.load().ok());
+
+    let desired_running = desired.as_ref().is_some_and(|d| d.desired_running);
+    let recovery_enabled = desired_running;
+    let recovery_pending = desired.as_ref().is_some_and(|d| d.recovery_pending);
+    let recovery_reason = desired.as_ref().and_then(|d| d.recovery_reason.clone());
+    let last_start_config = desired
+        .as_ref()
+        .and_then(|d| d.last_start_config.clone())
+        .and_then(|v| serde_json::from_value(v).ok());
+    let last_platform_state = desired.as_ref().and_then(|d| d.last_native_state.clone());
+    let last_platform_error = desired.as_ref().and_then(|d| d.last_platform_error.clone());
+
+    let (platform, _) = crate::capabilities::CapabilityProvider::detect_platform(desktop_mode);
+    let capabilities = crate::capabilities::CapabilityProvider::capabilities(
+        platform,
+        state.lifecycle_mode,
+        false,
+    );
+    let report = crate::validator::SetupValidator::validate(platform);
+    let mut issues: Vec<ValidationIssue> = report
+        .errors
+        .into_iter()
+        .map(|i| ValidationIssue {
+            severity: crate::models::Severity::Error,
+            code: i.code,
+            message: i.message,
+            fix: i.fix,
+            platform,
+        })
+        .collect();
+    issues.extend(report.warnings.into_iter().map(|i| ValidationIssue {
+        severity: crate::models::Severity::Warning,
+        code: i.code,
+        message: i.message,
+        fix: i.fix,
+        platform,
+    }));
+
+    LifecycleStatus {
+        state: lifecycle_state,
+        desired_running,
+        recovery_enabled,
+        recovery_pending,
+        recovery_reason,
+        last_start_config,
+        last_platform_state,
+        last_platform_error,
+        last_error,
+        platform,
+        capabilities,
+        issues,
+    }
 }
 
 #[cfg(test)]
@@ -3416,6 +3494,139 @@ mod tests {
         assert!(
             matches!(result, Err(ServiceError::NotRunning)),
             "timeout while stopped should return NotRunning: {result:?}"
+        );
+    }
+
+    // ── Step 13: GetLifecycleStatus command tests ────────────────────────────
+
+    /// Helper: send GetLifecycleStatus and return the result.
+    async fn send_get_lifecycle_status(
+        handle: &ServiceManagerHandle<tauri::test::MockRuntime>,
+    ) -> LifecycleStatus {
+        let (reply, rx) = oneshot::channel();
+        handle
+            .cmd_tx
+            .send(ManagerCommand::GetLifecycleStatus {
+                desktop_mode: None,
+                reply,
+            })
+            .await
+            .expect("send GetLifecycleStatus");
+        rx.await.expect("receive LifecycleStatus")
+    }
+
+    #[tokio::test]
+    async fn get_lifecycle_status_returns_idle_initially() {
+        let handle = setup_manager();
+        let status = send_get_lifecycle_status(&handle).await;
+        assert!(
+            matches!(status.state, LifecycleState::Idle),
+            "expected Idle, got {:?}",
+            status.state
+        );
+        assert!(!status.desired_running);
+        assert!(!status.recovery_enabled);
+        assert!(!status.recovery_pending);
+        assert!(status.last_error.is_none());
+        assert!(status.last_start_config.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_lifecycle_status_returns_running_after_start() {
+        let handle =
+            setup_manager_with_factory_and_backend(Box::new(|| Box::new(BlockingService)), None);
+        let app = tauri::test::mock_app();
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let status = send_get_lifecycle_status(&handle).await;
+        assert!(
+            matches!(status.state, LifecycleState::Running),
+            "expected Running, got {:?}",
+            status.state
+        );
+    }
+
+    #[tokio::test]
+    async fn get_lifecycle_status_reflects_desired_state() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+
+        // Enable auto-restart (sets desired_running=true)
+        send_enable_auto_restart(&handle, None).await.unwrap();
+
+        let status = send_get_lifecycle_status(&handle).await;
+        assert!(
+            status.desired_running,
+            "expected desired_running=true after enable_auto_restart"
+        );
+        assert!(
+            status.recovery_enabled,
+            "expected recovery_enabled=true when desired_running=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_lifecycle_status_clears_after_disable_recovery() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+
+        // Enable then disable
+        send_enable_auto_restart(&handle, None).await.unwrap();
+        send_disable_auto_restart(&handle).await.unwrap();
+
+        let status = send_get_lifecycle_status(&handle).await;
+        assert!(
+            !status.desired_running,
+            "expected desired_running=false after disable"
+        );
+        assert!(
+            !status.recovery_enabled,
+            "expected recovery_enabled=false after disable"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_lifecycle_status_includes_platform_and_capabilities() {
+        let handle = setup_manager();
+        let status = send_get_lifecycle_status(&handle).await;
+
+        // On the test machine (Linux desktop), platform should be Linux
+        #[cfg(target_os = "linux")]
+        assert!(
+            matches!(status.platform, crate::models::Platform::Linux),
+            "expected Linux platform, got {:?}",
+            status.platform
+        );
+        // Capabilities should be populated
+        assert!(
+            !status.capabilities.limitations.is_empty()
+                || !status.capabilities.required_setup.is_empty(),
+            "capabilities should have some content"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_lifecycle_status_returns_stopped_after_stop() {
+        let handle =
+            setup_manager_with_factory_and_backend(Box::new(|| Box::new(BlockingService)), None);
+        let app = tauri::test::mock_app();
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        send_stop(&handle).await.unwrap();
+
+        let status = send_get_lifecycle_status(&handle).await;
+        assert!(
+            matches!(status.state, LifecycleState::Stopped),
+            "expected Stopped, got {:?}",
+            status.state
         );
     }
 }

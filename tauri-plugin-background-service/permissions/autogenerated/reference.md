@@ -32,6 +32,32 @@ Default permissions for the background service plugin
 <tr>
 <td>
 
+`background-service:allow-configure-recovery`
+
+</td>
+<td>
+
+Enables the configure_recovery command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`background-service:deny-configure-recovery`
+
+</td>
+<td>
+
+Denies the configure_recovery command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `background-service:allow-disable-auto-restart`
 
 </td>
@@ -103,6 +129,32 @@ Enables the get_desired_service_state command without any pre-configured scope.
 <td>
 
 Denies the get_desired_service_state command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`background-service:allow-get-lifecycle-status`
+
+</td>
+<td>
+
+Enables the get_lifecycle_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`background-service:deny-get-lifecycle-status`
+
+</td>
+<td>
+
+Denies the get_lifecycle_status command without any pre-configured scope.
 
 </td>
 </tr>

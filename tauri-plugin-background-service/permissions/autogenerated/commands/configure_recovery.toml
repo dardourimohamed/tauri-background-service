@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-configure-recovery"
+description = "Enables the configure_recovery command without any pre-configured scope."
+commands.allow = ["configure_recovery"]
+
+[[permission]]
+identifier = "deny-configure-recovery"
+description = "Denies the configure_recovery command without any pre-configured scope."
+commands.deny = ["configure_recovery"]

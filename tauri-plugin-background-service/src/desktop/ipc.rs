@@ -41,6 +41,8 @@ pub enum IpcRequest {
     GetDesiredState,
     /// Validate background service setup prerequisites.
     ValidateSetup,
+    /// Get the complete lifecycle status snapshot.
+    GetLifecycleStatus,
 }
 
 /// IPC response sent from the headless service to the GUI process.

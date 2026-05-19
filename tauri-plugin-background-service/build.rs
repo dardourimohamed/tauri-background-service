@@ -11,6 +11,8 @@ const COMMANDS: &[&str] = &[
     "get_desired_service_state",
     "native_lifecycle_event",
     "validate_setup",
+    "get_lifecycle_status",
+    "configure_recovery",
 ];
 
 #[cfg(feature = "desktop-service")]
