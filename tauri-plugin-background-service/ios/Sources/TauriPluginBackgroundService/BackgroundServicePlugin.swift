@@ -136,6 +136,17 @@ import os.log
         static let lastTaskCompletedAt = "ios_last_task_completed_at"
     }
 
+    // MARK: - Pending Task Keys
+
+    /// UserDefaults keys for iOS pending BGTask persistence.
+    /// Survives timing gaps between BGTask handler and Rust setup.
+    private enum PendingTaskKeys {
+        static let kind = "ios_pending_task_kind"
+        static let identifier = "ios_pending_task_identifier"
+        static let receivedAt = "ios_pending_task_received_at"
+        static let consumedAt = "ios_pending_task_consumed_at"
+    }
+
     // MARK: - Scheduling Result
 
     /// Result of submitting BGTaskScheduler requests.
@@ -177,6 +188,17 @@ import os.log
 
     private func persistTaskCompletedAt() {
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: DesiredStateKeys.lastTaskCompletedAt)
+    }
+
+    /// Persist pending BGTask info to UserDefaults.
+    /// Called when a BGTask handler fires so the info survives timing gaps
+    /// between the native handler and Rust setup.
+    private func persistPendingTaskInfo(kind: String, identifier: String, receivedAt: TimeInterval) {
+        let defaults = UserDefaults.standard
+        defaults.set(kind, forKey: PendingTaskKeys.kind)
+        defaults.set(identifier, forKey: PendingTaskKeys.identifier)
+        defaults.set(receivedAt, forKey: PendingTaskKeys.receivedAt)
+        defaults.set(nil, forKey: PendingTaskKeys.consumedAt)
     }
 
     // MARK: - Plugin Lifecycle
@@ -262,12 +284,17 @@ import os.log
         self.currentRefreshTask = task
         self.taskCompleted = false
 
+        let now = Date().timeIntervalSince1970
+
         // Store pending task info for Rust auto-start on BGTask launch.
         self.pendingTaskInfo = PendingTaskInfo(
             taskKind: "refresh",
             identifier: refreshTaskId,
-            receivedAt: Date().timeIntervalSince1970
+            receivedAt: now
         )
+
+        // Persist to UserDefaults so info survives timing gaps.
+        persistPendingTaskInfo(kind: "refresh", identifier: refreshTaskId, receivedAt: now)
 
         persistTaskKind("refresh")
         persistTaskStartedAt()
@@ -286,12 +313,17 @@ import os.log
         self.currentProcessingTask = task
         self.taskCompleted = false
 
+        let now = Date().timeIntervalSince1970
+
         // Store pending task info for Rust auto-start on BGTask launch.
         self.pendingTaskInfo = PendingTaskInfo(
             taskKind: "processing",
             identifier: processingTaskId,
-            receivedAt: Date().timeIntervalSince1970
+            receivedAt: now
         )
+
+        // Persist to UserDefaults so info survives timing gaps.
+        persistPendingTaskInfo(kind: "processing", identifier: processingTaskId, receivedAt: now)
 
         persistTaskKind("processing")
         persistTaskStartedAt()
@@ -529,24 +561,37 @@ import os.log
     /// Called by Rust during iOS plugin setup to detect whether the app was
     /// launched by iOS for a background task. If a pending task exists and
     /// `desired_running` is true in UserDefaults, Rust auto-starts the service.
+    ///
+    /// Reads from UserDefaults as the source of truth so the info survives
+    /// timing gaps between the BGTask handler and Rust setup.
     @objc public func getPendingBgTask(_ invoke: Invoke) {
-        if let info = pendingTaskInfo {
+        let defaults = UserDefaults.standard
+        let kind = defaults.string(forKey: PendingTaskKeys.kind)
+        let identifier = defaults.string(forKey: PendingTaskKeys.identifier)
+        let receivedAt = defaults.object(forKey: PendingTaskKeys.receivedAt) as? TimeInterval
+        let consumedAt = defaults.object(forKey: PendingTaskKeys.consumedAt) as? TimeInterval
+
+        if let kind = kind, let identifier = identifier {
             invoke.resolve([
-                "taskKind": info.taskKind,
-                "identifier": info.identifier,
-                "receivedAt": info.receivedAt
+                "taskKind": kind,
+                "identifier": identifier,
+                "receivedAt": receivedAt ?? 0,
+                "consumedAt": consumedAt ?? NSNull()
             ] as [String: Any])
         } else {
             invoke.resolve([
                 "taskKind": NSNull(),
                 "identifier": NSNull(),
-                "receivedAt": NSNull()
+                "receivedAt": NSNull(),
+                "consumedAt": NSNull()
             ] as [String: Any])
         }
     }
 
-    /// Clear the pending BGTask info after Rust has processed the auto-start.
+    /// Mark the pending BGTask info as consumed by setting the consumed_at
+    /// timestamp in UserDefaults. The in-memory property is also cleared.
     @objc public func clearPendingBgTask(_ invoke: Invoke) {
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: PendingTaskKeys.consumedAt)
         pendingTaskInfo = nil
         invoke.resolve()
     }
