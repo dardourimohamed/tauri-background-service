@@ -475,9 +475,9 @@ fn handle_start<R: Runtime>(
         app: app.clone(),
         shutdown,
         #[cfg(mobile)]
-        service_label: config.service_label,
+        service_label: config.service_label.clone(),
         #[cfg(mobile)]
-        foreground_service_type: config.foreground_service_type,
+        foreground_service_type: config.foreground_service_type.clone(),
     };
 
     // Use tauri::async_runtime::spawn() instead of tokio::spawn() because
