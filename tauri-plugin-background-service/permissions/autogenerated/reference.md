@@ -292,6 +292,32 @@ Denies the is_running command without any pre-configured scope.
 <tr>
 <td>
 
+`background-service:allow-native-lifecycle-event`
+
+</td>
+<td>
+
+Enables the native_lifecycle_event command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`background-service:deny-native-lifecycle-event`
+
+</td>
+<td>
+
+Denies the native_lifecycle_event command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `background-service:allow-restart-os-service`
 
 </td>

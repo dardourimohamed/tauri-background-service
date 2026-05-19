@@ -570,6 +570,31 @@ async fn get_desired_service_state<R: Runtime>(
     rx.await.map_err(|e| e.to_string())
 }
 
+/// Notify the Rust actor of a native platform lifecycle event.
+///
+/// Called from the native layer (Kotlin/Swift) when the OS triggers a
+/// lifecycle action that the Rust actor must handle — e.g. the user pressed
+/// "Stop" on the Android foreground notification, or Android timed out the
+/// foreground service.
+///
+/// The actor maps each [`NativeLifecycleEvent`] variant to the appropriate
+/// [`StopReason`](models::StopReason) and dispatches through
+/// [`handle_stop_with_reason`](manager::handle_stop_with_reason).
+///
+/// This command is not intended for end-user consumption — it is called by
+/// the native plugin code.
+#[tauri::command]
+async fn native_lifecycle_event<R: Runtime>(
+    app: AppHandle<R>,
+    event: models::NativeLifecycleEvent,
+) -> Result<(), String> {
+    let manager = app.state::<ServiceManagerHandle<R>>();
+    manager
+        .send_native_lifecycle_event(event)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Validate the background service setup for the current platform.
 ///
 /// Returns a [`SetupValidationReport`] with errors (blocking) and warnings
@@ -869,6 +894,7 @@ where
             enable_auto_restart,
             disable_auto_restart,
             get_desired_service_state,
+            native_lifecycle_event,
             validate_setup,
             #[cfg(feature = "desktop-service")]
             install_service,
@@ -1281,6 +1307,15 @@ mod tests {
         app: AppHandle<R>,
     ) -> Result<models::SetupValidationReport, String> {
         validate_setup(app).await
+    }
+
+    /// Verify `native_lifecycle_event` command signature is async and generic over `R: Runtime`.
+    #[allow(dead_code)]
+    async fn native_lifecycle_event_command_signature<R: Runtime>(
+        app: AppHandle<R>,
+        event: models::NativeLifecycleEvent,
+    ) -> Result<(), String> {
+        native_lifecycle_event(app, event).await
     }
 
     // ── Desktop IPC State Tests ─────────────────────────────────────────

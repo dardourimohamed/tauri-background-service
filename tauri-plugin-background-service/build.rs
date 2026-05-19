@@ -9,6 +9,7 @@ const COMMANDS: &[&str] = &[
     "enable_auto_restart",
     "disable_auto_restart",
     "get_desired_service_state",
+    "native_lifecycle_event",
     "validate_setup",
 ];
 

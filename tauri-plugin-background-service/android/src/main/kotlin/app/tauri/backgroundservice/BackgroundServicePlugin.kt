@@ -59,10 +59,24 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
             data.put("platformError", errorMessage)
             trigger("timeout", data)
         }
+
+        // Register native lifecycle event callback so LifecycleService can
+        // signal notification-stop and timeout events to Rust via JS bridge.
+        // The TypeScript layer listens for "native-lifecycle-event" and calls
+        // the Rust native_lifecycle_event command.
+        onNativeLifecycleEvent = { eventType, fgsType ->
+            val data = JSObject()
+            data.put("type", eventType)
+            if (fgsType != null) {
+                data.put("fgsType", fgsType)
+            }
+            trigger("native-lifecycle-event", data)
+        }
     }
 
     override fun onDestroy() {
         onTimeoutEvent = null
+        onNativeLifecycleEvent = null
         super.onDestroy()
     }
 
@@ -166,6 +180,9 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
     companion object {
         @Volatile
         internal var onTimeoutEvent: ((String) -> Unit)? = null
+
+        @Volatile
+        internal var onNativeLifecycleEvent: ((String, String?) -> Unit)? = null
 
         fun validateForegroundServiceType(
             requestedType: String,

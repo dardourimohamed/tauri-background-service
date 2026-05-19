@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-native-lifecycle-event"
+description = "Enables the native_lifecycle_event command without any pre-configured scope."
+commands.allow = ["native_lifecycle_event"]
+
+[[permission]]
+identifier = "deny-native-lifecycle-event"
+description = "Denies the native_lifecycle_event command without any pre-configured scope."
+commands.deny = ["native_lifecycle_event"]

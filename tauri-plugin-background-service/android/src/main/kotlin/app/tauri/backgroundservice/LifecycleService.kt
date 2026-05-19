@@ -59,6 +59,12 @@ class LifecycleService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // ACTION_STOP: clear prefs and stop
         if (intent?.action == ACTION_STOP) {
+            // Notify Rust actor that the user pressed stop on the notification.
+            // The callback emits a JS event that the TypeScript layer forwards
+            // to the Rust native_lifecycle_event command.
+            BackgroundServicePlugin.onNativeLifecycleEvent?.invoke(
+                "androidNotificationStop", null
+            )
             getSharedPreferences("bg_service", Context.MODE_PRIVATE).edit()
                 .remove("bg_service_label")
                 .remove("bg_service_type")
@@ -133,6 +139,13 @@ class LifecycleService : Service() {
         val previous = DurableState.load(this)
         val serviceType = previous.lastServiceType.ifEmpty { "dataSync" }
         val label = previous.lastServiceLabel.ifEmpty { "Service" }
+
+        // Notify Rust actor about the timeout before applying policy.
+        // The callback emits a JS event that the TypeScript layer forwards
+        // to the Rust native_lifecycle_event command.
+        BackgroundServicePlugin.onNativeLifecycleEvent?.invoke(
+            "androidTimeout", serviceType
+        )
 
         // Persist timeout state
         DurableState.save(this, buildTimeoutState(previous, serviceType))
