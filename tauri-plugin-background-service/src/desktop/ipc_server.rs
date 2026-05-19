@@ -366,6 +366,77 @@ async fn handle_request<R: Runtime>(
                 Err(_) => error_response("manager dropped reply"),
             }
         }
+        IpcRequest::EnableAutoRestart { config } => {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if cmd_tx
+                .send(ManagerCommand::EnableAutoRestart { config, reply })
+                .await
+                .is_err()
+            {
+                return error_response("manager shut down");
+            }
+            match rx.await {
+                Ok(Ok(())) => IpcResponse {
+                    ok: true,
+                    data: None,
+                    error: None,
+                },
+                Ok(Err(e)) => error_response(&e.to_string()),
+                Err(_) => error_response("manager dropped reply"),
+            }
+        }
+        IpcRequest::DisableAutoRestart => {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if cmd_tx
+                .send(ManagerCommand::DisableAutoRestart { reply })
+                .await
+                .is_err()
+            {
+                return error_response("manager shut down");
+            }
+            match rx.await {
+                Ok(Ok(())) => IpcResponse {
+                    ok: true,
+                    data: None,
+                    error: None,
+                },
+                Ok(Err(e)) => error_response(&e.to_string()),
+                Err(_) => error_response("manager dropped reply"),
+            }
+        }
+        IpcRequest::GetDesiredState => {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            if cmd_tx
+                .send(ManagerCommand::GetDesiredState { reply })
+                .await
+                .is_err()
+            {
+                return error_response("manager shut down");
+            }
+            match rx.await {
+                Ok(Some(state)) => IpcResponse {
+                    ok: true,
+                    data: Some(serde_json::to_value(&state).unwrap_or_default()),
+                    error: None,
+                },
+                Ok(None) => IpcResponse {
+                    ok: true,
+                    data: None,
+                    error: None,
+                },
+                Err(_) => error_response("manager dropped reply"),
+            }
+        }
+        IpcRequest::ValidateSetup => {
+            use crate::validator::SetupValidator;
+            let (platform, _) = crate::capabilities::CapabilityProvider::detect_platform(None);
+            let report = SetupValidator::validate(platform);
+            IpcResponse {
+                ok: true,
+                data: Some(serde_json::to_value(&report).unwrap_or_default()),
+                error: None,
+            }
+        }
     }
 }
 

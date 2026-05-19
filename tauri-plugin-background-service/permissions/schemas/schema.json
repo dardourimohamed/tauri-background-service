@@ -295,6 +295,90 @@
       "type": "string",
       "oneOf": [
         {
+          "description": "Enables the disable_auto_restart command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-disable-auto-restart",
+          "markdownDescription": "Enables the disable_auto_restart command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the disable_auto_restart command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-disable-auto-restart",
+          "markdownDescription": "Denies the disable_auto_restart command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the enable_auto_restart command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-enable-auto-restart",
+          "markdownDescription": "Enables the enable_auto_restart command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the enable_auto_restart command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-enable-auto-restart",
+          "markdownDescription": "Denies the enable_auto_restart command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_desired_service_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-desired-service-state",
+          "markdownDescription": "Enables the get_desired_service_state command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_desired_service_state command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-desired-service-state",
+          "markdownDescription": "Denies the get_desired_service_state command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_os_service_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-os-service-status",
+          "markdownDescription": "Enables the get_os_service_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_os_service_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-os-service-status",
+          "markdownDescription": "Denies the get_os_service_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_pending_bg_task command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-pending-bg-task",
+          "markdownDescription": "Enables the get_pending_bg_task command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_pending_bg_task command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-pending-bg-task",
+          "markdownDescription": "Denies the get_pending_bg_task command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_platform_capabilities command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-platform-capabilities",
+          "markdownDescription": "Enables the get_platform_capabilities command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_platform_capabilities command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-platform-capabilities",
+          "markdownDescription": "Denies the get_platform_capabilities command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_scheduling_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-scheduling-status",
+          "markdownDescription": "Enables the get_scheduling_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_scheduling_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-scheduling-status",
+          "markdownDescription": "Denies the get_scheduling_status command without any pre-configured scope."
+        },
+        {
           "description": "Enables the get_service_state command without any pre-configured scope.",
           "type": "string",
           "const": "allow-get-service-state",
@@ -331,6 +415,18 @@
           "markdownDescription": "Denies the is_running command without any pre-configured scope."
         },
         {
+          "description": "Enables the restart_os_service command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-restart-os-service",
+          "markdownDescription": "Enables the restart_os_service command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the restart_os_service command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-restart-os-service",
+          "markdownDescription": "Denies the restart_os_service command without any pre-configured scope."
+        },
+        {
           "description": "Enables the service_status command without any pre-configured scope.",
           "type": "string",
           "const": "allow-service-status",
@@ -355,6 +451,18 @@
           "markdownDescription": "Denies the start command without any pre-configured scope."
         },
         {
+          "description": "Enables the start_os_service command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-start-os-service",
+          "markdownDescription": "Enables the start_os_service command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the start_os_service command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-start-os-service",
+          "markdownDescription": "Denies the start_os_service command without any pre-configured scope."
+        },
+        {
           "description": "Enables the stop command without any pre-configured scope.",
           "type": "string",
           "const": "allow-stop",
@@ -365,6 +473,18 @@
           "type": "string",
           "const": "deny-stop",
           "markdownDescription": "Denies the stop command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the stop_os_service command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-stop-os-service",
+          "markdownDescription": "Enables the stop_os_service command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the stop_os_service command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-stop-os-service",
+          "markdownDescription": "Denies the stop_os_service command without any pre-configured scope."
         },
         {
           "description": "Enables the uninstall_service command without any pre-configured scope.",
@@ -379,10 +499,22 @@
           "markdownDescription": "Denies the uninstall_service command without any pre-configured scope."
         },
         {
-          "description": "Default permissions for the background service plugin\n#### This default permission set includes:\n\n- `allow-start`\n- `allow-stop`\n- `allow-is-running`\n- `allow-get-service-state`\n- `allow-install-service`\n- `allow-uninstall-service`",
+          "description": "Enables the validate_setup command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-validate-setup",
+          "markdownDescription": "Enables the validate_setup command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the validate_setup command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-validate-setup",
+          "markdownDescription": "Denies the validate_setup command without any pre-configured scope."
+        },
+        {
+          "description": "Default permissions for the background service plugin\n#### This default permission set includes:\n\n- `allow-start`\n- `allow-stop`\n- `allow-is-running`\n- `allow-get-service-state`\n- `allow-get-platform-capabilities`\n- `allow-enable-auto-restart`\n- `allow-disable-auto-restart`\n- `allow-get-desired-service-state`\n- `allow-validate-setup`\n- `allow-install-service`\n- `allow-uninstall-service`\n- `allow-start-os-service`\n- `allow-stop-os-service`\n- `allow-restart-os-service`\n- `allow-get-os-service-status`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for the background service plugin\n#### This default permission set includes:\n\n- `allow-start`\n- `allow-stop`\n- `allow-is-running`\n- `allow-get-service-state`\n- `allow-install-service`\n- `allow-uninstall-service`"
+          "markdownDescription": "Default permissions for the background service plugin\n#### This default permission set includes:\n\n- `allow-start`\n- `allow-stop`\n- `allow-is-running`\n- `allow-get-service-state`\n- `allow-get-platform-capabilities`\n- `allow-enable-auto-restart`\n- `allow-disable-auto-restart`\n- `allow-get-desired-service-state`\n- `allow-validate-setup`\n- `allow-install-service`\n- `allow-uninstall-service`\n- `allow-start-os-service`\n- `allow-stop-os-service`\n- `allow-restart-os-service`\n- `allow-get-os-service-status`"
         }
       ]
     }

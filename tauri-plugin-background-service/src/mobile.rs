@@ -16,7 +16,9 @@ use tauri::{
 
 use crate::error::ServiceError;
 use crate::manager::MobileKeepalive;
-use crate::models::{AutoStartConfig, StartConfig, StartKeepaliveArgs};
+use crate::models::{
+    AutoStartConfig, IOSSchedulingStatus, PendingTaskInfo, StartConfig, StartKeepaliveArgs,
+};
 
 /// Rust-side bridge to native mobile keepalive code.
 ///
@@ -34,6 +36,11 @@ impl<R: Runtime> MobileLifecycle<R> {
     ///
     /// `ios_processing_safety_timeout_secs` caps the processing task duration on iOS.
     /// When `None`, the processing task has no safety cap.
+    ///
+    /// On iOS, returns `Ok(Some(IOSSchedulingStatus))` with the scheduling result.
+    /// On Android, returns `Ok(None)` (no structured result).
+    /// When both iOS scheduling attempts fail, Swift rejects the invoke with
+    /// `"schedulerUnavailable"`, which maps to `Err(ServiceError::Platform)`.
     #[allow(clippy::too_many_arguments)]
     pub fn start_keepalive(
         &self,
@@ -45,9 +52,10 @@ impl<R: Runtime> MobileLifecycle<R> {
         ios_earliest_processing_begin_minutes: Option<f64>,
         ios_requires_external_power: Option<bool>,
         ios_requires_network_connectivity: Option<bool>,
-    ) -> Result<(), ServiceError> {
-        self.handle
-            .run_mobile_plugin::<()>(
+    ) -> Result<Option<IOSSchedulingStatus>, ServiceError> {
+        let result: serde_json::Value = self
+            .handle
+            .run_mobile_plugin(
                 "startKeepalive",
                 StartKeepaliveArgs {
                     label,
@@ -61,7 +69,26 @@ impl<R: Runtime> MobileLifecycle<R> {
                 },
             )
             .map_err(|e| ServiceError::Platform(e.to_string()))?;
-        Ok(())
+
+        // On iOS, the result is a structured scheduling status dict.
+        // On Android, the result is null (Value::Null).
+        if let Ok(status) = serde_json::from_value::<IOSSchedulingStatus>(result) {
+            if status.refresh_error.is_some() {
+                log::warn!(
+                    "iOS BGAppRefreshTask scheduling error: {:?}",
+                    status.refresh_error
+                );
+            }
+            if status.processing_error.is_some() {
+                log::warn!(
+                    "iOS BGProcessingTask scheduling error: {:?}",
+                    status.processing_error
+                );
+            }
+            Ok(Some(status))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Stop the OS-specific keepalive mechanism.
@@ -140,6 +167,59 @@ impl<R: Runtime> MobileLifecycle<R> {
             .map_err(|e| ServiceError::Platform(e.to_string()))?;
         Ok(())
     }
+
+    /// Query the iOS scheduling status from the native layer.
+    ///
+    /// Calls `getSchedulingStatus` via `run_mobile_plugin` on the native side.
+    /// Returns the structured scheduling result on iOS, or `Ok(None)` on Android.
+    pub fn get_scheduling_status(&self) -> Result<Option<IOSSchedulingStatus>, ServiceError> {
+        let result: serde_json::Value = self
+            .handle
+            .run_mobile_plugin("getSchedulingStatus", ())
+            .map_err(|e| ServiceError::Platform(e.to_string()))?;
+
+        serde_json::from_value::<IOSSchedulingStatus>(result)
+            .map(Some)
+            .map_err(|e| ServiceError::Platform(e.to_string()))
+    }
+
+    /// Get the raw scheduling status as a JSON value.
+    ///
+    /// The native `getSchedulingStatus` returns more fields than
+    /// `IOSSchedulingStatus` captures (e.g. `desiredRunning`, `lastStartConfig`).
+    /// This method returns the full raw response for internal use.
+    pub fn get_scheduling_status_raw(&self) -> Result<serde_json::Value, ServiceError> {
+        self.handle
+            .run_mobile_plugin("getSchedulingStatus", ())
+            .map_err(|e| ServiceError::Platform(e.to_string()))
+    }
+
+    /// Query the pending BGTask info from the native layer.
+    ///
+    /// Returns `Some(PendingTaskInfo)` if the app was launched by iOS for a
+    /// background task, or `None` if no pending task exists.
+    pub fn get_pending_bg_task(&self) -> Result<Option<PendingTaskInfo>, ServiceError> {
+        let result: serde_json::Value = self
+            .handle
+            .run_mobile_plugin("getPendingBgTask", ())
+            .map_err(|e| ServiceError::Platform(e.to_string()))?;
+
+        if result["taskKind"].is_null() {
+            Ok(None)
+        } else {
+            serde_json::from_value::<PendingTaskInfo>(result)
+                .map(Some)
+                .map_err(|e| ServiceError::Platform(e.to_string()))
+        }
+    }
+
+    /// Clear the pending BGTask info after Rust has processed the auto-start.
+    pub fn clear_pending_bg_task(&self) -> Result<(), ServiceError> {
+        self.handle
+            .run_mobile_plugin::<()>("clearPendingBgTask", ())
+            .map_err(|e| ServiceError::Platform(e.to_string()))?;
+        Ok(())
+    }
 }
 
 /// Arguments sent to the native `completeBgTask` handler.
@@ -172,6 +252,7 @@ impl<R: Runtime> MobileKeepalive for MobileLifecycle<R> {
             ios_requires_external_power,
             ios_requires_network_connectivity,
         )
+        .map(|_| ())
     }
 
     fn stop_keepalive(&self) -> Result<(), ServiceError> {

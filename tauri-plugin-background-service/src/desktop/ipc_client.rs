@@ -208,6 +208,23 @@ enum IpcCommand {
     GetState {
         reply: tokio::sync::oneshot::Sender<Result<ServiceStatus, ServiceError>>,
     },
+    EnableAutoRestart {
+        config: Option<StartConfig>,
+        reply: tokio::sync::oneshot::Sender<Result<(), ServiceError>>,
+    },
+    DisableAutoRestart {
+        reply: tokio::sync::oneshot::Sender<Result<(), ServiceError>>,
+    },
+    GetDesiredState {
+        reply: tokio::sync::oneshot::Sender<
+            Result<Option<crate::desired_state::DesiredState>, ServiceError>,
+        >,
+    },
+    ValidateSetup {
+        reply: tokio::sync::oneshot::Sender<
+            Result<crate::models::SetupValidationReport, ServiceError>,
+        >,
+    },
 }
 
 /// Handle to a persistent IPC client that maintains a long-lived connection
@@ -221,6 +238,7 @@ pub struct PersistentIpcClientHandle {
     cmd_tx: tokio::sync::mpsc::Sender<IpcCommand>,
     shutdown: tokio_util::sync::CancellationToken,
     connected: Arc<AtomicBool>,
+    socket_path: PathBuf,
 }
 
 impl Drop for PersistentIpcClientHandle {
@@ -241,7 +259,7 @@ impl PersistentIpcClientHandle {
         let connected = Arc::new(AtomicBool::new(false));
 
         tokio::spawn(persistent_client_loop(
-            socket_path,
+            socket_path.clone(),
             app,
             cmd_rx,
             shutdown.clone(),
@@ -252,6 +270,7 @@ impl PersistentIpcClientHandle {
             cmd_tx,
             shutdown,
             connected,
+            socket_path,
         }
     }
 
@@ -310,6 +329,94 @@ impl PersistentIpcClientHandle {
     /// headless sidecar, `false` otherwise.
     pub fn is_connected(&self) -> bool {
         self.connected.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Returns the socket path this client is configured to connect to.
+    pub fn socket_path(&self) -> &PathBuf {
+        &self.socket_path
+    }
+
+    /// Wait until the persistent client is connected, polling `is_connected()`
+    /// at 500ms intervals.
+    ///
+    /// Returns `Ok(true)` if connected within the timeout, `Ok(false)` if the
+    /// timeout elapsed without connecting.
+    pub async fn wait_for_connected(&self, timeout: Duration) -> Result<bool, ServiceError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let poll_interval = Duration::from_millis(500);
+
+        while tokio::time::Instant::now() < deadline {
+            if self.is_connected() {
+                return Ok(true);
+            }
+            let remaining = deadline - tokio::time::Instant::now();
+            let sleep_dur = poll_interval.min(remaining);
+            tokio::time::sleep(sleep_dur).await;
+        }
+
+        if self.is_connected() {
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Enable auto-restart through the persistent connection.
+    pub async fn enable_auto_restart(
+        &self,
+        config: Option<StartConfig>,
+    ) -> Result<(), ServiceError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(IpcCommand::EnableAutoRestart {
+                config,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ServiceError::Ipc("persistent client shut down".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| ServiceError::Ipc("command dropped".into()))?
+    }
+
+    /// Disable auto-restart through the persistent connection.
+    pub async fn disable_auto_restart(&self) -> Result<(), ServiceError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(IpcCommand::DisableAutoRestart { reply: reply_tx })
+            .await
+            .map_err(|_| ServiceError::Ipc("persistent client shut down".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| ServiceError::Ipc("command dropped".into()))?
+    }
+
+    /// Get the persisted desired-state through the persistent connection.
+    pub async fn get_desired_state(
+        &self,
+    ) -> Result<Option<crate::desired_state::DesiredState>, ServiceError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(IpcCommand::GetDesiredState { reply: reply_tx })
+            .await
+            .map_err(|_| ServiceError::Ipc("persistent client shut down".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| ServiceError::Ipc("command dropped".into()))?
+    }
+
+    /// Validate background service setup prerequisites through the persistent connection.
+    pub async fn validate_setup(
+        &self,
+    ) -> Result<crate::models::SetupValidationReport, ServiceError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx
+            .send(IpcCommand::ValidateSetup { reply: reply_tx })
+            .await
+            .map_err(|_| ServiceError::Ipc("persistent client shut down".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| ServiceError::Ipc("command dropped".into()))?
     }
 }
 
@@ -515,6 +622,84 @@ async fn run_persistent_connection<R: Runtime>(
                                     serde_json::from_value::<ServiceStatus>(d)
                                         .map_err(|e| ServiceError::Ipc(format!("deserialize GetState: {e}")))
                                 }),
+                            Ok(resp) => Err(ServiceError::Ipc(
+                                resp.error.unwrap_or_else(|| "unknown error".into()),
+                            )),
+                            Err(e) => Err(e),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    IpcCommand::EnableAutoRestart { config, reply } => {
+                        let request = IpcRequest::EnableAutoRestart { config };
+                        let rx = prepare_response_slot(&response_slot).await;
+                        if let Err(e) = send_request_to(&mut write_half, &request).await {
+                            let _ = reply.send(Err(e));
+                            break Err(ServiceError::Ipc("send failed".into()));
+                        }
+                        let response = await_response(rx).await;
+                        let result = match response {
+                            Ok(resp) if resp.ok => Ok(()),
+                            Ok(resp) => Err(ServiceError::Ipc(
+                                resp.error.unwrap_or_else(|| "unknown error".into()),
+                            )),
+                            Err(e) => Err(e),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    IpcCommand::DisableAutoRestart { reply } => {
+                        let rx = prepare_response_slot(&response_slot).await;
+                        if let Err(e) = send_request_to(&mut write_half, &IpcRequest::DisableAutoRestart).await {
+                            let _ = reply.send(Err(e));
+                            break Err(ServiceError::Ipc("send failed".into()));
+                        }
+                        let response = await_response(rx).await;
+                        let result = match response {
+                            Ok(resp) if resp.ok => Ok(()),
+                            Ok(resp) => Err(ServiceError::Ipc(
+                                resp.error.unwrap_or_else(|| "unknown error".into()),
+                            )),
+                            Err(e) => Err(e),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    IpcCommand::GetDesiredState { reply } => {
+                        let rx = prepare_response_slot(&response_slot).await;
+                        if let Err(e) = send_request_to(&mut write_half, &IpcRequest::GetDesiredState).await {
+                            let _ = reply.send(Err(e));
+                            break Err(ServiceError::Ipc("send failed".into()));
+                        }
+                        let response = await_response(rx).await;
+                        let result = match response {
+                            Ok(resp) if resp.ok => {
+                                match resp.data {
+                                    Some(d) => serde_json::from_value::<crate::desired_state::DesiredState>(d)
+                                        .map(Some)
+                                        .map_err(|e| ServiceError::Ipc(format!("deserialize GetDesiredState: {e}"))),
+                                    None => Ok(None),
+                                }
+                            }
+                            Ok(resp) => Err(ServiceError::Ipc(
+                                resp.error.unwrap_or_else(|| "unknown error".into()),
+                            )),
+                            Err(e) => Err(e),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    IpcCommand::ValidateSetup { reply } => {
+                        let rx = prepare_response_slot(&response_slot).await;
+                        if let Err(e) = send_request_to(&mut write_half, &IpcRequest::ValidateSetup).await {
+                            let _ = reply.send(Err(e));
+                            break Err(ServiceError::Ipc("send failed".into()));
+                        }
+                        let response = await_response(rx).await;
+                        let result = match response {
+                            Ok(resp) if resp.ok => {
+                                match resp.data {
+                                    Some(d) => serde_json::from_value::<crate::models::SetupValidationReport>(d)
+                                        .map_err(|e| ServiceError::Ipc(format!("deserialize ValidateSetup: {e}"))),
+                                    None => Err(ServiceError::Ipc("missing ValidateSetup response data".into())),
+                                }
+                            }
                             Ok(resp) => Err(ServiceError::Ipc(
                                 resp.error.unwrap_or_else(|| "unknown error".into()),
                             )),
@@ -1090,7 +1275,7 @@ mod tests {
         let factory: ServiceFactory<tauri::test::MockRuntime> =
             Box::new(|| Box::new(BlockingService));
         tokio::spawn(manager_loop(
-            cmd_rx2, factory, 0.0, 0.0, 0.0, 0.0, false, false,
+            cmd_rx2, factory, 0.0, 0.0, 0.0, 0.0, false, false, None,
         ));
         let server2 = IpcServer::bind(path.clone(), cmd_tx2, app.handle().clone()).unwrap();
         let shutdown2 = CancellationToken::new();
@@ -1641,7 +1826,7 @@ mod tests {
         let factory: ServiceFactory<tauri::test::MockRuntime> =
             Box::new(|| Box::new(BlockingService));
         tokio::spawn(manager_loop(
-            cmd_rx2, factory, 0.0, 0.0, 0.0, 0.0, false, false,
+            cmd_rx2, factory, 0.0, 0.0, 0.0, 0.0, false, false, None,
         ));
         let server2 = IpcServer::bind(path.clone(), cmd_tx2, app.handle().clone()).unwrap();
         let shutdown2 = CancellationToken::new();
@@ -1738,6 +1923,70 @@ mod tests {
 
         server_handle.abort();
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  WAIT_FOR_CONNECTED TESTS (Step 12)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// wait_for_connected returns Ok immediately when already connected.
+    #[tokio::test]
+    async fn wait_for_connected_returns_immediately_when_connected() {
+        let (path, shutdown, _event_tx) = setup_server();
+        let app = tauri::test::mock_app();
+        let handle = PersistentIpcClientHandle::spawn(path, app.handle().clone());
+
+        // Wait for initial connection.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !handle.is_connected() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("should connect");
+
+        // Already connected → should return Ok immediately.
+        let result = handle
+            .wait_for_connected(Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(result, "should return true when connected");
+
+        shutdown.cancel();
+    }
+
+    /// wait_for_connected returns Err(timeout) when no server is running.
+    #[tokio::test]
+    async fn wait_for_connected_times_out_when_no_server() {
+        let app = tauri::test::mock_app();
+        let path = crate::desktop::test_helpers::unique_socket_path();
+        let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+
+        // No server → should time out quickly.
+        let result = handle
+            .wait_for_connected(Duration::from_millis(200))
+            .await
+            .unwrap();
+        assert!(!result, "should return false when no server and timeout");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// wait_for_connected returns Ok once the server starts and client connects.
+    #[tokio::test]
+    async fn wait_for_connected_succeeds_after_server_starts() {
+        let (path, shutdown, _event_tx) = setup_server();
+        let app = tauri::test::mock_app();
+        let handle = PersistentIpcClientHandle::spawn(path, app.handle().clone());
+
+        // Server is running — wait_for_connected should succeed within timeout.
+        let result = handle
+            .wait_for_connected(Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(result, "should connect within timeout");
+
+        shutdown.cancel();
     }
 
     /// send_and_read collects multiple consecutive events before the response.

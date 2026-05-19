@@ -1,7 +1,26 @@
-const COMMANDS: &[&str] = &["start", "stop", "is_running", "get_service_state"];
+const COMMANDS: &[&str] = &[
+    "start",
+    "stop",
+    "is_running",
+    "get_service_state",
+    "get_platform_capabilities",
+    "get_scheduling_status",
+    "get_pending_bg_task",
+    "enable_auto_restart",
+    "disable_auto_restart",
+    "get_desired_service_state",
+    "validate_setup",
+];
 
 #[cfg(feature = "desktop-service")]
-const DESKTOP_COMMANDS: &[&str] = &["install_service", "uninstall_service"];
+const DESKTOP_COMMANDS: &[&str] = &[
+    "install_service",
+    "uninstall_service",
+    "start_os_service",
+    "stop_os_service",
+    "restart_os_service",
+    "get_os_service_status",
+];
 
 fn main() {
     #[allow(unused_mut)]

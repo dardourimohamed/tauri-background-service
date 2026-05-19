@@ -15,9 +15,10 @@ use tauri::{AppHandle, Emitter, Runtime};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::desired_state::DesiredStateBackend;
 use crate::error::ServiceError;
 use crate::models::{
-    validate_foreground_service_type, PluginEvent, ServiceContext,
+    validate_foreground_service_type, LifecycleMode, PluginEvent, ServiceContext,
     ServiceState as ServiceLifecycle, ServiceStatus, StartConfig,
 };
 use crate::notifier::Notifier;
@@ -84,6 +85,21 @@ pub enum ManagerCommand<R: Runtime> {
     #[allow(dead_code, private_interfaces)]
     SetMobile {
         mobile: Arc<dyn MobileKeepalive>,
+    },
+    SetDesiredRunning {
+        desired: bool,
+        config: Option<StartConfig>,
+        reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
+    EnableAutoRestart {
+        config: Option<StartConfig>,
+        reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
+    DisableAutoRestart {
+        reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
+    GetDesiredState {
+        reply: oneshot::Sender<Option<crate::desired_state::DesiredState>>,
     },
 }
 
@@ -183,12 +199,12 @@ impl<R: Runtime> ServiceManagerHandle<R> {
         {
             return ServiceStatus {
                 state: ServiceLifecycle::Idle,
-                last_error: None,
+                ..Default::default()
             };
         }
         rx.await.unwrap_or(ServiceStatus {
             state: ServiceLifecycle::Idle,
-            last_error: None,
+            ..Default::default()
         })
     }
 }
@@ -237,6 +253,11 @@ struct ServiceState<R: Runtime> {
     /// Last error message from init/run failure.
     /// Shared with spawned task for error capture.
     last_error: Arc<Mutex<Option<String>>>,
+    /// Desired-state persistence backend.
+    /// `None` on platforms that haven't set one up yet.
+    desired_state: Option<Arc<dyn DesiredStateBackend>>,
+    /// Current platform's lifecycle mode (FGS, BGTask, in-process, OS-service).
+    lifecycle_mode: LifecycleMode,
 }
 
 // ─── Actor Loop ────────────────────────────────────────────────────────
@@ -265,7 +286,24 @@ pub async fn manager_loop<R: Runtime>(
     ios_requires_external_power: bool,
     // iOS BGProcessingTask requires network connectivity. From PluginConfig.
     ios_requires_network_connectivity: bool,
+    // Desired-state persistence backend. None if not configured.
+    desired_state_backend: Option<Arc<dyn DesiredStateBackend>>,
 ) {
+    let lifecycle_mode = {
+        #[cfg(target_os = "android")]
+        {
+            LifecycleMode::AndroidForegroundService
+        }
+        #[cfg(target_os = "ios")]
+        {
+            LifecycleMode::IosBgTaskScheduler
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            LifecycleMode::DesktopInProcess
+        }
+    };
+
     let mut state = ServiceState {
         is_running: Arc::new(AtomicBool::new(false)),
         token: Arc::new(Mutex::new(None)),
@@ -281,6 +319,8 @@ pub async fn manager_loop<R: Runtime>(
         ios_requires_network_connectivity,
         lifecycle_state: Arc::new(Mutex::new(ServiceLifecycle::Idle)),
         last_error: Arc::new(Mutex::new(None)),
+        desired_state: desired_state_backend,
+        lifecycle_mode,
     };
 
     while let Some(cmd) = rx.recv().await {
@@ -301,11 +341,51 @@ pub async fn manager_loop<R: Runtime>(
                 state.mobile = Some(mobile);
             }
             ManagerCommand::GetState { reply } => {
-                let status = ServiceStatus {
+                let mut status = ServiceStatus {
                     state: *state.lifecycle_state.lock().unwrap(),
                     last_error: state.last_error.lock().unwrap().clone(),
+                    platform_mode: Some(state.lifecycle_mode),
+                    ..Default::default()
                 };
+
+                if let Some(ref backend) = state.desired_state {
+                    if let Ok(ds) = backend.load() {
+                        status.desired_running = Some(ds.desired_running);
+                        status.native_state = ds
+                            .last_native_state
+                            .as_deref()
+                            .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok());
+                        status.last_start_config = ds
+                            .last_start_config
+                            .and_then(|v| serde_json::from_value(v).ok());
+                        status.last_heartbeat_at = ds.last_heartbeat_epoch_ms;
+                        status.restart_attempt = if ds.restart_attempt > 0 {
+                            Some(ds.restart_attempt)
+                        } else {
+                            None
+                        };
+                        status.recovery_reason = ds.recovery_reason;
+                        status.platform_error = ds.last_platform_error;
+                    }
+                }
+
                 let _ = reply.send(status);
+            }
+            ManagerCommand::SetDesiredRunning {
+                desired,
+                config,
+                reply,
+            } => {
+                let _ = reply.send(handle_set_desired_running(&mut state, desired, config));
+            }
+            ManagerCommand::EnableAutoRestart { config, reply } => {
+                let _ = reply.send(handle_enable_auto_restart(&mut state, config));
+            }
+            ManagerCommand::DisableAutoRestart { reply } => {
+                let _ = reply.send(handle_disable_auto_restart(&mut state));
+            }
+            ManagerCommand::GetDesiredState { reply } => {
+                let _ = reply.send(handle_get_desired_state(&state));
             }
         }
     }
@@ -493,6 +573,9 @@ fn handle_start<R: Runtime>(
         }
     });
 
+    // Persist desired_running=true after successful start.
+    save_desired_running(state, true, Some(&config));
+
     Ok(())
 }
 
@@ -515,15 +598,105 @@ fn handle_stop<R: Runtime>(state: &mut ServiceState<R>) -> Result<(), ServiceErr
                     log::warn!("stop_keepalive failed (service already cancelled): {e}");
                 }
             }
+            // Persist desired_running=false with cleared recovery fields.
+            save_desired_running(state, false, None);
             Ok(())
         }
         None => Err(ServiceError::NotRunning),
     }
 }
 
+// ─── Desired-State Helpers ──────────────────────────────────────────────
+
+/// Save desired-state to the backend (if configured).
+///
+/// On `desired=true`: saves `desired_running=true` with config and timestamp.
+/// On `desired=false`: saves `desired_running=false` and clears recovery fields.
+fn save_desired_running<R: Runtime>(
+    state: &ServiceState<R>,
+    desired: bool,
+    config: Option<&StartConfig>,
+) {
+    let Some(ref backend) = state.desired_state else {
+        return;
+    };
+
+    let mut ds = backend.load().unwrap_or_default();
+    ds.desired_running = desired;
+    if desired {
+        ds.last_start_config = config.map(|c| serde_json::to_value(c).unwrap_or_default());
+        ds.last_start_epoch_ms = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        );
+    } else {
+        ds.last_start_config = None;
+        ds.last_start_epoch_ms = None;
+        ds.recovery_pending = false;
+        ds.recovery_reason = None;
+        ds.restart_attempt = 0;
+    }
+    if let Err(e) = backend.save(&ds) {
+        log::warn!("failed to save desired state: {e}");
+    }
+}
+
+/// Handle a `SetDesiredRunning` command.
+///
+/// Persists the desired running state WITHOUT affecting the actual running state.
+/// This is used by `enableAutoRestart()` / `disableAutoRestart()` to set intent
+/// for recovery without starting/stopping the service.
+fn handle_set_desired_running<R: Runtime>(
+    state: &mut ServiceState<R>,
+    desired: bool,
+    config: Option<StartConfig>,
+) -> Result<(), ServiceError> {
+    save_desired_running(state, desired, config.as_ref());
+    Ok(())
+}
+
+/// Handle an `EnableAutoRestart` command.
+///
+/// Persists `desired_running=true` with the optional config WITHOUT starting
+/// the service. Used to set recovery intent for future restart/reboot.
+fn handle_enable_auto_restart<R: Runtime>(
+    state: &mut ServiceState<R>,
+    config: Option<StartConfig>,
+) -> Result<(), ServiceError> {
+    save_desired_running(state, true, config.as_ref());
+    Ok(())
+}
+
+/// Handle a `DisableAutoRestart` command.
+///
+/// Persists `desired_running=false` with cleared recovery fields WITHOUT
+/// stopping the service.
+fn handle_disable_auto_restart<R: Runtime>(
+    state: &mut ServiceState<R>,
+) -> Result<(), ServiceError> {
+    save_desired_running(state, false, None);
+    Ok(())
+}
+
+/// Handle a `GetDesiredState` command.
+///
+/// Returns the persisted desired state, or `None` if no backend is configured.
+fn handle_get_desired_state<R: Runtime>(
+    state: &ServiceState<R>,
+) -> Option<crate::desired_state::DesiredState> {
+    state
+        .desired_state
+        .as_ref()
+        .and_then(|backend| backend.load().ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::desired_state::DesiredState;
+    use crate::models::NativeState;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicI8, AtomicU8, AtomicUsize};
 
@@ -664,12 +837,19 @@ mod tests {
 
     /// Create a manager actor with a BlockingService factory.
     fn setup_manager() -> ServiceManagerHandle<tauri::test::MockRuntime> {
+        setup_manager_with_backend(None)
+    }
+
+    /// Create a manager actor with a desired-state backend.
+    fn setup_manager_with_backend(
+        backend: Option<Arc<dyn DesiredStateBackend>>,
+    ) -> ServiceManagerHandle<tauri::test::MockRuntime> {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let handle = ServiceManagerHandle::new(cmd_tx);
         let factory: ServiceFactory<tauri::test::MockRuntime> =
             Box::new(|| Box::new(BlockingService));
         tokio::spawn(manager_loop(
-            cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false,
+            cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false, backend,
         ));
         handle
     }
@@ -872,10 +1052,18 @@ mod tests {
     fn setup_manager_with_factory(
         factory: ServiceFactory<tauri::test::MockRuntime>,
     ) -> ServiceManagerHandle<tauri::test::MockRuntime> {
+        setup_manager_with_factory_and_backend(factory, None)
+    }
+
+    /// Create a manager actor with a custom factory and desired-state backend.
+    fn setup_manager_with_factory_and_backend(
+        factory: ServiceFactory<tauri::test::MockRuntime>,
+        backend: Option<Arc<dyn DesiredStateBackend>>,
+    ) -> ServiceManagerHandle<tauri::test::MockRuntime> {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let handle = ServiceManagerHandle::new(cmd_tx);
         tokio::spawn(manager_loop(
-            cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false,
+            cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false, backend,
         ));
         handle
     }
@@ -1320,7 +1508,7 @@ mod tests {
             Box::new(|| Box::new(BlockingService));
         // Use a custom timeout value (not default 28.0)
         tokio::spawn(manager_loop(
-            cmd_rx, factory, 15.0, 0.0, 15.0, 15.0, false, false,
+            cmd_rx, factory, 15.0, 0.0, 15.0, 15.0, false, false, None,
         ));
 
         let app = tauri::test::mock_app();
@@ -1348,7 +1536,7 @@ mod tests {
             Box::new(|| Box::new(BlockingService));
         // Use a custom processing timeout value
         tokio::spawn(manager_loop(
-            cmd_rx, factory, 28.0, 60.0, 15.0, 15.0, false, false,
+            cmd_rx, factory, 28.0, 60.0, 15.0, 15.0, false, false, None,
         ));
 
         let app = tauri::test::mock_app();
@@ -1714,7 +1902,7 @@ mod tests {
             Box::new(|| Box::new(BlockingService));
         // Processing timeout = 0.0 (default, no cap)
         tokio::spawn(manager_loop(
-            cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false,
+            cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false, None,
         ));
 
         let app = tauri::test::mock_app();
@@ -1727,6 +1915,582 @@ mod tests {
         assert_eq!(
             timeout, None,
             "ios_processing_safety_timeout_secs of 0.0 should pass None to mobile"
+        );
+    }
+
+    // ── Desired-state MockBackend ─────────────────────────────────────────
+
+    /// Mock desired-state backend that records all saves in a Mutex<Vec>.
+    struct MockDesiredStateBackend {
+        saves: std::sync::Mutex<Vec<DesiredState>>,
+    }
+
+    impl MockDesiredStateBackend {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                saves: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn last_save(&self) -> Option<DesiredState> {
+            self.saves.lock().unwrap().last().cloned()
+        }
+
+        #[allow(dead_code)]
+        fn save_count(&self) -> usize {
+            self.saves.lock().unwrap().len()
+        }
+
+        #[allow(dead_code)]
+        fn saves(&self) -> std::sync::MutexGuard<'_, Vec<DesiredState>> {
+            self.saves.lock().unwrap()
+        }
+    }
+
+    impl DesiredStateBackend for MockDesiredStateBackend {
+        fn load(&self) -> Result<DesiredState, String> {
+            Ok(self
+                .saves
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        fn save(&self, state: &DesiredState) -> Result<(), String> {
+            self.saves.lock().unwrap().push(state.clone());
+            Ok(())
+        }
+
+        fn clear(&self) -> Result<(), String> {
+            self.saves.lock().unwrap().clear();
+            Ok(())
+        }
+    }
+
+    // ── Desired-state actor integration tests ─────────────────────────────
+
+    async fn send_set_desired_running(
+        handle: &ServiceManagerHandle<tauri::test::MockRuntime>,
+        desired: bool,
+        config: Option<StartConfig>,
+    ) -> Result<(), ServiceError> {
+        let (tx, rx) = oneshot::channel();
+        handle
+            .cmd_tx
+            .send(ManagerCommand::SetDesiredRunning {
+                desired,
+                config,
+                reply: tx,
+            })
+            .await
+            .unwrap();
+        rx.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn start_saves_desired_running_true() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        let config = StartConfig {
+            service_label: "Syncing".into(),
+            ..Default::default()
+        };
+        send_start_with_config(&handle, config, app.handle().clone())
+            .await
+            .unwrap();
+
+        // Give the actor a moment to process the save (it happens after spawn).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let last = backend
+            .last_save()
+            .expect("should have saved desired state");
+        assert!(
+            last.desired_running,
+            "desired_running should be true after start"
+        );
+        assert!(
+            last.last_start_config.is_some(),
+            "last_start_config should be set"
+        );
+        assert!(
+            last.last_start_epoch_ms.is_some(),
+            "last_start_epoch_ms should be set"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_saves_desired_running_false_with_cleared_recovery() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+
+        // Simulate some recovery state that should be cleared on stop.
+        {
+            let mut saves = backend.saves.lock().unwrap();
+            let last = saves.last_mut().unwrap();
+            last.recovery_pending = true;
+            last.recovery_reason = Some("boot".into());
+            last.restart_attempt = 3;
+        }
+
+        send_stop(&handle).await.unwrap();
+
+        let last = backend.last_save().expect("should have saved on stop");
+        assert!(
+            !last.desired_running,
+            "desired_running should be false after stop"
+        );
+        assert!(
+            last.last_start_config.is_none(),
+            "last_start_config should be cleared"
+        );
+        assert!(
+            last.last_start_epoch_ms.is_none(),
+            "last_start_epoch_ms should be cleared"
+        );
+        assert!(!last.recovery_pending, "recovery_pending should be cleared");
+        assert_eq!(
+            last.recovery_reason, None,
+            "recovery_reason should be cleared"
+        );
+        assert_eq!(last.restart_attempt, 0, "restart_attempt should be cleared");
+    }
+
+    #[tokio::test]
+    async fn set_desired_running_saves_without_affecting_is_running() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_backend(Some(backend.clone()));
+
+        // Not running initially
+        assert!(!send_is_running(&handle).await);
+
+        // Set desired_running=true WITHOUT starting
+        let config = StartConfig {
+            service_label: "AutoRestart".into(),
+            ..Default::default()
+        };
+        send_set_desired_running(&handle, true, Some(config.clone()))
+            .await
+            .unwrap();
+
+        // Should NOT be running
+        assert!(
+            !send_is_running(&handle).await,
+            "SetDesiredRunning should not affect is_running"
+        );
+
+        // But desired state should be saved
+        let last = backend.last_save().expect("should have saved");
+        assert!(last.desired_running);
+        assert!(last.last_start_config.is_some());
+
+        // Now set desired_running=false
+        send_set_desired_running(&handle, false, None)
+            .await
+            .unwrap();
+
+        assert!(!send_is_running(&handle).await);
+
+        let last = backend.last_save().expect("should have saved");
+        assert!(!last.desired_running);
+    }
+
+    #[tokio::test]
+    async fn no_backend_means_no_panic() {
+        // No backend — should work fine without panicking.
+        let handle = setup_manager();
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        send_stop(&handle).await.unwrap();
+
+        send_set_desired_running(&handle, true, None).await.unwrap();
+        // If we got here, no panic occurred.
+    }
+
+    #[tokio::test]
+    async fn start_config_serialized_in_desired_state() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        let config = StartConfig {
+            service_label: "CustomLabel".into(),
+            foreground_service_type: "specialUse".into(),
+        };
+        send_start_with_config(&handle, config, app.handle().clone())
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let last = backend.last_save().expect("should have saved");
+        let saved_config = last.last_start_config.expect("config should be set");
+        assert_eq!(saved_config["serviceLabel"], "CustomLabel");
+        assert_eq!(saved_config["foregroundServiceType"], "specialUse");
+    }
+
+    // ── GetState population from desired-state backend (Step 4, task 1c5e) ──
+
+    #[tokio::test]
+    async fn get_state_returns_desired_running_true_after_start() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let status = send_get_state(&handle).await;
+        assert_eq!(
+            status.desired_running,
+            Some(true),
+            "desired_running should be Some(true) after start with backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_state_returns_desired_running_false_after_stop() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        send_stop(&handle).await.unwrap();
+
+        let status = send_get_state(&handle).await;
+        assert_eq!(
+            status.desired_running,
+            Some(false),
+            "desired_running should be Some(false) after stop with backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_state_returns_none_fields_when_no_backend() {
+        let handle = setup_manager();
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let status = send_get_state(&handle).await;
+        assert_eq!(status.desired_running, None);
+        assert_eq!(status.native_state, None);
+        assert_eq!(status.last_start_config, None);
+        assert_eq!(status.last_heartbeat_at, None);
+        assert_eq!(status.restart_attempt, None);
+        assert_eq!(status.recovery_reason, None);
+        assert_eq!(status.platform_error, None);
+    }
+
+    #[tokio::test]
+    async fn get_state_returns_last_start_config_from_backend() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        let config = StartConfig {
+            service_label: "TestService".into(),
+            foreground_service_type: "specialUse".into(),
+        };
+        send_start_with_config(&handle, config, app.handle().clone())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let status = send_get_state(&handle).await;
+        let cfg = status
+            .last_start_config
+            .expect("last_start_config should be populated from backend");
+        assert_eq!(cfg.service_label, "TestService");
+        assert_eq!(cfg.foreground_service_type, "specialUse");
+    }
+
+    #[tokio::test]
+    async fn get_state_populates_all_desired_state_fields() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Mutate the backend state to simulate recovery fields being set.
+        {
+            let mut saves = backend.saves.lock().unwrap();
+            let last = saves.last_mut().unwrap();
+            last.last_native_state = Some("timeout".into());
+            last.last_platform_error = Some("FGS timed out".into());
+            last.restart_attempt = 3;
+            last.recovery_reason = Some("boot recovery".into());
+            last.last_heartbeat_epoch_ms = Some(1700000005000);
+        }
+
+        let status = send_get_state(&handle).await;
+        assert_eq!(status.desired_running, Some(true));
+        assert_eq!(status.native_state, Some(NativeState::Timeout));
+        assert_eq!(status.platform_error, Some("FGS timed out".into()));
+        assert_eq!(status.restart_attempt, Some(3));
+        assert_eq!(status.recovery_reason, Some("boot recovery".into()));
+        assert_eq!(status.last_heartbeat_at, Some(1700000005000));
+    }
+
+    #[tokio::test]
+    async fn get_state_returns_platform_mode() {
+        let handle = setup_manager();
+
+        let status = send_get_state(&handle).await;
+        // On desktop (Linux test runner), should be DesktopInProcess.
+        assert_eq!(
+            status.platform_mode,
+            Some(LifecycleMode::DesktopInProcess),
+            "platform_mode should be populated even without backend"
+        );
+    }
+
+    // ── Step 13: EnableAutoRestart / DisableAutoRestart / GetDesiredState tests ──
+
+    async fn send_enable_auto_restart(
+        handle: &ServiceManagerHandle<tauri::test::MockRuntime>,
+        config: Option<StartConfig>,
+    ) -> Result<(), ServiceError> {
+        let (tx, rx) = oneshot::channel();
+        handle
+            .cmd_tx
+            .send(ManagerCommand::EnableAutoRestart { config, reply: tx })
+            .await
+            .unwrap();
+        rx.await.unwrap()
+    }
+
+    async fn send_disable_auto_restart(
+        handle: &ServiceManagerHandle<tauri::test::MockRuntime>,
+    ) -> Result<(), ServiceError> {
+        let (tx, rx) = oneshot::channel();
+        handle
+            .cmd_tx
+            .send(ManagerCommand::DisableAutoRestart { reply: tx })
+            .await
+            .unwrap();
+        rx.await.unwrap()
+    }
+
+    async fn send_get_desired_state(
+        handle: &ServiceManagerHandle<tauri::test::MockRuntime>,
+    ) -> Option<DesiredState> {
+        let (tx, rx) = oneshot::channel();
+        handle
+            .cmd_tx
+            .send(ManagerCommand::GetDesiredState { reply: tx })
+            .await
+            .unwrap();
+        rx.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn enable_auto_restart_saves_true_without_starting() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_backend(Some(backend.clone()));
+
+        assert!(!send_is_running(&handle).await);
+
+        send_enable_auto_restart(&handle, None).await.unwrap();
+
+        // Should NOT start the service
+        assert!(
+            !send_is_running(&handle).await,
+            "enableAutoRestart should not start the service"
+        );
+
+        // But desired state should be saved as true
+        let ds = backend.last_save().expect("should have saved");
+        assert!(ds.desired_running, "desired_running should be true");
+    }
+
+    #[tokio::test]
+    async fn disable_auto_restart_saves_false_without_stopping() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        // Start the service first
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        assert!(send_is_running(&handle).await);
+
+        // Disable auto restart
+        send_disable_auto_restart(&handle).await.unwrap();
+
+        // Should NOT stop the service
+        assert!(
+            send_is_running(&handle).await,
+            "disableAutoRestart should not stop the service"
+        );
+
+        // But desired state should be saved as false
+        let ds = backend.last_save().expect("should have saved");
+        assert!(!ds.desired_running, "desired_running should be false");
+    }
+
+    #[tokio::test]
+    async fn enable_auto_restart_with_config_stores_config() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_backend(Some(backend.clone()));
+
+        let config = StartConfig {
+            service_label: "MyService".into(),
+            foreground_service_type: "specialUse".into(),
+        };
+        send_enable_auto_restart(&handle, Some(config.clone()))
+            .await
+            .unwrap();
+
+        let ds = backend.last_save().expect("should have saved");
+        assert!(ds.desired_running);
+        let saved_config = ds.last_start_config.expect("config should be stored");
+        assert_eq!(saved_config["serviceLabel"], "MyService");
+        assert_eq!(saved_config["foregroundServiceType"], "specialUse");
+        assert!(
+            ds.last_start_epoch_ms.is_some(),
+            "should set last_start_epoch_ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn disable_auto_restart_clears_recovery_fields() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_backend(Some(backend.clone()));
+
+        // Enable with some recovery state
+        send_enable_auto_restart(&handle, None).await.unwrap();
+        {
+            let mut saves = backend.saves.lock().unwrap();
+            let last = saves.last_mut().unwrap();
+            last.recovery_pending = true;
+            last.recovery_reason = Some("boot".into());
+            last.restart_attempt = 5;
+        }
+
+        // Disable should clear recovery
+        send_disable_auto_restart(&handle).await.unwrap();
+
+        let ds = backend.last_save().expect("should have saved");
+        assert!(!ds.desired_running);
+        assert!(!ds.recovery_pending, "recovery_pending should be cleared");
+        assert_eq!(
+            ds.recovery_reason, None,
+            "recovery_reason should be cleared"
+        );
+        assert_eq!(ds.restart_attempt, 0, "restart_attempt should be cleared");
+    }
+
+    #[tokio::test]
+    async fn get_desired_state_returns_current_state() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_backend(Some(backend.clone()));
+
+        // Initially returns default
+        let ds = send_get_desired_state(&handle).await;
+        assert!(ds.is_some());
+        assert!(!ds.unwrap().desired_running);
+
+        // After enable, returns updated state
+        let config = StartConfig {
+            service_label: "Test".into(),
+            ..Default::default()
+        };
+        send_enable_auto_restart(&handle, Some(config))
+            .await
+            .unwrap();
+
+        let ds = send_get_desired_state(&handle)
+            .await
+            .expect("should return state");
+        assert!(ds.desired_running);
+        assert!(ds.last_start_config.is_some());
+    }
+
+    #[tokio::test]
+    async fn get_desired_state_returns_none_without_backend() {
+        let handle = setup_manager();
+        let ds = send_get_desired_state(&handle).await;
+        assert!(
+            ds.is_none(),
+            "GetDesiredState should return None without a backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn enable_disable_no_backend_no_panic() {
+        let handle = setup_manager();
+
+        // These should succeed (no-op) without a backend
+        send_enable_auto_restart(&handle, None).await.unwrap();
+        send_disable_auto_restart(&handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_state_stop_clears_start_config_and_recovery() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        let config = StartConfig {
+            service_label: "Syncing".into(),
+            ..Default::default()
+        };
+        send_start_with_config(&handle, config, app.handle().clone())
+            .await
+            .unwrap();
+        send_stop(&handle).await.unwrap();
+
+        let status = send_get_state(&handle).await;
+        assert_eq!(status.desired_running, Some(false));
+        assert_eq!(
+            status.last_start_config, None,
+            "last_start_config should be None after stop"
+        );
+        assert_eq!(
+            status.restart_attempt, None,
+            "restart_attempt should be None after stop"
+        );
+        assert_eq!(
+            status.recovery_reason, None,
+            "recovery_reason should be None after stop"
         );
     }
 }

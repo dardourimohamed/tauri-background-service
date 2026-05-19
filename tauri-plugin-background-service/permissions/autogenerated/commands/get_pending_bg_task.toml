@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-get-pending-bg-task"
+description = "Enables the get_pending_bg_task command without any pre-configured scope."
+commands.allow = ["get_pending_bg_task"]
+
+[[permission]]
+identifier = "deny-get-pending-bg-task"
+description = "Denies the get_pending_bg_task command without any pre-configured scope."
+commands.deny = ["get_pending_bg_task"]

@@ -44,3 +44,4 @@ tauri-plugin = { version = "2", features = ["build"] }
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }
+tempfile = "3"

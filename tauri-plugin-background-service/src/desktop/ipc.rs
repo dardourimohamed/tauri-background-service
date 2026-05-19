@@ -29,6 +29,17 @@ pub enum IpcRequest {
     IsRunning,
     /// Query the current service lifecycle state.
     GetState,
+    /// Enable auto-restart: persist desired_running=true without starting.
+    EnableAutoRestart {
+        /// Optional start config to store for recovery.
+        config: Option<crate::models::StartConfig>,
+    },
+    /// Disable auto-restart: persist desired_running=false without stopping.
+    DisableAutoRestart,
+    /// Get the persisted desired-state.
+    GetDesiredState,
+    /// Validate background service setup prerequisites.
+    ValidateSetup,
 }
 
 /// IPC response sent from the headless service to the GUI process.

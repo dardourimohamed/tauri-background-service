@@ -77,7 +77,7 @@ pub fn setup_server_with_factory(
     let app = tauri::test::mock_app();
     let (cmd_tx, cmd_rx) = mpsc::channel(16);
     tokio::spawn(manager_loop(
-        cmd_rx, factory, 0.0, 0.0, 0.0, 0.0, false, false,
+        cmd_rx, factory, 0.0, 0.0, 0.0, 0.0, false, false, None,
     ));
     let server = IpcServer::bind(path.clone(), cmd_tx, app.handle().clone()).unwrap();
     let event_tx = server.event_sender();
@@ -109,7 +109,7 @@ pub fn setup_server_raw(
     let app = tauri::test::mock_app();
     let (cmd_tx, cmd_rx) = mpsc::channel(16);
     tokio::spawn(manager_loop(
-        cmd_rx, factory, 0.0, 0.0, 0.0, 0.0, false, false,
+        cmd_rx, factory, 0.0, 0.0, 0.0, 0.0, false, false, None,
     ));
     let server = IpcServer::bind(path.clone(), cmd_tx, app.handle().clone()).unwrap();
     let shutdown = CancellationToken::new();

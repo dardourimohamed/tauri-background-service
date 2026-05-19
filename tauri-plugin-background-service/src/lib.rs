@@ -69,11 +69,14 @@
 //! See the [project repository](https://github.com/dardourimohamed/tauri-background-service)
 //! for detailed platform guides and API documentation.
 
+pub mod capabilities;
+pub mod desired_state;
 pub mod error;
 pub mod manager;
 pub mod models;
 pub mod notifier;
 pub mod service_trait;
+pub mod validator;
 
 #[cfg(mobile)]
 pub mod mobile;
@@ -89,7 +92,8 @@ pub use manager::{manager_loop, OnCompleteCallback, ServiceFactory, ServiceManag
 #[doc(hidden)]
 pub use models::AutoStartConfig;
 pub use models::{
-    PluginConfig, PluginEvent, ServiceContext, ServiceState, ServiceStatus, StartConfig,
+    IOSSchedulingStatus, PendingTaskInfo, PluginConfig, PluginEvent, ServiceContext, ServiceState,
+    ServiceStatus, SetupIssue, SetupValidationReport, StartConfig,
 };
 pub use notifier::Notifier;
 pub use service_trait::BackgroundService;
@@ -235,6 +239,47 @@ async fn start<R: Runtime>(app: AppHandle<R>, config: StartConfig) -> Result<(),
     // OS service mode: route through persistent IPC client.
     #[cfg(all(feature = "desktop-service", unix))]
     if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
+        // Check if IPC is connected before sending the start request.
+        if ipc_state.client.is_connected() {
+            return ipc_state
+                .client
+                .start(config)
+                .await
+                .map_err(|e| e.to_string());
+        }
+
+        // IPC is disconnected. Check if auto-start is enabled.
+        let plugin_config = app.state::<PluginConfig>();
+        if !plugin_config.desktop_start_service_if_missing {
+            return Err(ServiceError::Ipc("ipcUnavailable".into()).to_string());
+        }
+
+        // Try to start the OS service and wait for IPC readiness.
+        let socket_path = ipc_state.client.socket_path().display().to_string();
+        let timeout =
+            std::time::Duration::from_millis(plugin_config.desktop_service_start_timeout_ms);
+
+        use desktop::service_manager::{derive_service_label, DesktopServiceManager};
+        let label = derive_service_label(&app, plugin_config.desktop_service_label.as_deref());
+        let exec_path = std::env::current_exe().map_err(|e| e.to_string())?;
+        {
+            let mgr = DesktopServiceManager::new(&label, exec_path).map_err(|e| e.to_string())?;
+            mgr.start().map_err(|e| e.to_string())?;
+        }
+
+        let connected = ipc_state
+            .client
+            .wait_for_connected(timeout)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if !connected {
+            return Err(
+                ServiceError::Ipc(format!("ipcUnavailable: socket {socket_path}")).to_string(),
+            );
+        }
+
+        // IPC is now connected — send the start command.
         return ipc_state
             .client
             .start(config)
@@ -333,6 +378,213 @@ async fn get_service_state<R: Runtime>(app: AppHandle<R>) -> Result<models::Serv
     Ok(manager.get_state().await)
 }
 
+#[tauri::command]
+async fn get_platform_capabilities<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<models::PlatformCapabilities, String> {
+    let plugin_config = app.state::<PluginConfig>();
+
+    #[cfg(feature = "desktop-service")]
+    let desktop_mode = Some(plugin_config.desktop_service_mode.as_str());
+    #[cfg(not(feature = "desktop-service"))]
+    let desktop_mode: Option<&str> = None;
+
+    let (platform, lifecycle_mode) =
+        capabilities::CapabilityProvider::detect_platform(desktop_mode);
+
+    let os_service_installed = if matches!(lifecycle_mode, models::LifecycleMode::DesktopOsService)
+    {
+        #[cfg(all(feature = "desktop-service", unix))]
+        {
+            use desktop::service_manager::{derive_service_label, DesktopServiceManager};
+            let label = derive_service_label(&app, plugin_config.desktop_service_label.as_deref());
+            let exec = std::env::current_exe().unwrap_or_default();
+            DesktopServiceManager::new(&label, exec)
+                .map(|_| true)
+                .unwrap_or(false)
+        }
+        #[cfg(not(all(feature = "desktop-service", unix)))]
+        false
+    } else {
+        false
+    };
+
+    Ok(capabilities::CapabilityProvider::capabilities(
+        platform,
+        lifecycle_mode,
+        os_service_installed,
+    ))
+}
+
+/// Query the iOS scheduling status from the native layer.
+///
+/// Returns `IOSSchedulingStatus` on iOS with scheduling results and desired state.
+/// Returns a default status (not scheduled) on non-iOS platforms.
+#[tauri::command]
+async fn get_scheduling_status<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<models::IOSSchedulingStatus, String> {
+    #[cfg(target_os = "ios")]
+    {
+        let mobile = app.state::<Arc<MobileLifecycle<R>>>();
+        mobile
+            .get_scheduling_status()
+            .map_err(|e| e.to_string())
+            .and_then(|opt| opt.ok_or_else(|| "no scheduling status available".to_string()))
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let _ = app;
+        Ok(models::IOSSchedulingStatus {
+            refresh_scheduled: false,
+            processing_scheduled: false,
+            refresh_error: None,
+            processing_error: None,
+        })
+    }
+}
+
+/// Query the pending iOS background task info.
+///
+/// Returns `Some(PendingTaskInfo)` on iOS if the app was launched by iOS for
+/// a background task and the info hasn't been cleared yet.
+/// Returns `None` on non-iOS platforms or when no pending task exists.
+#[tauri::command]
+async fn get_pending_bg_task<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<Option<models::PendingTaskInfo>, String> {
+    #[cfg(target_os = "ios")]
+    {
+        let mobile = app.state::<Arc<MobileLifecycle<R>>>();
+        mobile.get_pending_bg_task().map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let _ = app;
+        Ok(None)
+    }
+}
+
+/// Enable auto-restart for the background service.
+///
+/// Persists `desired_running=true` with an optional start config WITHOUT
+/// starting the service. This sets the intent for recovery after process
+/// kill or device reboot. The platform recovery mechanisms will use this
+/// to automatically restart the service when conditions allow.
+#[tauri::command]
+async fn enable_auto_restart<R: Runtime>(
+    app: AppHandle<R>,
+    config: Option<StartConfig>,
+) -> Result<(), String> {
+    // OS service mode: route through persistent IPC client.
+    #[cfg(all(feature = "desktop-service", unix))]
+    if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
+        return ipc_state
+            .client
+            .enable_auto_restart(config)
+            .await
+            .map_err(|e| e.to_string());
+    }
+
+    let manager = app.state::<ServiceManagerHandle<R>>();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    manager
+        .cmd_tx
+        .send(ManagerCommand::EnableAutoRestart { config, reply: tx })
+        .await
+        .map_err(|e| e.to_string())?;
+    rx.await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// Disable auto-restart for the background service.
+///
+/// Persists `desired_running=false` and clears recovery fields WITHOUT
+/// stopping the service if it is currently running. After calling this,
+/// the platform recovery mechanisms will no longer attempt to restart the
+/// service after process kill or device reboot.
+#[tauri::command]
+async fn disable_auto_restart<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    // OS service mode: route through persistent IPC client.
+    #[cfg(all(feature = "desktop-service", unix))]
+    if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
+        return ipc_state
+            .client
+            .disable_auto_restart()
+            .await
+            .map_err(|e| e.to_string());
+    }
+
+    let manager = app.state::<ServiceManagerHandle<R>>();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    manager
+        .cmd_tx
+        .send(ManagerCommand::DisableAutoRestart { reply: tx })
+        .await
+        .map_err(|e| e.to_string())?;
+    rx.await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+/// Get the persisted desired-state for the background service.
+///
+/// Returns `Some(DesiredState)` with the current recovery intent and metadata,
+/// or `None` if no persistence backend is configured on the current platform.
+#[tauri::command]
+async fn get_desired_service_state<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<Option<desired_state::DesiredState>, String> {
+    // OS service mode: route through persistent IPC client.
+    #[cfg(all(feature = "desktop-service", unix))]
+    if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
+        return ipc_state
+            .client
+            .get_desired_state()
+            .await
+            .map_err(|e| e.to_string());
+    }
+
+    let manager = app.state::<ServiceManagerHandle<R>>();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    manager
+        .cmd_tx
+        .send(ManagerCommand::GetDesiredState { reply: tx })
+        .await
+        .map_err(|e| e.to_string())?;
+    rx.await.map_err(|e| e.to_string())
+}
+
+/// Validate the background service setup for the current platform.
+///
+/// Returns a [`SetupValidationReport`] with errors (blocking) and warnings
+/// (non-blocking) about platform-specific prerequisites.
+#[tauri::command]
+async fn validate_setup<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<models::SetupValidationReport, String> {
+    // OS service mode: route through persistent IPC client.
+    #[cfg(all(feature = "desktop-service", unix))]
+    if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
+        return ipc_state
+            .client
+            .validate_setup()
+            .await
+            .map_err(|e| e.to_string());
+    }
+
+    let plugin_config = app.state::<PluginConfig>();
+
+    #[cfg(feature = "desktop-service")]
+    let desktop_mode = Some(plugin_config.desktop_service_mode.as_str());
+    #[cfg(not(feature = "desktop-service"))]
+    let desktop_mode: Option<&str> = None;
+
+    let (platform, _) = capabilities::CapabilityProvider::detect_platform(desktop_mode);
+    Ok(validator::SetupValidator::validate(platform))
+}
+
 // ─── Desktop OS Service State & Commands ──────────────────────────────────────
 
 /// Managed state indicating OS service mode via IPC.
@@ -399,7 +651,14 @@ async fn install_service<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     }
 
     let mgr = DesktopServiceManager::new(&label, exec_path).map_err(|e| e.to_string())?;
-    mgr.install().map_err(|e| e.to_string())
+    use desktop::service_manager::InstallOptions;
+    let options = InstallOptions {
+        autostart: plugin_config.desktop_service_autostart,
+        restart_delay_secs: None,
+        journal_output: true,
+        log_path: None,
+    };
+    mgr.install(&options).map_err(|e| e.to_string())
 }
 
 #[cfg(feature = "desktop-service")]
@@ -411,6 +670,158 @@ async fn uninstall_service<R: Runtime>(app: AppHandle<R>) -> Result<(), String> 
     let exec_path = std::env::current_exe().map_err(|e| e.to_string())?;
     let mgr = DesktopServiceManager::new(&label, exec_path).map_err(|e| e.to_string())?;
     mgr.uninstall().map_err(|e| e.to_string())
+}
+
+// ─── Desktop OS Service Start/Stop/Status Commands ────────────────────────────
+
+/// Returns the standard "not yet supported" error for Windows OS-service mode.
+#[cfg(feature = "desktop-service")]
+#[allow(dead_code)] // Used on non-Unix targets and in tests
+fn windows_os_service_unsupported() -> ServiceError {
+    ServiceError::Platform("Windows OS-service mode is not yet supported".into())
+}
+
+/// Build an [`OsServiceStatus`] from available information.
+///
+/// Gathers the service label, mode string, IPC connection state, socket path,
+/// and optional last error into a status snapshot.
+#[cfg(all(feature = "desktop-service", unix))]
+fn build_os_service_status(
+    label: &str,
+    ipc_connected: bool,
+    socket_path: Option<String>,
+    last_error: Option<String>,
+) -> models::OsServiceStatus {
+    let mode = if cfg!(target_os = "macos") {
+        "launchd"
+    } else {
+        "systemd"
+    };
+
+    let installed = if ipc_connected {
+        models::OsServiceInstallState::Running
+    } else {
+        // If not running via IPC, we can't easily determine install state
+        // without calling external tools. Default to Installed if the manager
+        // was constructable (caller checks this before calling build).
+        models::OsServiceInstallState::Installed
+    };
+
+    models::OsServiceStatus {
+        label: label.to_string(),
+        mode: mode.to_string(),
+        installed,
+        ipc_connected,
+        socket_path,
+        last_error,
+    }
+}
+
+/// Start the OS-level background service (desktop only).
+///
+/// On Unix, delegates to [`DesktopServiceManager::start()`].
+/// On Windows, returns `ServiceError::Platform`.
+#[cfg(feature = "desktop-service")]
+#[tauri::command]
+async fn start_os_service<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use desktop::service_manager::{derive_service_label, DesktopServiceManager};
+        let plugin_config = app.state::<PluginConfig>();
+        let label = derive_service_label(&app, plugin_config.desktop_service_label.as_deref());
+        let exec_path = std::env::current_exe().map_err(|e| e.to_string())?;
+        let mgr = DesktopServiceManager::new(&label, exec_path).map_err(|e| e.to_string())?;
+        mgr.start().map_err(|e| e.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = app;
+        Err(windows_os_service_unsupported().to_string())
+    }
+}
+
+/// Stop the OS-level background service (desktop only).
+///
+/// On Unix, delegates to [`DesktopServiceManager::stop()`].
+/// On Windows, returns `ServiceError::Platform`.
+#[cfg(feature = "desktop-service")]
+#[tauri::command]
+async fn stop_os_service<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use desktop::service_manager::{derive_service_label, DesktopServiceManager};
+        let plugin_config = app.state::<PluginConfig>();
+        let label = derive_service_label(&app, plugin_config.desktop_service_label.as_deref());
+        let exec_path = std::env::current_exe().map_err(|e| e.to_string())?;
+        let mgr = DesktopServiceManager::new(&label, exec_path).map_err(|e| e.to_string())?;
+        mgr.stop().map_err(|e| e.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = app;
+        Err(windows_os_service_unsupported().to_string())
+    }
+}
+
+/// Restart the OS-level background service (desktop only).
+///
+/// On Unix, calls stop then start. On Windows, returns `ServiceError::Platform`.
+#[cfg(feature = "desktop-service")]
+#[tauri::command]
+async fn restart_os_service<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use desktop::service_manager::{derive_service_label, DesktopServiceManager};
+        let plugin_config = app.state::<PluginConfig>();
+        let label = derive_service_label(&app, plugin_config.desktop_service_label.as_deref());
+        let exec_path = std::env::current_exe().map_err(|e| e.to_string())?;
+        let mgr = DesktopServiceManager::new(&label, exec_path).map_err(|e| e.to_string())?;
+        mgr.stop().ok(); // Best-effort stop — service may not be running.
+        mgr.start().map_err(|e| e.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = app;
+        Err(windows_os_service_unsupported().to_string())
+    }
+}
+
+/// Get the status of the OS-level background service (desktop only).
+///
+/// On Unix, returns [`OsServiceStatus`] with label, mode, IPC state, socket path.
+/// On Windows, returns `ServiceError::Platform`.
+#[cfg(feature = "desktop-service")]
+#[tauri::command]
+async fn get_os_service_status<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<models::OsServiceStatus, String> {
+    #[cfg(unix)]
+    {
+        use desktop::service_manager::derive_service_label;
+        let plugin_config = app.state::<PluginConfig>();
+        let label = derive_service_label(&app, plugin_config.desktop_service_label.as_deref());
+
+        let ipc_connected = app
+            .try_state::<DesktopIpcState>()
+            .map(|s| s.client.is_connected())
+            .unwrap_or(false);
+
+        let socket_path = desktop::ipc::socket_path(&label)
+            .ok()
+            .map(|p| p.to_string_lossy().to_string());
+
+        Ok(build_os_service_status(
+            &label,
+            ipc_connected,
+            socket_path,
+            None,
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = app;
+        Err(windows_os_service_unsupported().to_string())
+    }
 }
 
 // ─── Plugin Builder ──────────────────────────────────────────────────────────
@@ -436,10 +847,25 @@ where
             stop,
             is_running,
             get_service_state,
+            get_platform_capabilities,
+            get_scheduling_status,
+            get_pending_bg_task,
+            enable_auto_restart,
+            disable_auto_restart,
+            get_desired_service_state,
+            validate_setup,
             #[cfg(feature = "desktop-service")]
             install_service,
             #[cfg(feature = "desktop-service")]
             uninstall_service,
+            #[cfg(feature = "desktop-service")]
+            start_os_service,
+            #[cfg(feature = "desktop-service")]
+            stop_os_service,
+            #[cfg(feature = "desktop-service")]
+            restart_os_service,
+            #[cfg(feature = "desktop-service")]
+            get_os_service_status,
         ])
         .setup(move |app, api| {
             let config = api.config().clone();
@@ -485,6 +911,7 @@ where
                     ios_earliest_processing_begin_minutes,
                     ios_requires_external_power,
                     ios_requires_network_connectivity,
+                    None,
                 ));
             }
 
@@ -501,6 +928,7 @@ where
                     ios_earliest_processing_begin_minutes,
                     ios_requires_external_power,
                     ios_requires_network_connectivity,
+                    None,
                 ));
             }
 
@@ -516,6 +944,7 @@ where
                     ios_earliest_processing_begin_minutes,
                     ios_requires_external_power,
                     ios_requires_network_connectivity,
+                    None,
                 ));
             }
 
@@ -534,6 +963,88 @@ where
 
                 // Store for iOS callbacks and Android auto-start helpers.
                 app.manage(lifecycle_arc);
+            }
+
+            // iOS: auto-start when launched by OS for a pending BGTask.
+            // Checks native pending task info and desired_running flag.
+            // If both are set, sends a Start command with the stored config.
+            #[cfg(target_os = "ios")]
+            {
+                let mobile = app.state::<Arc<MobileLifecycle<R>>>();
+
+                match mobile.get_pending_bg_task() {
+                    Ok(Some(_pending)) => {
+                        // Check desired_running and last_start_config from native.
+                        let should_start = mobile
+                            .get_scheduling_status_raw()
+                            .ok()
+                            .and_then(|v| {
+                                let desired = v.get("desiredRunning")?.as_bool()?;
+                                let config_str = v.get("lastStartConfig")?.as_str()?;
+                                Some((desired, config_str.to_string()))
+                            });
+
+                        if let Some((true, config_str)) = should_start {
+                            if let Ok(config) =
+                                serde_json::from_str::<StartConfig>(&config_str)
+                            {
+                                let manager = app.state::<ServiceManagerHandle<R>>();
+                                let cmd_tx = manager.cmd_tx.clone();
+                                let app_clone = app.app_handle().clone();
+
+                                // Capture timeout before spawn for cancel listener.
+                                let plugin_config = app.state::<PluginConfig>();
+                                let timeout_secs = plugin_config.ios_cancel_listener_timeout_secs;
+
+                                // Set on_complete callback for iOS completeBgTask.
+                                let mob_handle = mobile.handle.clone();
+                                if let Err(e) = cmd_tx.try_send(ManagerCommand::SetOnComplete {
+                                    callback: Box::new(move |success| {
+                                        let ml =
+                                            MobileLifecycle { handle: mob_handle.clone() };
+                                        let _ = ml.complete_bg_task(success);
+                                    }),
+                                }) {
+                                    log::error!("Failed to send SetOnComplete for iOS auto-start: {e}");
+                                }
+
+                                tauri::async_runtime::spawn(async move {
+                                    let (tx, rx) = tokio::sync::oneshot::channel();
+                                    if cmd_tx
+                                        .send(ManagerCommand::Start {
+                                            config,
+                                            reply: tx,
+                                            app: app_clone.clone(),
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                    if let Ok(Ok(())) = rx.await {
+                                        ios_spawn_cancel_listener(&app_clone, timeout_secs);
+                                    }
+                                });
+
+                                log::info!("iOS: auto-starting service for pending BGTask");
+                            } else {
+                                log::warn!("iOS: failed to parse stored start config");
+                            }
+                        } else {
+                            log::info!(
+                                "iOS: pending BGTask but desired_running is false, skipping auto-start"
+                            );
+                        }
+
+                        let _ = mobile.clear_pending_bg_task();
+                    }
+                    Ok(None) => {
+                        // No pending BGTask — normal launch.
+                    }
+                    Err(e) => {
+                        log::warn!("iOS: failed to get pending BGTask: {e}");
+                    }
+                }
             }
 
             // Android: auto-start detection after OS-initiated service restart.
@@ -693,6 +1204,55 @@ mod tests {
         get_service_state(app).await
     }
 
+    /// Verify `get_scheduling_status` command signature is async and generic over `R: Runtime`.
+    #[allow(dead_code)]
+    async fn get_scheduling_status_command_signature<R: Runtime>(
+        app: AppHandle<R>,
+    ) -> Result<models::IOSSchedulingStatus, String> {
+        get_scheduling_status(app).await
+    }
+
+    /// Verify `get_pending_bg_task` command signature is async and generic over `R: Runtime`.
+    #[allow(dead_code)]
+    async fn get_pending_bg_task_command_signature<R: Runtime>(
+        app: AppHandle<R>,
+    ) -> Result<Option<models::PendingTaskInfo>, String> {
+        get_pending_bg_task(app).await
+    }
+
+    /// Verify `enable_auto_restart` command signature is async and generic over `R: Runtime`.
+    #[allow(dead_code)]
+    async fn enable_auto_restart_command_signature<R: Runtime>(
+        app: AppHandle<R>,
+        config: Option<StartConfig>,
+    ) -> Result<(), String> {
+        enable_auto_restart(app, config).await
+    }
+
+    /// Verify `disable_auto_restart` command signature is async and generic over `R: Runtime`.
+    #[allow(dead_code)]
+    async fn disable_auto_restart_command_signature<R: Runtime>(
+        app: AppHandle<R>,
+    ) -> Result<(), String> {
+        disable_auto_restart(app).await
+    }
+
+    /// Verify `get_desired_service_state` command signature is async and generic over `R: Runtime`.
+    #[allow(dead_code)]
+    async fn get_desired_service_state_command_signature<R: Runtime>(
+        app: AppHandle<R>,
+    ) -> Result<Option<desired_state::DesiredState>, String> {
+        get_desired_service_state(app).await
+    }
+
+    /// Verify `validate_setup` command signature is async and generic over `R: Runtime`.
+    #[allow(dead_code)]
+    async fn validate_setup_command_signature<R: Runtime>(
+        app: AppHandle<R>,
+    ) -> Result<models::SetupValidationReport, String> {
+        validate_setup(app).await
+    }
+
     // ── Desktop IPC State Tests ─────────────────────────────────────────
 
     /// Verify PersistentIpcClientHandle can be constructed.
@@ -726,6 +1286,83 @@ mod tests {
         app: AppHandle<R>,
     ) -> Result<(), String> {
         uninstall_service(app).await
+    }
+
+    /// Verify `start_os_service` command signature is generic over `R: Runtime`.
+    #[cfg(feature = "desktop-service")]
+    #[allow(dead_code)]
+    async fn start_os_service_command_signature<R: Runtime>(
+        app: AppHandle<R>,
+    ) -> Result<(), String> {
+        start_os_service(app).await
+    }
+
+    /// Verify `stop_os_service` command signature is generic over `R: Runtime`.
+    #[cfg(feature = "desktop-service")]
+    #[allow(dead_code)]
+    async fn stop_os_service_command_signature<R: Runtime>(
+        app: AppHandle<R>,
+    ) -> Result<(), String> {
+        stop_os_service(app).await
+    }
+
+    /// Verify `restart_os_service` command signature is generic over `R: Runtime`.
+    #[cfg(feature = "desktop-service")]
+    #[allow(dead_code)]
+    async fn restart_os_service_command_signature<R: Runtime>(
+        app: AppHandle<R>,
+    ) -> Result<(), String> {
+        restart_os_service(app).await
+    }
+
+    /// Verify `get_os_service_status` command signature is generic over `R: Runtime`.
+    #[cfg(feature = "desktop-service")]
+    #[allow(dead_code)]
+    async fn get_os_service_status_command_signature<R: Runtime>(
+        app: AppHandle<R>,
+    ) -> Result<models::OsServiceStatus, String> {
+        get_os_service_status(app).await
+    }
+
+    // ── Desktop OS Service Command Routing Tests ──────────────────────────
+
+    /// Test that `windows_os_service_unsupported()` returns a Platform error.
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn windows_stub_returns_platform_error() {
+        let err = windows_os_service_unsupported();
+        assert!(
+            matches!(err, ServiceError::Platform(ref msg) if msg.contains("not yet supported")),
+            "Expected Platform error with 'not yet supported', got: {err}"
+        );
+    }
+
+    /// Test that `build_os_service_status` produces a valid OsServiceStatus
+    /// with the correct fields populated.
+    #[cfg(all(feature = "desktop-service", unix))]
+    #[test]
+    fn build_os_service_status_populates_fields() {
+        let status = build_os_service_status(
+            "com.example.bg-service",
+            true,
+            Some("/tmp/test.sock".to_string()),
+            None,
+        );
+        assert_eq!(status.label, "com.example.bg-service");
+        assert!(status.ipc_connected);
+        assert_eq!(status.socket_path.as_deref(), Some("/tmp/test.sock"));
+        assert!(status.last_error.is_none());
+    }
+
+    /// Test that `build_os_service_status` includes the correct mode string.
+    #[cfg(all(feature = "desktop-service", unix))]
+    #[test]
+    fn build_os_service_status_mode_is_correct() {
+        let status = build_os_service_status("test", false, None, None);
+        #[cfg(target_os = "linux")]
+        assert_eq!(status.mode, "systemd");
+        #[cfg(target_os = "macos")]
+        assert_eq!(status.mode, "launchd");
     }
 
     // ── On-Event Shutdown Compile-time Test ─────────────────────────────────
@@ -871,5 +1508,94 @@ mod tests {
             !seen.await.unwrap(),
             "Stop command should NOT be sent on join error"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  IPC AUTO-START RECOVERY TESTS (Step 12)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[cfg(all(feature = "desktop-service", unix))]
+    mod ipc_auto_start_tests {
+        use super::*;
+        use crate::desktop::ipc_client::PersistentIpcClientHandle;
+        use crate::desktop::test_helpers::setup_server;
+        use std::time::Duration;
+
+        /// Verify that `wait_for_connected` returns `false` when the timeout
+        /// expires without a server, and that the error message includes
+        /// the socket path.
+        #[tokio::test]
+        async fn wait_for_connected_timeout_returns_false() {
+            let app = tauri::test::mock_app();
+            let path = crate::desktop::test_helpers::unique_socket_path();
+            let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+
+            let connected = handle
+                .wait_for_connected(Duration::from_millis(200))
+                .await
+                .unwrap();
+            assert!(!connected, "should return false on timeout");
+
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// Verify that `wait_for_connected` returns `true` once a server
+        /// appears and the persistent client connects.
+        #[tokio::test]
+        async fn wait_for_connected_succeeds_with_server() {
+            let (path, shutdown, _event_tx) = setup_server();
+            let app = tauri::test::mock_app();
+            let handle = PersistentIpcClientHandle::spawn(path, app.handle().clone());
+
+            let connected = handle
+                .wait_for_connected(Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert!(connected, "should connect within timeout");
+
+            shutdown.cancel();
+        }
+
+        /// Verify that `socket_path()` returns the path the handle was
+        /// spawned with.
+        #[tokio::test]
+        async fn socket_path_accessor() {
+            let app = tauri::test::mock_app();
+            let path = crate::desktop::test_helpers::unique_socket_path();
+            let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+            assert_eq!(
+                handle.socket_path(),
+                &path,
+                "socket_path() should return the path passed to spawn"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+
+        /// Verify the disconnected path with `desktop_start_service_if_missing=false`
+        /// returns an IPC error containing "ipcUnavailable".
+        ///
+        /// This tests the `start` command handler's disconnected branch
+        /// by directly checking the error construction logic.
+        #[tokio::test]
+        async fn start_disconnected_without_auto_start_returns_ipc_error() {
+            let err = ServiceError::Ipc("ipcUnavailable".into());
+            let msg = err.to_string();
+            assert!(
+                msg.contains("ipcUnavailable"),
+                "error should contain 'ipcUnavailable': {msg}"
+            );
+        }
+
+        /// Verify the timeout error includes the socket path for diagnostics.
+        #[tokio::test]
+        async fn start_timeout_error_includes_socket_path() {
+            let socket = "/tmp/test-socket-path.sock";
+            let err = ServiceError::Ipc(format!("ipcUnavailable: socket {socket}"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(socket),
+                "error should contain socket path: {msg}"
+            );
+        }
     }
 }

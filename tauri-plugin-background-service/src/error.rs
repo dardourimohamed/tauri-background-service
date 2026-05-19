@@ -46,6 +46,16 @@ pub enum ServiceError {
     #[cfg(feature = "desktop-service")]
     #[error("IPC error: {0}")]
     Ipc(String),
+
+    /// Failed to start the OS service (desktop only).
+    #[cfg(feature = "desktop-service")]
+    #[error("Service start failed: {0}")]
+    ServiceStart(String),
+
+    /// Failed to stop the OS service (desktop only).
+    #[cfg(feature = "desktop-service")]
+    #[error("Service stop failed: {0}")]
+    ServiceStop(String),
 }
 
 // ─── From impls for mobile error types ─────────────────────────────────────
@@ -216,6 +226,40 @@ mod tests {
             let err = ServiceError::Ipc("timeout".into());
             let cloned = err.clone();
             assert_eq!(err.to_string(), cloned.to_string());
+        }
+
+        #[test]
+        fn display_service_start() {
+            let msg = "systemd failed".to_string();
+            assert_eq!(
+                ServiceError::ServiceStart(msg.clone()).to_string(),
+                format!("Service start failed: {msg}")
+            );
+        }
+
+        #[test]
+        fn display_service_stop() {
+            let msg = "not running".to_string();
+            assert_eq!(
+                ServiceError::ServiceStop(msg.clone()).to_string(),
+                format!("Service stop failed: {msg}")
+            );
+        }
+
+        #[test]
+        fn serde_roundtrip_service_start() {
+            let err = ServiceError::ServiceStart("fail".into());
+            let json = serde_json::to_string(&err).unwrap();
+            let de: ServiceError = serde_json::from_str(&json).unwrap();
+            assert!(matches!(de, ServiceError::ServiceStart(ref s) if s == "fail"));
+        }
+
+        #[test]
+        fn serde_roundtrip_service_stop() {
+            let err = ServiceError::ServiceStop("fail".into());
+            let json = serde_json::to_string(&err).unwrap();
+            let de: ServiceError = serde_json::from_str(&json).unwrap();
+            assert!(matches!(de, ServiceError::ServiceStop(ref s) if s == "fail"));
         }
     }
 }

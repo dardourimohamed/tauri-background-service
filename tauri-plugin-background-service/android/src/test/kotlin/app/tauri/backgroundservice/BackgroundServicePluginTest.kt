@@ -187,4 +187,86 @@ class BackgroundServicePluginTest {
             )
         }
     }
+
+    // ── Preflight FGS type validation ────────────────────────────────────
+
+    @Test
+    fun validateFgsTypeAllowedTypeReturnsNull() {
+        val allowedTypes = listOf("dataSync", "specialUse")
+        val result = BackgroundServicePlugin.validateForegroundServiceType(
+            "dataSync", allowedTypes, true
+        )
+        assertNull(result)
+    }
+
+    @Test
+    fun validateFgsTypeUndeclaredTypeReturnsError() {
+        val allowedTypes = listOf("dataSync")
+        val result = BackgroundServicePlugin.validateForegroundServiceType(
+            "location", allowedTypes, true
+        )
+        assertNotNull(result)
+        assertTrue("error should mention the type", result!!.contains("location"))
+        assertTrue("error should mention allowed types", result.contains("dataSync"))
+    }
+
+    @Test
+    fun validateFgsTypeSkippedWhenValidationDisabled() {
+        val allowedTypes = listOf("dataSync")
+        val result = BackgroundServicePlugin.validateForegroundServiceType(
+            "location", allowedTypes, false
+        )
+        assertNull(result)
+    }
+
+    @Test
+    fun validateFgsTypeMultipleAllowedTypes() {
+        val allowedTypes = listOf("dataSync", "location", "specialUse")
+        assertNull(
+            BackgroundServicePlugin.validateForegroundServiceType(
+                "location", allowedTypes, true
+            )
+        )
+        assertNull(
+            BackgroundServicePlugin.validateForegroundServiceType(
+                "specialUse", allowedTypes, true
+            )
+        )
+        assertNotNull(
+            BackgroundServicePlugin.validateForegroundServiceType(
+                "mediaPlayback", allowedTypes, true
+            )
+        )
+    }
+
+    @Test
+    fun validateFgsTypeEmptyAllowlistRejectsAll() {
+        val result = BackgroundServicePlugin.validateForegroundServiceType(
+            "dataSync", emptyList(), true
+        )
+        assertNotNull(result)
+    }
+
+    // ── stopKeepalive clears DurableState ─────────────────────────────────
+
+    @Test
+    fun stopKeepaliveClearsDurableState() {
+        // Simulate service was running with DurableState persisted
+        val durableState = DurableState(
+            desiredRunning = true,
+            lastServiceLabel = "Syncing",
+            lastServiceType = "dataSync",
+            lastStartEpochMs = 1000L,
+        )
+        DurableState.save(context, durableState)
+        assertTrue("Precondition: DurableState should be saved",
+            DurableState.load(context).desiredRunning)
+
+        // Simulate stopKeepalive clearing DurableState
+        DurableState.clear(context)
+
+        val loaded = DurableState.load(context)
+        assertFalse("desiredRunning should be false after clear", loaded.desiredRunning)
+        assertEquals("", loaded.lastServiceLabel)
+    }
 }

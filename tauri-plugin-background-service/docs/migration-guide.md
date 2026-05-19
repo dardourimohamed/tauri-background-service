@@ -194,6 +194,111 @@ When a breaking change is documented, it follows this format:
 2. Another concrete action
 ```
 
+## 0.5 → 0.6 Migration
+
+There are **no breaking changes** in 0.6. All 0.5 code continues to work unchanged.
+
+### What's New
+
+| Feature | Platform | Description |
+|---------|----------|-------------|
+| `getPlatformCapabilities()` | All | Reports platform-specific background execution guarantees |
+| Extended `ServiceStatus` | All | New optional fields: `desiredRunning`, `nativeState`, `platformMode`, `lastHeartbeatAt`, `restartAttempt`, `recoveryReason`, `platformError` |
+| `enableAutoRestart(config?)` | All | Persists intent to restart without starting the service now |
+| `disableAutoRestart()` | All | Clears the auto-restart flag without stopping the service |
+| `getDesiredServiceState()` | All | Reads the persisted desired-state (survives process kill) |
+| `validateBackgroundServiceSetup()` | All | Checks platform prerequisites and returns errors/warnings |
+| `normalizeBackgroundServiceError()` | All | Parses unknown errors into typed `BackgroundServiceError` objects |
+| `installService()` / `uninstallService()` | Desktop | Install/uninstall OS-level service (systemd / launchd) |
+| `startOsService()` / `stopOsService()` / `restartOsService()` | Desktop | Manage OS service lifecycle |
+| `getOsServiceStatus()` | Desktop | Query OS service install state, IPC status, socket path |
+| Android boot recovery | Android | `BootReceiver` auto-starts service after reboot (via `enableAutoRestart`) |
+| Android timeout handling | Android | Configurable policies for Android 15 `onTimeout()` (`stop`, `notifyUser`, `scheduleRecovery`) |
+| Android notification customization | Android | Configurable channel, icon, ID, and stop-action button |
+| iOS scheduling result reporting | iOS | Structured `IOSSchedulingStatus` with per-task-type errors |
+| iOS desired state | iOS | `ios_desired_running` persists across app launches |
+| `NativeState` enum | All | `foregroundService`, `bgAppRefresh`, `bgProcessing`, `timeout`, etc. |
+
+### New PluginConfig Fields
+
+All new fields are optional with sensible defaults. Add them to your `tauri.conf.json` only if you need non-default values:
+
+**Android:**
+
+```json
+{
+  "plugins": {
+    "background-service": {
+      "androidForegroundServiceTypes": ["dataSync"],
+      "androidValidateForegroundServiceType": true,
+      "androidOnTimeout": "notifyUser",
+      "androidNotificationChannelId": "bg_service",
+      "androidNotificationChannelName": "Background Service",
+      "androidNotificationId": 9001,
+      "androidNotificationSmallIcon": "ic_notification",
+      "androidShowStopAction": true
+    }
+  }
+}
+```
+
+**iOS:**
+
+```json
+{
+  "plugins": {
+    "background-service": {
+      "iosSafetyTimeoutSecs": 28.0,
+      "iosCancelListenerTimeoutSecs": 14400,
+      "iosProcessingSafetyTimeoutSecs": 0.0,
+      "iosEarliestRefreshBeginMinutes": 15.0,
+      "iosEarliestProcessingBeginMinutes": 15.0,
+      "iosRequiresExternalPower": false,
+      "iosRequiresNetworkConnectivity": false
+    }
+  }
+}
+```
+
+**Desktop (requires `desktop-service` feature):**
+
+```json
+{
+  "plugins": {
+    "background-service": {
+      "desktopServiceMode": "osService",
+      "desktopServiceLabel": "com.example.myapp.background",
+      "desktopServiceAutostart": true,
+      "desktopStartServiceIfMissing": true,
+      "desktopServiceStartTimeoutMs": 5000
+    }
+  }
+}
+```
+
+### New TypeScript Error Handling
+
+Opt-in helper to get typed error codes from rejected promises:
+
+```typescript
+import { normalizeBackgroundServiceError } from "tauri-plugin-background-service";
+
+try {
+  await startService();
+} catch (err) {
+  const typed = normalizeBackgroundServiceError(err);
+  console.log(typed.code);    // "alreadyRunning" | "platform" | "ipc" | ...
+  console.log(typed.message); // human-readable message
+}
+```
+
+### No Action Required For
+
+- Existing `startService()` / `stopService()` / `isServiceRunning()` calls
+- Existing `BackgroundService<R>` trait implementations
+- Existing `onPluginEvent()` listeners
+- Existing `ServiceStatus` consumers — new fields are optional and omitted when not applicable
+
 ## Version History
 
 _No versions with breaking changes yet._

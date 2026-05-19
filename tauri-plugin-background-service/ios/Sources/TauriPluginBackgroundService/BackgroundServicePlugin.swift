@@ -105,6 +105,80 @@ import os.log
     /// BGProcessingTask requires network connectivity (default: false).
     private var requiresNetworkConnectivity: Bool = false
 
+    // MARK: - Pending Task Info
+
+    /// Information about a BGTask that launched the app in the background.
+    /// Queried by Rust on iOS setup to implement auto-start.
+    private struct PendingTaskInfo {
+        let taskKind: String       // "refresh" or "processing"
+        let identifier: String     // BGTask identifier
+        let receivedAt: TimeInterval // Date().timeIntervalSince1970
+    }
+
+    /// Currently pending BGTask info, set when a BGTask launches the app.
+    /// Cleared by Rust after processing the auto-start.
+    private var pendingTaskInfo: PendingTaskInfo?
+
+    /// Whether `setTaskCompleted` has been called for the current BGTask.
+    /// Prevents double-completion across all terminal paths (expiration, safety
+    /// timer, explicit stop, natural completion).
+    private var taskCompleted: Bool = false
+
+    // MARK: - Desired State Keys
+
+    /// UserDefaults keys for iOS desired-state persistence.
+    private enum DesiredStateKeys {
+        static let desiredRunning = "ios_desired_running"
+        static let lastStartConfig = "ios_last_start_config"
+        static let lastScheduleError = "ios_last_schedule_error"
+        static let lastTaskKind = "ios_last_task_kind"
+        static let lastTaskStartedAt = "ios_last_task_started_at"
+        static let lastTaskCompletedAt = "ios_last_task_completed_at"
+    }
+
+    // MARK: - Scheduling Result
+
+    /// Result of submitting BGTaskScheduler requests.
+    private struct SchedulingResult {
+        let refreshScheduled: Bool
+        let processingScheduled: Bool
+        let refreshError: String?
+        let processingError: String?
+    }
+
+    // MARK: - UserDefaults Helpers
+
+    private func persistDesiredRunning(_ running: Bool) {
+        UserDefaults.standard.set(running, forKey: DesiredStateKeys.desiredRunning)
+    }
+
+    private func persistStartConfig(_ args: [String: Any]) {
+        if let data = try? JSONSerialization.data(withJSONObject: args, options: []),
+           let json = String(data: data, encoding: .utf8) {
+            UserDefaults.standard.set(json, forKey: DesiredStateKeys.lastStartConfig)
+        }
+    }
+
+    private func persistScheduleError(_ error: String?) {
+        if let error = error {
+            UserDefaults.standard.set(error, forKey: DesiredStateKeys.lastScheduleError)
+        } else {
+            UserDefaults.standard.removeObject(forKey: DesiredStateKeys.lastScheduleError)
+        }
+    }
+
+    private func persistTaskKind(_ kind: String) {
+        UserDefaults.standard.set(kind, forKey: DesiredStateKeys.lastTaskKind)
+    }
+
+    private func persistTaskStartedAt() {
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: DesiredStateKeys.lastTaskStartedAt)
+    }
+
+    private func persistTaskCompletedAt() {
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: DesiredStateKeys.lastTaskCompletedAt)
+    }
+
     // MARK: - Plugin Lifecycle
 
     public override func load(webView: WKWebView) {
@@ -136,12 +210,67 @@ import os.log
                 (task as? BGTask)?.setTaskCompleted(success: false)
             }
         }
+
+        // Foreground/background transition observers.
+        // When going to background with desired_running=true and no active BGTask,
+        // ensure BGTasks are scheduled so iOS can manage the lifecycle.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(appWillEnterForeground),
+            name: UIApplication.willEnterForegroundNotification,
+            object: nil
+        )
+    }
+
+    // MARK: - Completion Safety
+
+    /// Safely complete the active BGTask exactly once.
+    ///
+    /// iOS requires `setTaskCompleted` to be called exactly once per BGTask.
+    /// This method guards against double-completion by checking the `taskCompleted`
+    /// flag before calling `setTaskCompleted`. The flag is reset in `cleanup()`
+    /// and when a new BGTask handler fires.
+    ///
+    /// - Returns: `true` if a task was completed, `false` if already completed or no task.
+    @discardableResult
+    private func completeActiveTask(success: Bool) -> Bool {
+        guard !taskCompleted else { return false }
+
+        if let task = currentRefreshTask {
+            taskCompleted = true
+            currentRefreshTask = nil
+            task.setTaskCompleted(success: success)
+            return true
+        } else if let task = currentProcessingTask {
+            taskCompleted = true
+            currentProcessingTask = nil
+            task.setTaskCompleted(success: success)
+            return true
+        }
+        return false
     }
 
     // MARK: - BGAppRefreshTask Handler
 
     private func handleBackgroundTask(_ task: BGAppRefreshTask) {
         self.currentRefreshTask = task
+        self.taskCompleted = false
+
+        // Store pending task info for Rust auto-start on BGTask launch.
+        self.pendingTaskInfo = PendingTaskInfo(
+            taskKind: "refresh",
+            identifier: refreshTaskId,
+            receivedAt: Date().timeIntervalSince1970
+        )
+
+        persistTaskKind("refresh")
+        persistTaskStartedAt()
 
         task.expirationHandler = { [weak self] in
             self?.handleExpiration()
@@ -155,6 +284,17 @@ import os.log
 
     private func handleProcessingTask(_ task: BGProcessingTask) {
         self.currentProcessingTask = task
+        self.taskCompleted = false
+
+        // Store pending task info for Rust auto-start on BGTask launch.
+        self.pendingTaskInfo = PendingTaskInfo(
+            taskKind: "processing",
+            identifier: processingTaskId,
+            receivedAt: Date().timeIntervalSince1970
+        )
+
+        persistTaskKind("processing")
+        persistTaskStartedAt()
 
         task.expirationHandler = { [weak self] in
             self?.handleExpiration()
@@ -169,21 +309,16 @@ import os.log
     // MARK: - Expiration Handler (signals Rust to cancel)
 
     private func handleExpiration() {
+        persistTaskCompletedAt()
+
         // Resolve pending cancel invoke (unblocks Rust thread)
         if let invoke = pendingCancelInvoke {
             invoke.resolve()
             pendingCancelInvoke = nil
         }
 
-        // Complete whichever task is active — nil out BEFORE completing
-        // to prevent double-completion if completeBgTask races in.
-        if let task = currentRefreshTask {
-            currentRefreshTask = nil
-            task.setTaskCompleted(success: false)
-        } else if let task = currentProcessingTask {
-            currentProcessingTask = nil
-            task.setTaskCompleted(success: false)
-        }
+        // Complete the active task exactly once
+        completeActiveTask(success: false)
 
         // Schedule next tasks
         scheduleNext()
@@ -202,6 +337,8 @@ import os.log
     }
 
     private func handleSafetyTimerExpiration() {
+        persistTaskCompletedAt()
+
         // Force-complete task if Rust never called completeBgTask
         if currentRefreshTask != nil || currentProcessingTask != nil {
             // Resolve pending cancel invoke (unblocks Rust thread)
@@ -210,14 +347,8 @@ import os.log
                 pendingCancelInvoke = nil
             }
 
-            // Complete whichever task is active — nil out BEFORE completing
-            if let task = currentRefreshTask {
-                currentRefreshTask = nil
-                task.setTaskCompleted(success: false)
-            } else if let task = currentProcessingTask {
-                currentProcessingTask = nil
-                task.setTaskCompleted(success: false)
-            }
+            // Complete the active task exactly once
+            completeActiveTask(success: false)
 
             // Schedule next tasks
             scheduleNext()
@@ -235,6 +366,7 @@ import os.log
         pendingCancelInvoke = nil
         safetyTimer?.invalidate()
         safetyTimer = nil
+        taskCompleted = false
     }
 
     // MARK: - waitForCancel (Pending Invoke pattern)
@@ -266,20 +398,13 @@ import os.log
         // Extract success value from invoke arguments
         let success = invoke.args(as: [String: Bool].self)?["success"] ?? true
 
-        // Track whether we had an active BGTask before nil-out.
+        // Track whether we had an active BGTask before completion.
         // Prevents spurious rescheduling when completeBgTask is called
         // after expiration or explicit stop already cleaned up the task.
         let hadActiveTask = currentRefreshTask != nil || currentProcessingTask != nil
 
-        // Complete whichever task is active — nil out BEFORE completing
-        // to prevent double-completion. At most one BGTask is active at a time.
-        if let task = currentRefreshTask {
-            currentRefreshTask = nil
-            task.setTaskCompleted(success: success)
-        } else if let task = currentProcessingTask {
-            currentProcessingTask = nil
-            task.setTaskCompleted(success: success)
-        }
+        // Complete the active task exactly once
+        completeActiveTask(success: success)
 
         // Reject pending cancel invoke (unblocks Rust thread)
         if let cancelInvoke = pendingCancelInvoke {
@@ -303,7 +428,8 @@ import os.log
     // MARK: - startKeepalive (configurable iOS safety timers)
 
     @objc public func startKeepalive(_ invoke: Invoke) {
-        if let args = invoke.args(as: [String: Any].self) {
+        let args = invoke.args(as: [String: Any].self)
+        if let args = args {
             // BGAppRefreshTask safety timeout (default: 28.0s via PluginConfig)
             if let timeout = args["iosSafetyTimeoutSecs"] as? Double {
                 safetyTimeout = timeout
@@ -329,13 +455,39 @@ import os.log
                 requiresNetworkConnectivity = network
             }
         }
-        scheduleNext()
-        invoke.resolve()
+
+        let result = scheduleNext()
+
+        // Persist desired state
+        persistDesiredRunning(true)
+        if let args = args {
+            persistStartConfig(args)
+        }
+        persistScheduleError(result.refreshError ?? result.processingError)
+        UserDefaults.standard.removeObject(forKey: DesiredStateKeys.lastTaskCompletedAt)
+
+        // If both scheduling attempts failed, reject with schedulerUnavailable
+        if !result.refreshScheduled && !result.processingScheduled {
+            invoke.reject(error: "schedulerUnavailable")
+            return
+        }
+
+        // Return structured scheduling result
+        invoke.resolve([
+            "refreshScheduled": result.refreshScheduled,
+            "processingScheduled": result.processingScheduled,
+            "refreshError": result.refreshError ?? NSNull(),
+            "processingError": result.processingError ?? NSNull()
+        ] as [String: Any])
     }
 
     // MARK: - stopKeepalive (clean up active task)
 
     @objc public func stopKeepalive(_ invoke: Invoke) {
+        // Persist desired state
+        persistDesiredRunning(false)
+        persistTaskCompletedAt()
+
         // Cancel any pending schedules for both task types
         BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: refreshTaskId)
         BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: processingTaskId)
@@ -347,15 +499,8 @@ import os.log
             pendingCancelInvoke = nil
         }
 
-        // If a BGTask is active, nil out and complete it — prevents
-        // completeBgTask from double-completing if it races in.
-        if let task = currentRefreshTask {
-            currentRefreshTask = nil
-            task.setTaskCompleted(success: false)
-        } else if let task = currentProcessingTask {
-            currentProcessingTask = nil
-            task.setTaskCompleted(success: false)
-        }
+        // Complete the active task exactly once
+        completeActiveTask(success: false)
 
         // Clear remaining state
         cleanup()
@@ -363,17 +508,87 @@ import os.log
         invoke.resolve()
     }
 
+    // MARK: - getSchedulingStatus (query scheduling state from UserDefaults)
+
+    @objc public func getSchedulingStatus(_ invoke: Invoke) {
+        let defaults = UserDefaults.standard
+        invoke.resolve([
+            "desiredRunning": defaults.object(forKey: DesiredStateKeys.desiredRunning) as? Bool ?? false,
+            "lastStartConfig": defaults.string(forKey: DesiredStateKeys.lastStartConfig) ?? NSNull(),
+            "lastScheduleError": defaults.string(forKey: DesiredStateKeys.lastScheduleError) ?? NSNull(),
+            "lastTaskKind": defaults.string(forKey: DesiredStateKeys.lastTaskKind) ?? NSNull(),
+            "lastTaskStartedAt": defaults.object(forKey: DesiredStateKeys.lastTaskStartedAt) ?? NSNull(),
+            "lastTaskCompletedAt": defaults.object(forKey: DesiredStateKeys.lastTaskCompletedAt) ?? NSNull()
+        ] as [String: Any])
+    }
+
+    // MARK: - Pending BGTask Query (for Rust auto-start)
+
+    /// Return the pending BGTask info that launched the app in the background.
+    ///
+    /// Called by Rust during iOS plugin setup to detect whether the app was
+    /// launched by iOS for a background task. If a pending task exists and
+    /// `desired_running` is true in UserDefaults, Rust auto-starts the service.
+    @objc public func getPendingBgTask(_ invoke: Invoke) {
+        if let info = pendingTaskInfo {
+            invoke.resolve([
+                "taskKind": info.taskKind,
+                "identifier": info.identifier,
+                "receivedAt": info.receivedAt
+            ] as [String: Any])
+        } else {
+            invoke.resolve([
+                "taskKind": NSNull(),
+                "identifier": NSNull(),
+                "receivedAt": NSNull()
+            ] as [String: Any])
+        }
+    }
+
+    /// Clear the pending BGTask info after Rust has processed the auto-start.
+    @objc public func clearPendingBgTask(_ invoke: Invoke) {
+        pendingTaskInfo = nil
+        invoke.resolve()
+    }
+
+    // MARK: - Foreground/Background Transitions
+
+    /// When the app transitions to background, ensure BGTasks are scheduled
+    /// if desired_running is true and no BGTask is currently active.
+    /// This covers the case where the user started the service in the foreground
+    /// and then backgrounds the app — iOS needs scheduled BGTasks to potentially
+    /// relaunch the app later.
+    @objc private func appDidEnterBackground() {
+        let desired = UserDefaults.standard.bool(forKey: DesiredStateKeys.desiredRunning)
+        if desired && currentRefreshTask == nil && currentProcessingTask == nil {
+            scheduleNext()
+        }
+    }
+
+    /// No special action on foreground transition — the service keeps running.
+    @objc private func appWillEnterForeground() {
+        // Intentionally empty. Service runs continuously while app is active.
+    }
+
     // MARK: - Scheduling
 
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "app.tauri.backgroundservice", category: "BGTaskScheduler")
 
-    private func scheduleNext() {
+    @discardableResult
+    private func scheduleNext() -> SchedulingResult {
+        var refreshScheduled = false
+        var refreshError: String?
+        var processingScheduled = false
+        var processingError: String?
+
         // BGAppRefreshTask — runs opportunistically, ~30s budget
         let refreshReq = BGAppRefreshTaskRequest(identifier: refreshTaskId)
         refreshReq.earliestBeginDate = Date(timeIntervalSinceNow: earliestRefreshBeginMinutes * 60)
         do {
             try BGTaskScheduler.shared.submit(refreshReq)
+            refreshScheduled = true
         } catch {
+            refreshError = error.localizedDescription
             logger.error("Failed to submit BGAppRefreshTask '\(self.refreshTaskId)': \(error.localizedDescription)")
         }
 
@@ -384,8 +599,17 @@ import os.log
         processingReq.requiresNetworkConnectivity = requiresNetworkConnectivity
         do {
             try BGTaskScheduler.shared.submit(processingReq)
+            processingScheduled = true
         } catch {
+            processingError = error.localizedDescription
             logger.error("Failed to submit BGProcessingTask '\(self.processingTaskId)': \(error.localizedDescription)")
         }
+
+        return SchedulingResult(
+            refreshScheduled: refreshScheduled,
+            processingScheduled: processingScheduled,
+            refreshError: refreshError,
+            processingError: processingError
+        )
     }
 }

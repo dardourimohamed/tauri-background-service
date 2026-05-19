@@ -11,6 +11,7 @@
 //!
 //! Only available when the `desktop-service` Cargo feature is enabled.
 
+pub mod env_checks;
 pub mod service_manager;
 pub mod transport;
 

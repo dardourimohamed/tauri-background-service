@@ -16,7 +16,7 @@
             background: #ffffff;
             color: #333333;
             padding: 16px;
-            max-width: 400px;
+            max-width: 480px;
             margin: 0 auto;
         }
 
@@ -60,42 +60,116 @@
         button {
             display: block;
             width: 100%;
-            height: 48px;
-            font-size: 16px;
+            height: 44px;
+            font-size: 15px;
             font-weight: 500;
             color: #ffffff;
             border: none;
             border-radius: 6px;
             cursor: pointer;
-            margin-bottom: 8px;
+            margin-bottom: 6px;
         }
 
-        #start-btn {
-            background: #4CAF50;
+        button:disabled {
+            opacity: 0.5;
+            cursor: default;
         }
 
-        #stop-btn {
-            background: #F44336;
+        .btn-green { background: #4CAF50; }
+        .btn-red { background: #F44336; }
+        .btn-blue { background: #2196F3; }
+        .btn-orange { background: #FF9800; }
+        .btn-purple { background: #9C27B0; }
+        .btn-teal { background: #009688; }
+        .btn-grey { background: #607D8B; }
+
+        .btn-row {
+            display: flex;
+            gap: 6px;
+            margin-bottom: 6px;
         }
 
-        #check-btn {
-            background: #2196F3;
-            margin-bottom: 16px;
+        .btn-row button {
+            flex: 1;
+            margin-bottom: 0;
         }
 
         h2 {
-            font-size: 16px;
+            font-size: 15px;
             font-weight: 600;
-            margin-bottom: 8px;
+            margin-bottom: 6px;
+            margin-top: 14px;
             border-top: 1px solid #e0e0e0;
-            padding-top: 12px;
+            padding-top: 10px;
+            color: #555;
+        }
+
+        .info-card {
+            background: #f5f5f5;
+            border: 1px solid #e0e0e0;
+            border-radius: 6px;
+            padding: 10px;
+            margin-bottom: 8px;
+            font-size: 13px;
+            line-height: 1.6;
+            word-break: break-word;
+        }
+
+        .info-card .label {
+            color: #888;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .info-card .value {
+            font-weight: 500;
+            color: #333;
+        }
+
+        .info-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 4px 12px;
+        }
+
+        .guarantee-good { color: #4CAF50; font-weight: 600; }
+        .guarantee-ok { color: #FF9800; font-weight: 600; }
+        .guarantee-bad { color: #F44336; font-weight: 600; }
+
+        .issue-item {
+            padding: 4px 0;
+            border-bottom: 1px solid #eee;
+        }
+
+        .issue-item:last-child {
+            border-bottom: none;
+        }
+
+        .issue-code {
+            font-weight: 600;
+            font-size: 12px;
+        }
+
+        .issue-error .issue-code { color: #F44336; }
+        .issue-warning .issue-code { color: #FF9800; }
+
+        .issue-msg {
+            font-size: 12px;
+            color: #555;
+        }
+
+        .issue-fix {
+            font-size: 11px;
+            color: #2196F3;
+            font-style: italic;
         }
 
         #event-log {
-            max-height: 300px;
+            max-height: 250px;
             overflow-y: auto;
             font-family: "Courier New", Courier, monospace;
-            font-size: 13px;
+            font-size: 12px;
             line-height: 1.5;
             background: #fafafa;
             border: 1px solid #e0e0e0;
@@ -109,26 +183,18 @@
             text-overflow: ellipsis;
         }
 
-        .log-entry.info {
-            color: #2196F3;
-        }
+        .log-entry.info { color: #2196F3; }
+        .log-entry.tick { color: #4CAF50; }
+        .log-entry.error { color: #F44336; }
+        .log-entry.stopped { color: #F44336; }
 
-        .log-entry.tick {
-            color: #4CAF50;
-        }
-
-        .log-entry.error {
-            color: #F44336;
-        }
-
-        .log-entry.stopped {
-            color: #F44336;
-        }
+        .hidden { display: none; }
     </style>
 </head>
 <body>
     <h1>Background Service Test App</h1>
 
+    <!-- Status -->
     <div class="status-line">
         <div class="status-dot" id="status-dot"></div>
         <span id="status-text">Stopped</span>
@@ -138,15 +204,75 @@
         Tick Count: <span id="tick-count">0</span>
     </div>
 
-    <button id="start-btn">Start Service</button>
-    <button id="stop-btn">Stop Service</button>
-    <button id="check-btn">Check Status</button>
+    <!-- Core controls -->
+    <button id="start-btn" class="btn-green">Start Service</button>
+    <button id="stop-btn" class="btn-red">Stop Service</button>
+    <button id="check-btn" class="btn-blue">Check Status</button>
 
+    <!-- Platform Capabilities -->
+    <h2>Platform Capabilities</h2>
+    <div id="capabilities-card" class="info-card" style="display:none;"></div>
+    <button id="capabilities-btn" class="btn-blue">Get Capabilities</button>
+
+    <!-- Extended Service State -->
+    <h2>Service State</h2>
+    <div id="state-card" class="info-card" style="display:none;"></div>
+    <button id="state-btn" class="btn-blue">Get Service State</button>
+
+    <!-- Auto-Restart -->
+    <h2>Auto-Restart</h2>
+    <div class="btn-row">
+        <button id="enable-autorestart-btn" class="btn-green">Enable</button>
+        <button id="disable-autorestart-btn" class="btn-red">Disable</button>
+    </div>
+    <button id="desired-state-btn" class="btn-blue">Get Desired State</button>
+    <div id="desired-state-card" class="info-card" style="display:none;"></div>
+
+    <!-- Validate Setup -->
+    <h2>Validate Setup</h2>
+    <button id="validate-btn" class="btn-purple">Validate Setup</button>
+    <div id="validate-card" class="info-card" style="display:none;"></div>
+
+    <!-- Desktop OS Service -->
+    <h2 id="desktop-heading" class="hidden">Desktop OS Service</h2>
+    <div id="desktop-section" class="hidden">
+        <div class="btn-row">
+            <button id="install-btn" class="btn-green">Install</button>
+            <button id="uninstall-btn" class="btn-red">Uninstall</button>
+        </div>
+        <div class="btn-row">
+            <button id="os-start-btn" class="btn-teal">Start OS</button>
+            <button id="os-stop-btn" class="btn-orange">Stop OS</button>
+        </div>
+        <button id="os-restart-btn" class="btn-orange">Restart OS Service</button>
+        <button id="os-status-btn" class="btn-blue">Get OS Status</button>
+        <div id="os-status-card" class="info-card" style="display:none;"></div>
+    </div>
+
+    <!-- Event Log -->
     <h2>Event Log</h2>
     <div id="event-log"></div>
 
     <script type="module">
-        import { invoke } from '@tauri-apps/api/core';
+        import {
+            startService,
+            stopService,
+            isServiceRunning,
+            getServiceState,
+            getPlatformCapabilities,
+            enableAutoRestart,
+            disableAutoRestart,
+            getDesiredServiceState,
+            validateBackgroundServiceSetup,
+            normalizeBackgroundServiceError,
+            onPluginEvent,
+            installService,
+            uninstallService,
+            startOsService,
+            stopOsService,
+            restartOsService,
+            getOsServiceStatus,
+        } from '@tauri-apps/plugin-background-service';
         import { listen } from '@tauri-apps/api/event';
 
         function updateStatus(running) {
@@ -175,10 +301,27 @@
             log.scrollTop = log.scrollHeight;
         }
 
-        // Event listeners — set up first so we don't miss any events
+        function handleError(e) {
+            var err = normalizeBackgroundServiceError(e);
+            addLogEntry('error', '[' + err.code + '] ' + err.message);
+        }
+
+        function guaranteeClass(g) {
+            if (g === 'guaranteed') return 'guarantee-good';
+            if (g === 'bestEffort') return 'guarantee-ok';
+            return 'guarantee-bad';
+        }
+
+        function esc(s) {
+            var d = document.createElement('div');
+            d.textContent = String(s ?? '—');
+            return d.innerHTML;
+        }
+
+        // ── Event listeners ───────────────────────────────────────────
+
         async function initListeners() {
-            await listen('background-service://event', (event) => {
-                var payload = event.payload;
+            await onPluginEvent(function(payload) {
                 if (payload.type === 'started') {
                     updateStatus(true);
                     addLogEntry('info', 'Service started');
@@ -190,13 +333,13 @@
                 }
             });
 
-            await listen('service-tick', (event) => {
+            await listen('service-tick', function(event) {
                 var count = event.payload;
                 updateTickCount(count);
                 addLogEntry('tick', 'Tick #' + count);
             });
 
-            await listen('service-stopped', (event) => {
+            await listen('service-stopped', function(event) {
                 var count = event.payload;
                 updateTickCount(count);
                 addLogEntry('stopped', 'Service stopped at tick #' + count);
@@ -207,30 +350,225 @@
 
         initListeners();
 
-        // Button handlers
-        document.getElementById('start-btn').addEventListener('click', async () => {
+        // ── Core controls ─────────────────────────────────────────────
+
+        document.getElementById('start-btn').addEventListener('click', async function() {
             try {
-                await invoke('plugin:background-service|start', { config: { serviceLabel: "Test Service" } });
+                await startService({ serviceLabel: 'Test Service' });
             } catch (e) {
-                addLogEntry('error', typeof e === 'string' ? e : (e.message || String(e)));
+                handleError(e);
             }
         });
 
-        document.getElementById('stop-btn').addEventListener('click', async () => {
+        document.getElementById('stop-btn').addEventListener('click', async function() {
             try {
-                await invoke('plugin:background-service|stop');
+                await stopService();
             } catch (e) {
-                addLogEntry('error', typeof e === 'string' ? e : (e.message || String(e)));
+                handleError(e);
             }
         });
 
-        document.getElementById('check-btn').addEventListener('click', async () => {
+        document.getElementById('check-btn').addEventListener('click', async function() {
             try {
-                var running = await invoke('plugin:background-service|is_running');
+                var running = await isServiceRunning();
                 updateStatus(running);
                 addLogEntry('info', 'Status: ' + (running ? 'Running' : 'Stopped'));
             } catch (e) {
-                addLogEntry('error', typeof e === 'string' ? e : (e.message || String(e)));
+                handleError(e);
+            }
+        });
+
+        // ── Platform Capabilities ─────────────────────────────────────
+
+        document.getElementById('capabilities-btn').addEventListener('click', async function() {
+            try {
+                var caps = await getPlatformCapabilities();
+                var card = document.getElementById('capabilities-card');
+                card.style.display = 'block';
+                card.innerHTML =
+                    '<div class="info-grid">' +
+                        '<div><span class="label">Platform</span><br><span class="value">' + esc(caps.platform) + '</span></div>' +
+                        '<div><span class="label">Mode</span><br><span class="value">' + esc(caps.lifecycleMode) + '</span></div>' +
+                        '<div><span class="label">App Close</span><br><span class="' + guaranteeClass(caps.survivesAppClose) + '">' + esc(caps.survivesAppClose) + '</span></div>' +
+                        '<div><span class="label">Reboot</span><br><span class="' + guaranteeClass(caps.survivesReboot) + '">' + esc(caps.survivesReboot) + '</span></div>' +
+                        '<div><span class="label">Force Quit</span><br><span class="' + guaranteeClass(caps.survivesForceQuit) + '">' + esc(caps.survivesForceQuit) + '</span></div>' +
+                        '<div><span class="label">BG Exec</span><br><span class="' + guaranteeClass(caps.backgroundExecution) + '">' + esc(caps.backgroundExecution) + '</span></div>' +
+                    '</div>' +
+                    (caps.limitations.length > 0 ? '<div style="margin-top:6px;"><span class="label">Limitations</span><br>' + caps.limitations.map(function(l) { return '&bull; ' + esc(l); }).join('<br>') + '</div>' : '');
+                addLogEntry('info', 'Capabilities: ' + caps.platform + ' / ' + caps.lifecycleMode);
+            } catch (e) {
+                handleError(e);
+            }
+        });
+
+        // ── Extended Service State ─────────────────────────────────────
+
+        document.getElementById('state-btn').addEventListener('click', async function() {
+            try {
+                var st = await getServiceState();
+                var card = document.getElementById('state-card');
+                card.style.display = 'block';
+                var rows = '<div class="info-grid">' +
+                    '<div><span class="label">State</span><br><span class="value">' + esc(st.state) + '</span></div>' +
+                    '<div><span class="label">LastError</span><br><span class="value">' + esc(st.lastError) + '</span></div>';
+
+                if (st.desiredRunning != null) {
+                    rows += '<div><span class="label">DesiredRunning</span><br><span class="value">' + esc(st.desiredRunning) + '</span></div>';
+                }
+                if (st.nativeState != null) {
+                    rows += '<div><span class="label">NativeState</span><br><span class="value">' + esc(st.nativeState) + '</span></div>';
+                }
+                if (st.platformMode != null) {
+                    rows += '<div><span class="label">PlatformMode</span><br><span class="value">' + esc(st.platformMode) + '</span></div>';
+                }
+                if (st.restartAttempt != null) {
+                    rows += '<div><span class="label">RestartAttempt</span><br><span class="value">' + esc(st.restartAttempt) + '</span></div>';
+                }
+                if (st.recoveryReason != null) {
+                    rows += '<div><span class="label">RecoveryReason</span><br><span class="value">' + esc(st.recoveryReason) + '</span></div>';
+                }
+                if (st.platformError != null) {
+                    rows += '<div><span class="label">PlatformError</span><br><span class="value">' + esc(st.platformError) + '</span></div>';
+                }
+                if (st.lastHeartbeatAt != null) {
+                    var d = new Date(st.lastHeartbeatAt);
+                    rows += '<div><span class="label">LastHeartbeat</span><br><span class="value">' + esc(d.toLocaleTimeString()) + '</span></div>';
+                }
+                rows += '</div>';
+                card.innerHTML = rows;
+                updateStatus(st.state === 'running');
+                addLogEntry('info', 'State: ' + st.state);
+            } catch (e) {
+                handleError(e);
+            }
+        });
+
+        // ── Auto-Restart ───────────────────────────────────────────────
+
+        document.getElementById('enable-autorestart-btn').addEventListener('click', async function() {
+            try {
+                await enableAutoRestart({ serviceLabel: 'Test Service' });
+                addLogEntry('info', 'Auto-restart enabled');
+            } catch (e) {
+                handleError(e);
+            }
+        });
+
+        document.getElementById('disable-autorestart-btn').addEventListener('click', async function() {
+            try {
+                await disableAutoRestart();
+                addLogEntry('info', 'Auto-restart disabled');
+            } catch (e) {
+                handleError(e);
+            }
+        });
+
+        document.getElementById('desired-state-btn').addEventListener('click', async function() {
+            try {
+                var ds = await getDesiredServiceState();
+                var card = document.getElementById('desired-state-card');
+                card.style.display = 'block';
+                if (ds == null) {
+                    card.innerHTML = '<span class="label">No desired state persisted</span>';
+                } else {
+                    card.innerHTML =
+                        '<div class="info-grid">' +
+                            '<div><span class="label">DesiredRunning</span><br><span class="value">' + esc(ds.desiredRunning) + '</span></div>' +
+                            '<div><span class="label">RestartAttempt</span><br><span class="value">' + esc(ds.restartAttempt) + '</span></div>' +
+                            '<div><span class="label">RecoveryPending</span><br><span class="value">' + esc(ds.recoveryPending) + '</span></div>' +
+                            (ds.recoveryReason != null ? '<div><span class="label">RecoveryReason</span><br><span class="value">' + esc(ds.recoveryReason) + '</span></div>' : '') +
+                            (ds.lastNativeState != null ? '<div><span class="label">LastNativeState</span><br><span class="value">' + esc(ds.lastNativeState) + '</span></div>' : '') +
+                            (ds.lastPlatformError != null ? '<div><span class="label">LastPlatformError</span><br><span class="value">' + esc(ds.lastPlatformError) + '</span></div>' : '') +
+                        '</div>';
+                }
+                addLogEntry('info', 'Desired state: ' + (ds ? (ds.desiredRunning ? 'running' : 'stopped') : 'null'));
+            } catch (e) {
+                handleError(e);
+            }
+        });
+
+        // ── Validate Setup ─────────────────────────────────────────────
+
+        document.getElementById('validate-btn').addEventListener('click', async function() {
+            try {
+                var report = await validateBackgroundServiceSetup();
+                var card = document.getElementById('validate-card');
+                card.style.display = 'block';
+                var html = '<div><strong>' + (report.ok ? '&#10003; OK' : '&#10007; Issues found') + '</strong></div>';
+
+                if (report.errors.length > 0) {
+                    html += '<div style="margin-top:4px;"><span class="label">Errors</span></div>';
+                    report.errors.forEach(function(issue) {
+                        html += '<div class="issue-item issue-error"><span class="issue-code">[' + esc(issue.code) + ']</span> <span class="issue-msg">' + esc(issue.message) + '</span>' +
+                            (issue.fix ? '<br><span class="issue-fix">Fix: ' + esc(issue.fix) + '</span>' : '') + '</div>';
+                    });
+                }
+
+                if (report.warnings.length > 0) {
+                    html += '<div style="margin-top:4px;"><span class="label">Warnings</span></div>';
+                    report.warnings.forEach(function(issue) {
+                        html += '<div class="issue-item issue-warning"><span class="issue-code">[' + esc(issue.code) + ']</span> <span class="issue-msg">' + esc(issue.message) + '</span>' +
+                            (issue.fix ? '<br><span class="issue-fix">Fix: ' + esc(issue.fix) + '</span>' : '') + '</div>';
+                    });
+                }
+
+                card.innerHTML = html;
+                addLogEntry('info', 'Validation: ' + (report.ok ? 'OK' : report.errors.length + ' errors, ' + report.warnings.length + ' warnings'));
+            } catch (e) {
+                handleError(e);
+            }
+        });
+
+        // ── Desktop OS Service (gated) ────────────────────────────────
+
+        function setupDesktopSection() {
+            getPlatformCapabilities().then(function(caps) {
+                if (caps.platform === 'linux' || caps.platform === 'macos') {
+                    document.getElementById('desktop-heading').classList.remove('hidden');
+                    document.getElementById('desktop-section').classList.remove('hidden');
+                }
+            }).catch(function() {});
+        }
+
+        setupDesktopSection();
+
+        document.getElementById('install-btn').addEventListener('click', async function() {
+            try { await installService(); addLogEntry('info', 'OS service installed'); } catch (e) { handleError(e); }
+        });
+
+        document.getElementById('uninstall-btn').addEventListener('click', async function() {
+            try { await uninstallService(); addLogEntry('info', 'OS service uninstalled'); } catch (e) { handleError(e); }
+        });
+
+        document.getElementById('os-start-btn').addEventListener('click', async function() {
+            try { await startOsService(); addLogEntry('info', 'OS service started'); } catch (e) { handleError(e); }
+        });
+
+        document.getElementById('os-stop-btn').addEventListener('click', async function() {
+            try { await stopOsService(); addLogEntry('info', 'OS service stopped'); } catch (e) { handleError(e); }
+        });
+
+        document.getElementById('os-restart-btn').addEventListener('click', async function() {
+            try { await restartOsService(); addLogEntry('info', 'OS service restarted'); } catch (e) { handleError(e); }
+        });
+
+        document.getElementById('os-status-btn').addEventListener('click', async function() {
+            try {
+                var s = await getOsServiceStatus();
+                var card = document.getElementById('os-status-card');
+                card.style.display = 'block';
+                card.innerHTML =
+                    '<div class="info-grid">' +
+                        '<div><span class="label">Label</span><br><span class="value">' + esc(s.label) + '</span></div>' +
+                        '<div><span class="label">Mode</span><br><span class="value">' + esc(s.mode) + '</span></div>' +
+                        '<div><span class="label">Installed</span><br><span class="value">' + esc(s.installed) + '</span></div>' +
+                        '<div><span class="label">IPC</span><br><span class="value">' + esc(s.ipcConnected) + '</span></div>' +
+                        (s.socketPath ? '<div><span class="label">Socket</span><br><span class="value" style="font-size:11px;">' + esc(s.socketPath) + '</span></div>' : '') +
+                        (s.lastError ? '<div><span class="label">Error</span><br><span class="value" style="color:#F44336;">' + esc(s.lastError) + '</span></div>' : '') +
+                    '</div>';
+                addLogEntry('info', 'OS status: ' + s.installed + ' / ipc=' + s.ipcConnected);
+            } catch (e) {
+                handleError(e);
             }
         });
     </script>

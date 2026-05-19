@@ -89,6 +89,177 @@ jobs:
       - run: cargo clippy --features desktop-service -- -D warnings
         working-directory: tauri-plugin-background-service
 
+  ts:
+    name: TypeScript build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+        working-directory: tauri-plugin-background-service/guest-js
+      - run: npm run build
+        working-directory: tauri-plugin-background-service/guest-js
+
+  android-test:
+    name: Android unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch Tauri Android SDK
+        run: |
+          cd tauri-plugin-background-service
+          cargo fetch
+          TAURI_VERSION=$(grep -A1 'name = "tauri"' Cargo.lock | grep version | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+          TAURI_ANDROID_PATH=$(find ~/.cargo/registry/src -path "*/tauri-${TAURI_VERSION}/mobile/android" -type d | head -1)
+          echo "TAURI_ANDROID_PATH=${TAURI_ANDROID_PATH}" >> "$GITHUB_ENV"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.14.3
+      - name: Setup Gradle project
+        run: |
+          cd tauri-plugin-background-service/android
+          mkdir -p ci-build
+          cat > ci-build/settings.gradle <<EOF
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+              plugins {
+                  id("com.android.library") version "8.11.0" apply false
+                  id("org.jetbrains.kotlin.android") version "1.9.25" apply false
+              }
+          }
+          rootProject.name = "bg-service-ci"
+          include ":tauri-android"
+          project(":tauri-android").projectDir = new File("${TAURI_ANDROID_PATH}")
+          include ":plugin"
+          project(":plugin").projectDir = new File(settingsDir, "..")
+          EOF
+          cat > ci-build/build.gradle <<'EOF'
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          EOF
+          echo "android.useAndroidX=true" > ci-build/gradle.properties
+      - name: Run unit tests
+        working-directory: tauri-plugin-background-service/android/ci-build
+        run: gradle :plugin:testDebugUnitTest
+
+  android-lint:
+    name: Android lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch Tauri Android SDK
+        run: |
+          cd tauri-plugin-background-service
+          cargo fetch
+          TAURI_VERSION=$(grep -A1 'name = "tauri"' Cargo.lock | grep version | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+          TAURI_ANDROID_PATH=$(find ~/.cargo/registry/src -path "*/tauri-${TAURI_VERSION}/mobile/android" -type d | head -1)
+          echo "TAURI_ANDROID_PATH=${TAURI_ANDROID_PATH}" >> "$GITHUB_ENV"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.14.3
+      - name: Setup Gradle project
+        run: |
+          cd tauri-plugin-background-service/android
+          mkdir -p ci-build
+          cat > ci-build/settings.gradle <<EOF
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+              plugins {
+                  id("com.android.library") version "8.11.0" apply false
+                  id("org.jetbrains.kotlin.android") version "1.9.25" apply false
+              }
+          }
+          rootProject.name = "bg-service-ci"
+          include ":tauri-android"
+          project(":tauri-android").projectDir = new File("${TAURI_ANDROID_PATH}")
+          include ":plugin"
+          project(":plugin").projectDir = new File(settingsDir, "..")
+          EOF
+          cat > ci-build/build.gradle <<'EOF'
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          EOF
+          echo "android.useAndroidX=true" > ci-build/gradle.properties
+      - name: Run lint
+        working-directory: tauri-plugin-background-service/android/ci-build
+        run: gradle :plugin:lintDebug
+        continue-on-error: true
+
+  ios-build:
+    name: iOS Swift compile
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch Tauri iOS SDK
+        run: |
+          cd tauri-plugin-background-service
+          cargo fetch
+          TAURI_VERSION=$(grep -A1 'name = "tauri"' Cargo.lock | grep version | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+          TAURI_IOS_PATH=$(find ~/.cargo/registry/src -path "*/tauri-${TAURI_VERSION}/mobile/ios-api" -type d | head -1)
+          echo "TAURI_IOS_PATH=${TAURI_IOS_PATH}" >> "$GITHUB_ENV"
+      - name: Generate Package.swift
+        run: |
+          cd tauri-plugin-background-service/ios
+          cat > Package.swift <<EOF
+          // swift-tools-version:5.9
+          import PackageDescription
+
+          let package = Package(
+            name: "TauriPluginBackgroundService",
+            platforms: [.iOS(.v13)],
+            dependencies: [
+              .package(name: "Tauri", path: "${TAURI_IOS_PATH}")
+            ],
+            targets: [
+              .target(
+                name: "TauriPluginBackgroundService",
+                dependencies: ["Tauri"],
+                path: "Sources"
+              ),
+              .testTarget(
+                name: "TauriPluginBackgroundServiceTests",
+                dependencies: ["TauriPluginBackgroundService"],
+                path: "Tests"
+              )
+            ]
+          )
+          EOF
+      - name: Build
+        working-directory: tauri-plugin-background-service/ios
+        run: |
+          xcodebuild build \
+            -scheme TauriPluginBackgroundService \
+            -destination 'platform=iOS Simulator,name=iPhone 16'
+
   docs:
     name: cargo doc
     runs-on: ubuntu-latest

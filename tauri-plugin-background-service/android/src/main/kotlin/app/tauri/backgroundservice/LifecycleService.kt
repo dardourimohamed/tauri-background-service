@@ -16,6 +16,8 @@ class LifecycleService : Service() {
     companion object {
         const val CHANNEL_ID   = "bg_keepalive"
         const val NOTIF_ID     = 9001
+        const val TIMEOUT_NOTIFICATION_ID = 9003
+        const val TIMEOUT_CHANNEL_ID = "bg_service_timeout"
         const val EXTRA_LABEL  = "label"
         const val EXTRA_SERVICE_TYPE = "foregroundServiceType"
         const val ACTION_START = "START"
@@ -24,6 +26,31 @@ class LifecycleService : Service() {
 
         @Volatile var isRunning = false
         @Volatile var autoRestarting = false
+
+        fun buildStartState(label: String, serviceType: String, previous: DurableState): DurableState {
+            return previous.copy(
+                desiredRunning = true,
+                lastServiceLabel = label,
+                lastServiceType = serviceType,
+                lastStartEpochMs = System.currentTimeMillis(),
+                lastNativeState = "running",
+            )
+        }
+
+        fun buildStopState(previous: DurableState): DurableState {
+            return previous.copy(
+                desiredRunning = false,
+                recoveryPending = false,
+                recoveryReason = null,
+            )
+        }
+
+        fun buildTimeoutState(previous: DurableState, serviceType: String): DurableState {
+            return previous.copy(
+                lastNativeState = "timeout",
+                lastPlatformError = "FGS timeout (type: $serviceType)",
+            )
+        }
     }
 
     private val restartTimeoutHandler = Handler(Looper.getMainLooper())
@@ -38,7 +65,15 @@ class LifecycleService : Service() {
                 .remove("bg_auto_start_pending")
                 .remove("bg_auto_start_label")
                 .remove("bg_auto_start_type")
+                .remove("bg_notif_channel_id")
+                .remove("bg_notif_channel_name")
+                .remove("bg_notif_id")
+                .remove("bg_notif_small_icon")
+                .remove("bg_show_stop_action")
+                .remove("bg_on_timeout_policy")
                 .apply()
+            // Persist DurableState: desiredRunning=false
+            DurableState.save(this, buildStopState(DurableState.load(this)))
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
@@ -55,10 +90,15 @@ class LifecycleService : Service() {
             restartTimeoutHandler.removeCallbacks(it)
             restartTimeoutRunnable = null
         }
+
+        // Cancel any recovery notification from handleOsRestart or BootReceiver
+        cancelRecoveryNotification()
+        // Cancel any timeout notification from previous handleTimeout
+        cancelTimeoutNotification()
         val label = intent.getStringExtra(EXTRA_LABEL) ?: "Service running"
         val serviceType = intent.getStringExtra(EXTRA_SERVICE_TYPE) ?: "dataSync"
         createChannel()
-        startForegroundTyped(NOTIF_ID, buildNotification(label), mapServiceType(serviceType))
+        startForegroundTyped(notifId(), buildNotification(label), mapServiceType(serviceType))
         isRunning = true
 
         // Persist config for OS restart detection
@@ -66,6 +106,9 @@ class LifecycleService : Service() {
             .putString("bg_service_label", label)
             .putString("bg_service_type", serviceType)
             .apply()
+
+        // Persist DurableState
+        DurableState.save(this, buildStartState(label, serviceType, DurableState.load(this)))
 
         return START_STICKY
     }
@@ -82,8 +125,39 @@ class LifecycleService : Service() {
 
     @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
     override fun onTimeout(startId: Int, fgsType: Int) {
+        handleTimeout(fgsType)
+    }
+
+    @Suppress("UNUSED_PARAMETER")
+    internal fun handleTimeout(fgsType: Int) {
+        val previous = DurableState.load(this)
+        val serviceType = previous.lastServiceType.ifEmpty { "dataSync" }
+        val label = previous.lastServiceLabel.ifEmpty { "Service" }
+
+        // Persist timeout state
+        DurableState.save(this, buildTimeoutState(previous, serviceType))
+
+        // Apply timeout policy
+        when (timeoutPolicy()) {
+            "stop" -> { /* just stop below */ }
+            "notifyUser" -> postTimeoutNotification(label)
+            "scheduleRecovery" -> {
+                DurableState.save(this, DurableState.load(this).copy(
+                    recoveryPending = true,
+                    recoveryReason = "timeout",
+                ))
+                BootReceiver.postRecoveryNotification(this, label)
+            }
+        }
+
+        // Emit timeout event to JS layer via BackgroundServicePlugin
+        BackgroundServicePlugin.onTimeoutEvent?.invoke(
+            "FGS timeout (type: $serviceType)"
+        )
+
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+        isRunning = false
     }
 
     override fun onBind(i: Intent?) = null
@@ -106,9 +180,16 @@ class LifecycleService : Service() {
             .putString("bg_auto_start_type", serviceType)
             .apply()
 
+        // Persist recovery state
+        val previous = DurableState.load(this)
+        DurableState.save(this, previous.copy(
+            recoveryPending = true,
+            recoveryReason = "os_restart",
+        ))
+
         // Must call startForeground immediately (Android 12+ requirement)
         createChannel()
-        startForegroundTyped(NOTIF_ID, buildNotification("Restarting..."), mapServiceType(serviceType))
+        startForegroundTyped(notifId(), buildNotification("Restarting..."), mapServiceType(serviceType))
         isRunning = true
         autoRestarting = true
 
@@ -118,11 +199,9 @@ class LifecycleService : Service() {
         restartTimeoutRunnable = Runnable { stopSelf() }
         restartTimeoutHandler.postDelayed(restartTimeoutRunnable!!, RESTART_TIMEOUT_MS)
 
-        // Launch Activity to reinitialize Tauri runtime
-        packageManager.getLaunchIntentForPackage(packageName)?.let { launchIntent ->
-            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-            startActivity(launchIntent)
-        }
+        // Post recovery notification instead of launching activity directly.
+        // startActivity() from background service context is blocked on Android 10+.
+        BootReceiver.postRecoveryNotification(this, label)
 
         return START_STICKY
     }
@@ -160,22 +239,103 @@ class LifecycleService : Service() {
             ?.let { PendingIntent.getActivity(this, 0, it,
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT) }
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, notifChannelId())
             .setContentTitle(applicationInfo.loadLabel(packageManager).toString())
             .setContentText(label)
-            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setSmallIcon(notifSmallIcon())
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .apply { pi?.let { setContentIntent(it) } }
-            .build()
+
+        if (notifShowStopAction()) {
+            val stopIntent = Intent(this, LifecycleService::class.java).apply {
+                action = ACTION_STOP
+            }
+            val stopPendingIntent = PendingIntent.getService(
+                this, 0, stopIntent,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            builder.addAction(0, "Stop", stopPendingIntent)
+        }
+
+        return builder.build()
     }
 
     private fun createChannel() {
         getSystemService(NotificationManager::class.java)
             .createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "Service Status",
+                NotificationChannel(notifChannelId(), notifChannelName(),
                     NotificationManager.IMPORTANCE_LOW)
                     .apply { setShowBadge(false) }
             )
+    }
+
+    private fun notifPrefs() = getSharedPreferences("bg_service", Context.MODE_PRIVATE)
+
+    private fun notifChannelId(): String =
+        notifPrefs().getString("bg_notif_channel_id", CHANNEL_ID) ?: CHANNEL_ID
+
+    private fun notifChannelName(): String =
+        notifPrefs().getString("bg_notif_channel_name", "Service Status") ?: "Service Status"
+
+    private fun notifId(): Int =
+        notifPrefs().getInt("bg_notif_id", NOTIF_ID)
+
+    private fun notifSmallIcon(): Int {
+        val iconName = notifPrefs().getString("bg_notif_small_icon", null)
+        if (iconName != null) {
+            val resId = resources.getIdentifier(iconName, "drawable", packageName)
+            if (resId != 0) return resId
+        }
+        return android.R.drawable.stat_notify_sync
+    }
+
+    private fun notifShowStopAction(): Boolean =
+        notifPrefs().getBoolean("bg_show_stop_action", true)
+
+    private fun cancelRecoveryNotification() {
+        getSystemService(NotificationManager::class.java)
+            .cancel(BootReceiver.RECOVERY_NOTIFICATION_ID)
+    }
+
+    private fun cancelTimeoutNotification() {
+        getSystemService(NotificationManager::class.java)
+            .cancel(TIMEOUT_NOTIFICATION_ID)
+    }
+
+    private fun timeoutPolicy(): String =
+        notifPrefs().getString("bg_on_timeout_policy", "notifyUser") ?: "notifyUser"
+
+    private fun postTimeoutNotification(label: String) {
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+        val channel = NotificationChannel(
+            TIMEOUT_CHANNEL_ID,
+            "Service Timeout",
+            NotificationManager.IMPORTANCE_HIGH,
+        ).apply {
+            description = "Notifications when background service times out"
+            setShowBadge(true)
+        }
+        nm.createNotificationChannel(channel)
+
+        val pendingIntent = packageManager.getLaunchIntentForPackage(packageName)
+            ?.let {
+                PendingIntent.getActivity(
+                    this, 0, it,
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                )
+            }
+
+        val notification = NotificationCompat.Builder(this, TIMEOUT_CHANNEL_ID)
+            .setContentTitle(applicationInfo.loadLabel(packageManager))
+            .setContentText("Background service timed out: $label")
+            .setSmallIcon(notifSmallIcon())
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .apply { pendingIntent?.let { setContentIntent(it) } }
+            .build()
+
+        nm.notify(TIMEOUT_NOTIFICATION_ID, notification)
     }
 }

@@ -8,7 +8,9 @@ import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
+import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
+import org.json.JSONArray
 
 @InvokeArg class StartKeepaliveArgs {
     var label: String = "Service running"
@@ -25,11 +27,21 @@ class GetAutoStartConfigResult {
 @TauriPlugin
 class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity) {
 
+    private var allowedFgsTypes: List<String> = listOf("dataSync")
+    private var validateFgsType: Boolean = true
+    private var onTimeoutPolicy: String = "notifyUser"
+    private var notificationChannelId: String = "bg_service"
+    private var notificationChannelName: String = "Background Service"
+    private var notificationId: Int = 9001
+    private var notificationSmallIcon: String? = null
+    private var showStopAction: Boolean = true
+
     private fun prefs() =
         activity.getSharedPreferences("bg_service", Context.MODE_PRIVATE)
 
     override fun load(webView: android.webkit.WebView) {
         super.load(webView)
+        loadConfig()
         // Request POST_NOTIFICATIONS once so Rust's Notifier can fire freely
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             activity.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
@@ -38,11 +50,50 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
             activity.requestPermissions(
                 arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1001)
         }
+
+        // Register timeout callback so LifecycleService can emit events to JS.
+        onTimeoutEvent = { errorMessage ->
+            val data = JSObject()
+            data.put("type", "stopped")
+            data.put("reason", "timeout")
+            data.put("platformError", errorMessage)
+            trigger("timeout", data)
+        }
+    }
+
+    override fun onDestroy() {
+        onTimeoutEvent = null
+        super.onDestroy()
+    }
+
+    private fun loadConfig() {
+        val configJson = handle?.config ?: return
+        val json = try { org.json.JSONObject(configJson) } catch (_: Exception) { return }
+        val typesArray = json.optJSONArray("androidForegroundServiceTypes")
+        if (typesArray != null) {
+            allowedFgsTypes = (0 until typesArray.length()).map { typesArray.getString(it) }
+        }
+        validateFgsType = json.optBoolean("androidValidateForegroundServiceType", true)
+        onTimeoutPolicy = json.optString("androidOnTimeout", "notifyUser")
+        notificationChannelId = json.optString("androidNotificationChannelId", "bg_service")
+        notificationChannelName = json.optString("androidNotificationChannelName", "Background Service")
+        notificationId = json.optInt("androidNotificationId", 9001)
+        notificationSmallIcon = json.optString("androidNotificationSmallIcon").ifEmpty { null }
+        showStopAction = json.optBoolean("androidShowStopAction", true)
     }
 
     @Command
     fun startKeepalive(invoke: Invoke) {
-        val args  = invoke.parseArgs(StartKeepaliveArgs::class.java)
+        val args = invoke.parseArgs(StartKeepaliveArgs::class.java)
+
+        val validationError = validateForegroundServiceType(
+            args.foregroundServiceType, allowedFgsTypes, validateFgsType
+        )
+        if (validationError != null) {
+            invoke.reject(validationError)
+            return
+        }
+
         val intent = Intent(activity, LifecycleService::class.java).apply {
             action = LifecycleService.ACTION_START
             putExtra(LifecycleService.EXTRA_LABEL, args.label)
@@ -55,6 +106,12 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
         prefs().edit()
             .putString("bg_service_label", args.label)
             .putString("bg_service_type", args.foregroundServiceType)
+            .putString("bg_notif_channel_id", notificationChannelId)
+            .putString("bg_notif_channel_name", notificationChannelName)
+            .putInt("bg_notif_id", notificationId)
+            .putString("bg_notif_small_icon", notificationSmallIcon)
+            .putBoolean("bg_show_stop_action", showStopAction)
+            .putString("bg_on_timeout_policy", onTimeoutPolicy)
             .apply()
         invoke.resolve()
     }
@@ -67,7 +124,14 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
             .remove("bg_auto_start_pending")
             .remove("bg_auto_start_label")
             .remove("bg_auto_start_type")
+            .remove("bg_notif_channel_id")
+            .remove("bg_notif_channel_name")
+            .remove("bg_notif_id")
+            .remove("bg_notif_small_icon")
+            .remove("bg_show_stop_action")
+            .remove("bg_on_timeout_policy")
             .apply()
+        DurableState.clear(activity)
         activity.startService(Intent(activity, LifecycleService::class.java)
             .apply { action = LifecycleService.ACTION_STOP })
         invoke.resolve()
@@ -97,5 +161,21 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
     fun moveTaskToBackground(invoke: Invoke) {
         activity.moveTaskToBack(true)
         invoke.resolve()
+    }
+
+    companion object {
+        @Volatile
+        internal var onTimeoutEvent: ((String) -> Unit)? = null
+
+        fun validateForegroundServiceType(
+            requestedType: String,
+            allowedTypes: List<String>,
+            validate: Boolean
+        ): String? {
+            if (!validate) return null
+            if (allowedTypes.contains(requestedType)) return null
+            return "foreground service type '$requestedType' is not in the configured allowlist $allowedTypes. " +
+                "Add it to androidForegroundServiceTypes in your plugin config."
+        }
     }
 }

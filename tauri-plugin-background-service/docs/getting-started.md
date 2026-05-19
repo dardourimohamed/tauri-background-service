@@ -140,6 +140,49 @@ In your `tauri.conf.json`, add the plugin configuration. It can be empty — the
 }
 ```
 
+### Desktop Configuration
+
+For OS-service mode on Linux and macOS, enable the `desktop-service` feature flag and configure the service mode:
+
+```toml
+[dependencies]
+tauri-plugin-background-service = { version = "0.5", features = ["desktop-service"] }
+```
+
+```json
+{
+  "plugins": {
+    "background-service": {
+      "desktopServiceMode": "osService",
+      "desktopServiceLabel": "com.example.myapp.background",
+      "desktopServiceAutostart": true,
+      "desktopStartServiceIfMissing": true
+    }
+  }
+}
+```
+
+See [Desktop Guide](./desktop.md) for the full configuration reference, including autostart behavior, systemd lingering requirements, and macOS sandbox limitations.
+
+> **Note:** The `desktop-service` feature is optional. Without it, the plugin runs in the default `inProcess` mode — no additional configuration needed.
+
+### Android Configuration
+
+On Android, you can configure which foreground service types your app allows. The default allows `"dataSync"` only. If your app uses a different type, add it to the allowlist:
+
+```json
+{
+  "plugins": {
+    "background-service": {
+      "androidForegroundServiceTypes": ["dataSync"],
+      "androidValidateForegroundServiceType": true
+    }
+  }
+}
+```
+
+See [Android Guide](./android.md#foreground-service-type-configuration) for all 14 valid types and their required permissions.
+
 > **Checkpoint:** Run `cargo check` — Tauri validates plugin configuration at build time.
 
 ## Add Permissions
@@ -165,15 +208,24 @@ The `background-service:default` permission grants access to all commands:
 | Stop service | `allow-stop` |
 | Check if running | `allow-is-running` |
 | Query service state | `allow-get-service-state` |
+| Get platform capabilities | `allow-get-platform-capabilities` |
+| Enable auto-restart | `allow-enable-auto-restart` |
+| Disable auto-restart | `allow-disable-auto-restart` |
+| Get desired service state | `allow-get-desired-service-state` |
+| Validate setup | `allow-validate-setup` |
+| Install OS service | `allow-install-service` |
+| Uninstall OS service | `allow-uninstall-service` |
+| Start OS service | `allow-start-os-service` |
+| Stop OS service | `allow-stop-os-service` |
+| Restart OS service | `allow-restart-os-service` |
+| Get OS service status | `allow-get-os-service-status` |
 
 To grant permissions individually instead:
 
 ```json
 "permissions": [
   "background-service:allow-start",
-  "background-service:allow-stop",
-  "background-service:allow-is-running",
-  "background-service:allow-get-service-state"
+  "background-service:allow-stop"
 ]
 ```
 
@@ -233,6 +285,38 @@ unlisten();
 
 > **Checkpoint:** Build and run the app. Call `startService()` from the browser console or a button click. Verify the notification appears and `isServiceRunning()` returns `true`.
 
+## Validate Your Setup
+
+After completing the integration above, run the setup validator to catch missing permissions, manifest entries, or configuration issues:
+
+```typescript
+import { validateBackgroundServiceSetup } from "tauri-plugin-background-service";
+
+const report = await validateBackgroundServiceSetup();
+
+if (report.ok) {
+  console.log("Setup OK");
+  if (report.warnings.length > 0) {
+    console.warn("Warnings:", report.warnings.map(w => w.message));
+  }
+} else {
+  console.error("Setup issues:");
+  for (const issue of report.errors) {
+    console.error(`  [${issue.code}] ${issue.message}`);
+    if (issue.fix) console.error(`    Fix: ${issue.fix}`);
+  }
+}
+```
+
+The validator checks platform-specific prerequisites:
+- **Android**: foreground service type/permission, `POST_NOTIFICATIONS`, boot receiver, `specialUse` subtype
+- **iOS**: `UIBackgroundModes`, `BGTaskSchedulerPermittedIdentifiers`, background refresh status
+- **Desktop**: service manager availability (systemd/launchd), systemd lingering, macOS sandbox
+
+Call this early in your app's lifecycle (e.g. on first launch) to surface configuration issues before the user encounters them at runtime.
+
+> **Checkpoint:** Run the validator on each target platform. Confirm `ok` is `true` or review warnings/errors and fix the reported issues.
+
 ## Verify
 
 ### Desktop
@@ -269,7 +353,27 @@ A persistent notification labeled "Service running" (or your custom `serviceLabe
 cargo tauri ios dev
 ```
 
-The service runs while the app is in the foreground. Background execution is limited to short windows (~30 seconds) managed by BGTaskScheduler.
+The service runs while the app is in the foreground. Background execution is limited to short, opportunistic windows (~30 seconds) managed by BGTaskScheduler. Ensure your `Info.plist` includes the required entries:
+
+```xml
+<!-- Required for BGTaskScheduler -->
+<key>UIBackgroundModes</key>
+<array>
+    <string>fetch</string>
+    <string>processing</string>
+</array>
+<key>BGTaskSchedulerPermittedIdentifiers</key>
+<array>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER).bg-refresh</string>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER).bg-processing</string>
+</array>
+```
+
+- `fetch` enables `BGAppRefreshTask` scheduling (~30s budget).
+- `processing` enables `BGProcessingTask` scheduling (minutes/hours, requires device idle).
+- Both task identifiers must match the plugin's `{bundleIdentifier}.bg-refresh` and `{bundleIdentifier}.bg-processing` pattern.
+
+If either key is missing, `startService()` will reject with `ServiceError::Platform("schedulerUnavailable")`.
 
 > **Checkpoint:** The service starts, runs, and stops without panics or errors in the console.
 

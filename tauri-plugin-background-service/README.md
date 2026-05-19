@@ -4,15 +4,40 @@
 
 A Tauri v2 plugin that manages long-lived background service lifecycle across all platforms (Android, iOS, Windows, macOS, Linux).
 
-You implement a single `BackgroundService` trait on your own struct. The plugin spawns it in a Tokio task, keeps the OS from killing it on mobile, and provides helpers for notifications and event emission. No business logic lives in the plugin — only lifecycle management.
+You implement a single `BackgroundService` trait on your own struct. The plugin spawns it in a Tokio task, manages OS-specific keepalive mechanisms (Android foreground service, iOS BGTaskScheduler, desktop OS service), and provides helpers for notifications and event emission. No business logic lives in the plugin — only lifecycle management.
+
+Use [`getPlatformCapabilities()`](./docs/api-reference.md#getplatformcapabilities) at runtime to query what the current platform can guarantee for background execution survival.
+
+## Platform Guarantees
+
+Background service survival varies significantly across platforms. The table below uses three guarantee levels:
+
+| | **Guaranteed** | **Best-effort** | **Unsupported** |
+|---|---|---|---|
+| Meaning | Platform reliably supports this scenario. | Platform may support this, but behavior depends on OEM, battery, OS scheduling, etc. | Platform does not support this scenario. |
+
+| Scenario | Android (FGS) | iOS (BGTaskScheduler) | Desktop in-process | Desktop OS service |
+|---|---|---|---|---|
+| Background execution | Guaranteed | Best-effort | Guaranteed | Guaranteed |
+| Survives app close | Best-effort | Best-effort | Unsupported | Guaranteed |
+| Survives reboot | Best-effort | Best-effort (scheduled only) | Unsupported | Guaranteed (if autostart enabled) |
+| Survives force quit | Unsupported | Unsupported | Unsupported | Unsupported |
+
+**Android:** Foreground Service with persistent notification. `START_STICKY` enables OS restart under memory pressure (best-effort). Boot recovery via `enableAutoRestart()`. Android 15 `dataSync` type has a 6-hour cumulative timeout. OEM battery optimization may kill services.
+
+**iOS:** BGTaskScheduler requests periodic execution windows (~30 seconds every 15+ minutes). Force-quitting the app kills all background tasks and prevents relaunch — this is an iOS design limitation.
+
+**Desktop:** In-process mode runs as a standard Tokio task. OS-service mode (systemd/launchd, requires `desktop-service` feature) provides guaranteed background execution and survives app close/reboot when autostart is enabled.
 
 ## Platform Support
 
 | Capability | Android | iOS | Desktop (Win/macOS/Linux) |
 |---|---|---|---|
-| Service runs in background | Foreground Service | BGAppRefreshTask + BGProcessingTask | Standard Tokio task |
+| Background execution | Foreground Service (guaranteed) | Best-effort scheduled execution (BGTaskScheduler) | Standard Tokio task (guaranteed) |
 | OS service mode | — | — | systemd / launchd (`desktop-service` feature) |
-| Service survives app close | `START_STICKY` | No | In-process: No; OS service: Yes |
+| Survives app close | Best-effort (`START_STICKY`) | Best-effort (scheduled only) | In-process: Unsupported; OS service: Guaranteed |
+| Survives reboot | Best-effort (boot receiver) | Best-effort (scheduled only) | In-process: Unsupported; OS service: Guaranteed (autostart) |
+| Survives force quit | Unsupported | Unsupported | Unsupported |
 | Local notifications | Yes | Yes | Yes |
 
 ## Installation
@@ -130,7 +155,18 @@ import {
   isServiceRunning,
   getServiceState,
   onPluginEvent,
+  getPlatformCapabilities,
+  enableAutoRestart,
+  disableAutoRestart,
+  getDesiredServiceState,
+  validateBackgroundServiceSetup,
+  normalizeBackgroundServiceError,
 } from 'tauri-plugin-background-service';
+
+// Query platform capabilities (call early to set UI expectations)
+const caps = await getPlatformCapabilities();
+console.log(caps.backgroundExecution);  // 'guaranteed' | 'bestEffort' | 'unsupported'
+console.log(caps.survivesReboot);       // 'guaranteed' | 'bestEffort' | 'unsupported'
 
 // Start the service (optionally configure the Android notification label)
 await startService({ serviceLabel: 'Syncing data' });
@@ -142,6 +178,11 @@ const running = await isServiceRunning();
 const status = await getServiceState();
 console.log(status.state); // 'idle' | 'initializing' | 'running' | 'stopped'
 console.log(status.lastError); // null or error message
+console.log(status.desiredRunning); // true | false | undefined
+console.log(status.nativeState); // 'idle' | 'running' | 'timeout' | ... | undefined
+
+// Enable auto-restart for recovery after process kill / reboot
+await enableAutoRestart();
 
 // Listen to lifecycle events
 const unlisten = await onPluginEvent((event) => {
@@ -158,8 +199,26 @@ const unlisten = await onPluginEvent((event) => {
   }
 });
 
-// Stop the service
+// Validate your platform setup (checks permissions, manifest entries)
+const report = await validateBackgroundServiceSetup();
+if (!report.ok) {
+  for (const err of report.errors) {
+    console.error(`[${err.code}] ${err.message}`);
+    if (err.fix) console.error(`  Fix: ${err.fix}`);
+  }
+}
+
+// Typed error handling (opt-in helper)
+try {
+  await startService({ serviceLabel: 'Syncing' });
+} catch (e) {
+  const err = normalizeBackgroundServiceError(e);
+  console.error(`[${err.code}] ${err.message}`);
+}
+
+// Stop the service and disable recovery
 await stopService();
+await disableAutoRestart();
 
 // Clean up listener
 unlisten();
@@ -173,10 +232,24 @@ When the `desktop-service` Cargo feature is enabled:
 import {
   installService,
   uninstallService,
+  startOsService,
+  stopOsService,
+  restartOsService,
+  getOsServiceStatus,
 } from 'tauri-plugin-background-service';
 
 // Install as OS-level daemon (systemd / launchd)
 await installService();
+
+// Check OS service status
+const status = await getOsServiceStatus();
+console.log(status.installed);    // 'notInstalled' | 'installed' | 'running'
+console.log(status.ipcConnected); // true | false
+
+// Manage the OS service lifecycle
+await startOsService();
+await stopOsService();
+await restartOsService();
 
 // Uninstall the OS service
 await uninstallService();
@@ -192,23 +265,42 @@ Add these to your app's capability configuration:
     "background-service:allow-start",
     "background-service:allow-stop",
     "background-service:allow-is-running",
-    "background-service:allow-get-service-state"
+    "background-service:allow-get-service-state",
+    "background-service:allow-get-platform-capabilities"
   ]
 }
+```
+
+For auto-restart and desired-state:
+
+```json
+"background-service:allow-enable-auto-restart",
+"background-service:allow-disable-auto-restart",
+"background-service:allow-get-desired-service-state"
+```
+
+For setup validation:
+
+```json
+"background-service:allow-validate-setup"
 ```
 
 For desktop service mode, also add:
 
 ```json
 "background-service:allow-install-service",
-"background-service:allow-uninstall-service"
+"background-service:allow-uninstall-service",
+"background-service:allow-start-os-service",
+"background-service:allow-stop-os-service",
+"background-service:allow-restart-os-service",
+"background-service:allow-get-os-service-status"
 ```
 
 ## Platform Notes
 
 ### Android
 
-The plugin uses a Foreground Service with a persistent notification to keep the process alive. Required additions to your app's `AndroidManifest.xml` (the plugin's manifest already declares these):
+The plugin uses a Foreground Service with a persistent notification to reduce the likelihood of the OS killing the process while backgrounded. Required additions to your app's `AndroidManifest.xml` (the plugin's manifest already declares these):
 
 - `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_DATA_SYNC` permissions
 - `POST_NOTIFICATIONS` runtime permission (requested automatically on Android 13+)
@@ -220,7 +312,7 @@ When the service is restarted by the OS, the Rust process is new. Persist any st
 
 ### iOS
 
-iOS background execution is **best-effort**. The plugin uses `BGTaskScheduler` to request periodic execution windows (~30 seconds every 15+ minutes). Required `Info.plist` additions:
+iOS background execution is **best-effort scheduled execution**. The plugin uses `BGTaskScheduler` to request periodic execution windows (~30 seconds every 15+ minutes). `startService()` returns a structured scheduling result indicating which task types were accepted. Force-quitting the app kills all background tasks and prevents relaunch. Required `Info.plist` additions:
 
 ```xml
 <key>BGTaskSchedulerPermittedIdentifiers</key>

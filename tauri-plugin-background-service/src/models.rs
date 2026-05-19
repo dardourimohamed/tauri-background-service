@@ -72,7 +72,7 @@ pub struct ServiceContext<R: Runtime> {
 }
 
 /// Optional startup configuration forwarded from JS through the plugin.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartConfig {
     /// Text shown in the Android persistent foreground notification.
@@ -141,6 +141,52 @@ pub struct PluginConfig {
     #[serde(default = "default_channel_capacity")]
     pub channel_capacity: usize,
 
+    /// Android foreground service types allowed for `startService()`.
+    /// Default: `["dataSync"]`. The preflight validation rejects any type
+    /// not in this list when `android_validate_foreground_service_type` is true.
+    #[serde(default = "default_android_foreground_service_types")]
+    pub android_foreground_service_types: Vec<String>,
+
+    /// Whether to validate the requested foreground service type against
+    /// `android_foreground_service_types` before starting the native service.
+    /// Default: true. Set to false to skip the allowlist check.
+    #[serde(default = "default_true")]
+    pub android_validate_foreground_service_type: bool,
+
+    /// Timeout policy for Android foreground service.
+    /// Values: "stop", "notifyUser" (default), "scheduleRecovery".
+    /// - "stop": set desiredRunning=false, stop service.
+    /// - "notifyUser": stop service, post timeout notification, keep desiredRunning=true.
+    /// - "scheduleRecovery": stop service, set recoveryPending=true, attempt reschedule.
+    #[serde(default = "default_android_on_timeout")]
+    pub android_on_timeout: String,
+
+    /// Android notification channel ID for the foreground service notification.
+    /// Default: "bg_service".
+    #[serde(default = "default_android_notification_channel_id")]
+    pub android_notification_channel_id: String,
+
+    /// Android notification channel name (visible to the user in system settings).
+    /// Default: "Background Service".
+    #[serde(default = "default_android_notification_channel_name")]
+    pub android_notification_channel_name: String,
+
+    /// Android notification ID for the foreground service notification.
+    /// Default: 9001.
+    #[serde(default = "default_android_notification_id")]
+    pub android_notification_id: u32,
+
+    /// Custom small icon resource name for the foreground notification.
+    /// When `None`, the system default (`android.R.drawable.ic_dialog_info`) is used.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub android_notification_small_icon: Option<String>,
+
+    /// Whether to show a stop action button on the foreground notification.
+    /// Default: true.
+    #[serde(default = "default_true")]
+    pub android_show_stop_action: bool,
+
     /// Desktop service mode: "inProcess" (default) or "osService".
     /// Controls whether the background service runs in-process or as a
     /// registered OS service/daemon.
@@ -153,6 +199,29 @@ pub struct PluginConfig {
     #[cfg(feature = "desktop-service")]
     #[serde(default)]
     pub desktop_service_label: Option<String>,
+
+    /// Whether the OS service should start automatically on boot (Linux) or
+    /// login (macOS). Only applies when `desktop_service_mode` is `"osService"`.
+    /// Default: false.
+    #[cfg(feature = "desktop-service")]
+    #[serde(default)]
+    pub desktop_service_autostart: bool,
+
+    /// When `true`, calling `startService()` will automatically start the OS
+    /// service if it is not already running (i.e. IPC is disconnected).
+    /// Only applies when `desktop_service_mode` is `"osService"`.
+    /// Default: false.
+    #[cfg(feature = "desktop-service")]
+    #[serde(default)]
+    pub desktop_start_service_if_missing: bool,
+
+    /// Timeout in milliseconds to wait for the IPC connection to become ready
+    /// after starting the OS service sidecar. Only applies when
+    /// `desktop_start_service_if_missing` is `true`.
+    /// Default: 5000 (5 seconds).
+    #[cfg(feature = "desktop-service")]
+    #[serde(default = "default_desktop_service_start_timeout_ms")]
+    pub desktop_service_start_timeout_ms: u64,
 }
 
 fn default_ios_safety_timeout() -> f64 {
@@ -175,6 +244,30 @@ fn default_ios_earliest_processing_begin_minutes() -> f64 {
     15.0
 }
 
+fn default_android_foreground_service_types() -> Vec<String> {
+    vec!["dataSync".into()]
+}
+
+fn default_android_on_timeout() -> String {
+    "notifyUser".into()
+}
+
+fn default_android_notification_channel_id() -> String {
+    "bg_service".into()
+}
+
+fn default_android_notification_channel_name() -> String {
+    "Background Service".into()
+}
+
+fn default_android_notification_id() -> u32 {
+    9001
+}
+
+fn default_true() -> bool {
+    true
+}
+
 fn default_channel_capacity() -> usize {
     16
 }
@@ -182,6 +275,11 @@ fn default_channel_capacity() -> usize {
 #[cfg(feature = "desktop-service")]
 fn default_desktop_service_mode() -> String {
     "inProcess".into()
+}
+
+#[cfg(feature = "desktop-service")]
+fn default_desktop_service_start_timeout_ms() -> u64 {
+    5000
 }
 
 impl Default for StartConfig {
@@ -211,6 +309,25 @@ pub enum ServiceState {
     Stopped,
 }
 
+/// Native platform-side state reported by the OS service layer.
+///
+/// Reflects the state as observed by the Android foreground service, iOS
+/// BGTask handler, or desktop OS-service process — distinct from the
+/// plugin-internal [`ServiceState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum NativeState {
+    Idle,
+    Starting,
+    Running,
+    Stopping,
+    Timeout,
+    Expired,
+    Recovering,
+    Error,
+}
+
 /// Snapshot of the service lifecycle status.
 ///
 /// Returned by the `get-service-state` command.
@@ -220,6 +337,147 @@ pub struct ServiceStatus {
     /// Current lifecycle state.
     pub state: ServiceState,
     /// Last error message, if the service stopped due to an error.
+    pub last_error: Option<String>,
+
+    // --- Extended fields (Step 4) ---
+    /// Whether the service is desired to be running (persisted across restarts).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub desired_running: Option<bool>,
+    /// Platform-native state as reported by the OS service layer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_state: Option<NativeState>,
+    /// The lifecycle mechanism in use on the current platform.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform_mode: Option<LifecycleMode>,
+    /// Configuration used for the last successful start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_start_config: Option<StartConfig>,
+    /// Epoch milliseconds of the last heartbeat received from the service.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat_at: Option<u64>,
+    /// How many restart attempts have been made since the last clean start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_attempt: Option<u32>,
+    /// Human-readable reason for the current recovery attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_reason: Option<String>,
+    /// Last platform-specific error message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform_error: Option<String>,
+}
+
+impl Default for ServiceStatus {
+    fn default() -> Self {
+        Self {
+            state: ServiceState::Idle,
+            last_error: None,
+            desired_running: None,
+            native_state: None,
+            platform_mode: None,
+            last_start_config: None,
+            last_heartbeat_at: None,
+            restart_attempt: None,
+            recovery_reason: None,
+            platform_error: None,
+        }
+    }
+}
+
+/// The operating system platform.
+///
+/// Returned by `get_platform_capabilities` to identify the current runtime environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum Platform {
+    Android,
+    Ios,
+    Windows,
+    Macos,
+    Linux,
+    Unknown,
+}
+
+/// The lifecycle mechanism used by the plugin on the current platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum LifecycleMode {
+    AndroidForegroundService,
+    IosBgTaskScheduler,
+    DesktopInProcess,
+    DesktopOsService,
+}
+
+/// Guarantee level for a specific background execution scenario.
+///
+/// - `Guaranteed`: The platform reliably supports this scenario.
+/// - `BestEffort`: The platform may support this scenario but cannot guarantee it.
+/// - `Unsupported`: The platform does not support this scenario.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum LifecycleGuarantee {
+    Guaranteed,
+    BestEffort,
+    Unsupported,
+}
+
+/// Platform-specific background execution capabilities.
+///
+/// Returned by the `get_platform_capabilities` Tauri command. Provides honest
+/// reporting of what each platform can guarantee for background service survival.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PlatformCapabilities {
+    pub platform: Platform,
+    pub lifecycle_mode: LifecycleMode,
+    pub survives_app_close: LifecycleGuarantee,
+    pub survives_reboot: LifecycleGuarantee,
+    pub survives_force_quit: LifecycleGuarantee,
+    pub background_execution: LifecycleGuarantee,
+    pub limitations: Vec<String>,
+    pub required_setup: Vec<String>,
+}
+
+/// OS service install/running state.
+///
+/// Reported by [`OsServiceStatus`] to indicate whether the OS-level service
+/// (systemd, launchd, etc.) is installed and/or currently running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum OsServiceInstallState {
+    /// The OS service is not installed.
+    NotInstalled,
+    /// The OS service is installed but not currently running.
+    Installed,
+    /// The OS service is installed and currently running.
+    Running,
+}
+
+/// Snapshot of an OS-level service's status.
+///
+/// Returned by `get_os_service_status` to report the state of the desktop
+/// OS service (systemd user service, launchd agent).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct OsServiceStatus {
+    /// The service label (e.g. `com.example.background-service`).
+    pub label: String,
+    /// The service manager kind (e.g. `systemd`, `launchd`).
+    pub mode: String,
+    /// Whether the service is installed and/or running.
+    pub installed: OsServiceInstallState,
+    /// Whether the IPC connection to the service sidecar is active.
+    pub ipc_connected: bool,
+    /// Path to the Unix domain socket used for IPC.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket_path: Option<String>,
+    /// Last error message from the OS service, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
 
@@ -247,10 +505,24 @@ impl Default for PluginConfig {
             ios_requires_external_power: false,
             ios_requires_network_connectivity: false,
             channel_capacity: default_channel_capacity(),
+            android_foreground_service_types: default_android_foreground_service_types(),
+            android_validate_foreground_service_type: default_true(),
+            android_on_timeout: default_android_on_timeout(),
+            android_notification_channel_id: default_android_notification_channel_id(),
+            android_notification_channel_name: default_android_notification_channel_name(),
+            android_notification_id: default_android_notification_id(),
+            android_notification_small_icon: None,
+            android_show_stop_action: default_true(),
             #[cfg(feature = "desktop-service")]
             desktop_service_mode: default_desktop_service_mode(),
             #[cfg(feature = "desktop-service")]
             desktop_service_label: None,
+            #[cfg(feature = "desktop-service")]
+            desktop_service_autostart: false,
+            #[cfg(feature = "desktop-service")]
+            desktop_start_service_if_missing: false,
+            #[cfg(feature = "desktop-service")]
+            desktop_service_start_timeout_ms: default_desktop_service_start_timeout_ms(),
         }
     }
 }
@@ -312,6 +584,83 @@ impl AutoStartConfig {
             None
         }
     }
+}
+
+/// Information about a pending iOS background task that launched the app.
+///
+/// Returned by `getPendingBgTask()` on iOS when the app was launched by iOS
+/// for a background task (BGAppRefreshTask or BGProcessingTask). Used by the
+/// Rust auto-start logic to detect OS-initiated launches and automatically
+/// start the service if `desired_running` is true.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct PendingTaskInfo {
+    /// The kind of background task: "refresh" or "processing".
+    pub task_kind: String,
+    /// The task identifier (e.g. "com.example.app.bg-refresh").
+    pub identifier: String,
+    /// Epoch timestamp (seconds) when the task was received by the native layer.
+    pub received_at: f64,
+}
+
+/// iOS scheduling status returned by the native layer.
+///
+/// Reports which background task types were successfully scheduled
+/// and any errors that occurred during scheduling. Returned by
+/// `get_scheduling_status` and parsed from `startKeepalive` on iOS.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct IOSSchedulingStatus {
+    /// Whether a `BGAppRefreshTask` was successfully scheduled.
+    pub refresh_scheduled: bool,
+    /// Whether a `BGProcessingTask` was successfully scheduled.
+    pub processing_scheduled: bool,
+    /// Error from `BGAppRefreshTask` scheduling, if any.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_error: Option<String>,
+    /// Error from `BGProcessingTask` scheduling, if any.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processing_error: Option<String>,
+}
+
+/// A single setup issue found during validation.
+///
+/// Part of [`SetupValidationReport`]. Each issue has a machine-readable code,
+/// a human-readable message, the platform it applies to, and an optional fix.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SetupIssue {
+    /// Machine-readable error code (e.g. "android_fgs_type").
+    pub code: String,
+    /// Human-readable description of the issue.
+    pub message: String,
+    /// The platform this issue applies to.
+    pub platform: Platform,
+    /// Suggested fix for the issue.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<String>,
+}
+
+/// Result of validating background service setup prerequisites.
+///
+/// Returned by `validateBackgroundServiceSetup()`. Contains `errors` (blocking
+/// issues that prevent the service from working) and `warnings` (non-blocking
+/// issues that may cause degraded behavior).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SetupValidationReport {
+    /// `true` when `errors` is empty (warnings do not affect this).
+    pub ok: bool,
+    /// Blocking issues that prevent the service from working correctly.
+    pub errors: Vec<SetupIssue>,
+    /// Non-blocking issues that may cause degraded behavior.
+    pub warnings: Vec<SetupIssue>,
 }
 
 #[cfg(test)]
@@ -899,6 +1248,367 @@ mod tests {
         );
     }
 
+    // --- PluginConfig android FGS type fields tests ---
+
+    #[test]
+    fn plugin_config_android_fgs_types_default() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.android_foreground_service_types, vec!["dataSync"]);
+    }
+
+    #[test]
+    fn plugin_config_android_fgs_types_custom() {
+        let json = r#"{"androidForegroundServiceTypes":["dataSync","specialUse"]}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.android_foreground_service_types,
+            vec!["dataSync", "specialUse"]
+        );
+    }
+
+    #[test]
+    fn plugin_config_android_fgs_types_serde_roundtrip() {
+        let config = PluginConfig {
+            android_foreground_service_types: vec!["location".into(), "connectedDevice".into()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            de.android_foreground_service_types,
+            vec!["location", "connectedDevice"]
+        );
+    }
+
+    #[test]
+    fn plugin_config_android_fgs_types_json_key_camel_case() {
+        let config = PluginConfig {
+            android_foreground_service_types: vec!["specialUse".into()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("androidForegroundServiceTypes"),
+            "JSON should use camelCase: {json}"
+        );
+    }
+
+    #[test]
+    fn plugin_config_android_validate_default() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert!(config.android_validate_foreground_service_type);
+    }
+
+    #[test]
+    fn plugin_config_android_validate_false() {
+        let json = r#"{"androidValidateForegroundServiceType":false}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.android_validate_foreground_service_type);
+    }
+
+    #[test]
+    fn plugin_config_android_validate_serde_roundtrip() {
+        let config = PluginConfig {
+            android_validate_foreground_service_type: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert!(!de.android_validate_foreground_service_type);
+    }
+
+    #[test]
+    fn plugin_config_android_validate_json_key_camel_case() {
+        let config = PluginConfig {
+            android_validate_foreground_service_type: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("androidValidateForegroundServiceType"),
+            "JSON should use camelCase: {json}"
+        );
+    }
+
+    // --- PluginConfig Android timeout/notification config tests ---
+
+    #[test]
+    fn plugin_config_android_on_timeout_default() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.android_on_timeout, "notifyUser");
+    }
+
+    #[test]
+    fn plugin_config_android_on_timeout_custom() {
+        let json = r#"{"androidOnTimeout":"stop"}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.android_on_timeout, "stop");
+    }
+
+    #[test]
+    fn plugin_config_android_on_timeout_schedule_recovery() {
+        let json = r#"{"androidOnTimeout":"scheduleRecovery"}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.android_on_timeout, "scheduleRecovery");
+    }
+
+    #[test]
+    fn plugin_config_android_on_timeout_serde_roundtrip() {
+        let config = PluginConfig {
+            android_on_timeout: "stop".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.android_on_timeout, "stop");
+    }
+
+    #[test]
+    fn plugin_config_android_on_timeout_json_key_camel_case() {
+        let config = PluginConfig {
+            android_on_timeout: "notifyUser".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("androidOnTimeout"),
+            "JSON should use camelCase: {json}"
+        );
+    }
+
+    #[test]
+    fn plugin_config_android_notification_channel_id_default() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.android_notification_channel_id, "bg_service");
+    }
+
+    #[test]
+    fn plugin_config_android_notification_channel_id_custom() {
+        let json = r#"{"androidNotificationChannelId":"my_channel"}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.android_notification_channel_id, "my_channel");
+    }
+
+    #[test]
+    fn plugin_config_android_notification_channel_id_serde_roundtrip() {
+        let config = PluginConfig {
+            android_notification_channel_id: "custom_ch".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.android_notification_channel_id, "custom_ch");
+    }
+
+    #[test]
+    fn plugin_config_android_notification_channel_id_json_key_camel_case() {
+        let config = PluginConfig {
+            android_notification_channel_id: "test".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("androidNotificationChannelId"),
+            "JSON should use camelCase: {json}"
+        );
+    }
+
+    #[test]
+    fn plugin_config_android_notification_channel_name_default() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.android_notification_channel_name,
+            "Background Service"
+        );
+    }
+
+    #[test]
+    fn plugin_config_android_notification_channel_name_custom() {
+        let json = r#"{"androidNotificationChannelName":"My Service"}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.android_notification_channel_name, "My Service");
+    }
+
+    #[test]
+    fn plugin_config_android_notification_channel_name_serde_roundtrip() {
+        let config = PluginConfig {
+            android_notification_channel_name: "Sync Service".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.android_notification_channel_name, "Sync Service");
+    }
+
+    #[test]
+    fn plugin_config_android_notification_channel_name_json_key_camel_case() {
+        let config = PluginConfig {
+            android_notification_channel_name: "Test".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("androidNotificationChannelName"),
+            "JSON should use camelCase: {json}"
+        );
+    }
+
+    #[test]
+    fn plugin_config_android_notification_id_default() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.android_notification_id, 9001);
+    }
+
+    #[test]
+    fn plugin_config_android_notification_id_custom() {
+        let json = r#"{"androidNotificationId":1234}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.android_notification_id, 1234);
+    }
+
+    #[test]
+    fn plugin_config_android_notification_id_serde_roundtrip() {
+        let config = PluginConfig {
+            android_notification_id: 42,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.android_notification_id, 42);
+    }
+
+    #[test]
+    fn plugin_config_android_notification_id_json_key_camel_case() {
+        let config = PluginConfig {
+            android_notification_id: 5555,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("androidNotificationId"),
+            "JSON should use camelCase: {json}"
+        );
+    }
+
+    #[test]
+    fn plugin_config_android_notification_small_icon_default() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.android_notification_small_icon, None);
+    }
+
+    #[test]
+    fn plugin_config_android_notification_small_icon_custom() {
+        let json = r#"{"androidNotificationSmallIcon":"ic_notification"}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.android_notification_small_icon,
+            Some("ic_notification".to_string())
+        );
+    }
+
+    #[test]
+    fn plugin_config_android_notification_small_icon_serde_roundtrip() {
+        let config = PluginConfig {
+            android_notification_small_icon: Some("my_icon".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.android_notification_small_icon, Some("my_icon".into()));
+    }
+
+    #[test]
+    fn plugin_config_android_notification_small_icon_absent_when_none() {
+        let config = PluginConfig {
+            android_notification_small_icon: None,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            !json.contains("androidNotificationSmallIcon"),
+            "should be absent when None: {json}"
+        );
+    }
+
+    #[test]
+    fn plugin_config_android_notification_small_icon_json_key_camel_case() {
+        let config = PluginConfig {
+            android_notification_small_icon: Some("icon".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("androidNotificationSmallIcon"),
+            "JSON should use camelCase: {json}"
+        );
+    }
+
+    #[test]
+    fn plugin_config_android_show_stop_action_default() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert!(config.android_show_stop_action);
+    }
+
+    #[test]
+    fn plugin_config_android_show_stop_action_false() {
+        let json = r#"{"androidShowStopAction":false}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.android_show_stop_action);
+    }
+
+    #[test]
+    fn plugin_config_android_show_stop_action_serde_roundtrip() {
+        let config = PluginConfig {
+            android_show_stop_action: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert!(!de.android_show_stop_action);
+    }
+
+    #[test]
+    fn plugin_config_android_show_stop_action_json_key_camel_case() {
+        let config = PluginConfig {
+            android_show_stop_action: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("androidShowStopAction"),
+            "JSON should use camelCase: {json}"
+        );
+    }
+
+    #[test]
+    fn plugin_config_android_timeout_notification_full_roundtrip() {
+        let config = PluginConfig {
+            android_on_timeout: "scheduleRecovery".into(),
+            android_notification_channel_id: "my_ch".into(),
+            android_notification_channel_name: "My Channel".into(),
+            android_notification_id: 42,
+            android_notification_small_icon: Some("ic_bg".into()),
+            android_show_stop_action: false,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.android_on_timeout, "scheduleRecovery");
+        assert_eq!(de.android_notification_channel_id, "my_ch");
+        assert_eq!(de.android_notification_channel_name, "My Channel");
+        assert_eq!(de.android_notification_id, 42);
+        assert_eq!(de.android_notification_small_icon, Some("ic_bg".into()));
+        assert!(!de.android_show_stop_action);
+    }
+
     // --- PluginConfig desktop fields tests (feature-gated) ---
 
     #[cfg(feature = "desktop-service")]
@@ -943,6 +1653,150 @@ mod tests {
         let json = r#"{"desktopServiceLabel":"my.svc"}"#;
         let config: PluginConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.desktop_service_label, Some("my.svc".to_string()));
+    }
+
+    // --- PluginConfig desktop autostart/start-if-missing/timeout tests ---
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn plugin_config_desktop_autostart_default() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.desktop_service_autostart);
+    }
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn plugin_config_desktop_autostart_true() {
+        let json = r#"{"desktopServiceAutostart":true}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert!(config.desktop_service_autostart);
+    }
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn plugin_config_desktop_autostart_serde_roundtrip() {
+        let config = PluginConfig {
+            desktop_service_autostart: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert!(de.desktop_service_autostart);
+    }
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn plugin_config_desktop_autostart_json_key_camel_case() {
+        let config = PluginConfig {
+            desktop_service_autostart: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("desktopServiceAutostart"),
+            "JSON should use camelCase: {json}"
+        );
+    }
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn plugin_config_desktop_start_if_missing_default() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.desktop_start_service_if_missing);
+    }
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn plugin_config_desktop_start_if_missing_true() {
+        let json = r#"{"desktopStartServiceIfMissing":true}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert!(config.desktop_start_service_if_missing);
+    }
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn plugin_config_desktop_start_if_missing_serde_roundtrip() {
+        let config = PluginConfig {
+            desktop_start_service_if_missing: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert!(de.desktop_start_service_if_missing);
+    }
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn plugin_config_desktop_start_if_missing_json_key_camel_case() {
+        let config = PluginConfig {
+            desktop_start_service_if_missing: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("desktopStartServiceIfMissing"),
+            "JSON should use camelCase: {json}"
+        );
+    }
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn plugin_config_desktop_start_timeout_default() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.desktop_service_start_timeout_ms, 5000);
+    }
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn plugin_config_desktop_start_timeout_custom() {
+        let json = r#"{"desktopServiceStartTimeoutMs":10000}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.desktop_service_start_timeout_ms, 10000);
+    }
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn plugin_config_desktop_start_timeout_serde_roundtrip() {
+        let config = PluginConfig {
+            desktop_service_start_timeout_ms: 15000,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.desktop_service_start_timeout_ms, 15000);
+    }
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn plugin_config_desktop_start_timeout_json_key_camel_case() {
+        let config = PluginConfig {
+            desktop_service_start_timeout_ms: 3000,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("desktopServiceStartTimeoutMs"),
+            "JSON should use camelCase: {json}"
+        );
+    }
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn plugin_config_desktop_all_new_fields_roundtrip() {
+        let config = PluginConfig {
+            desktop_service_autostart: true,
+            desktop_start_service_if_missing: true,
+            desktop_service_start_timeout_ms: 8000,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert!(de.desktop_service_autostart);
+        assert!(de.desktop_start_service_if_missing);
+        assert_eq!(de.desktop_service_start_timeout_ms, 8000);
     }
 
     use tauri::AppHandle;
@@ -1105,7 +1959,7 @@ mod tests {
     fn service_status_serde_roundtrip_idle() {
         let status = ServiceStatus {
             state: ServiceState::Idle,
-            last_error: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&status).unwrap();
         let de: ServiceStatus = serde_json::from_str(&json).unwrap();
@@ -1118,6 +1972,7 @@ mod tests {
         let status = ServiceStatus {
             state: ServiceState::Stopped,
             last_error: Some("init failed".into()),
+            ..Default::default()
         };
         let json = serde_json::to_string(&status).unwrap();
         let de: ServiceStatus = serde_json::from_str(&json).unwrap();
@@ -1129,7 +1984,7 @@ mod tests {
     fn service_status_json_keys_camel_case() {
         let status = ServiceStatus {
             state: ServiceState::Running,
-            last_error: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"state\":"), "state key: {json}");
@@ -1140,12 +1995,654 @@ mod tests {
     fn service_status_json_null_last_error() {
         let status = ServiceStatus {
             state: ServiceState::Idle,
-            last_error: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(
             json.contains("\"lastError\":null"),
             "lastError should be null: {json}"
         );
+    }
+
+    // --- Platform tests ---
+
+    #[test]
+    fn platform_serde_roundtrip() {
+        for variant in [
+            Platform::Android,
+            Platform::Ios,
+            Platform::Windows,
+            Platform::Macos,
+            Platform::Linux,
+            Platform::Unknown,
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let de: Platform = serde_json::from_str(&json).unwrap();
+            assert_eq!(de, variant);
+        }
+    }
+
+    #[test]
+    fn platform_json_values_are_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&Platform::Android).unwrap(),
+            "\"android\""
+        );
+        assert_eq!(serde_json::to_string(&Platform::Ios).unwrap(), "\"ios\"");
+        assert_eq!(
+            serde_json::to_string(&Platform::Windows).unwrap(),
+            "\"windows\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Platform::Macos).unwrap(),
+            "\"macos\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Platform::Linux).unwrap(),
+            "\"linux\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Platform::Unknown).unwrap(),
+            "\"unknown\""
+        );
+    }
+
+    // --- LifecycleMode tests ---
+
+    #[test]
+    fn lifecycle_mode_serde_roundtrip() {
+        for variant in [
+            LifecycleMode::AndroidForegroundService,
+            LifecycleMode::IosBgTaskScheduler,
+            LifecycleMode::DesktopInProcess,
+            LifecycleMode::DesktopOsService,
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let de: LifecycleMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(de, variant);
+        }
+    }
+
+    #[test]
+    fn lifecycle_mode_json_values_are_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&LifecycleMode::AndroidForegroundService).unwrap(),
+            "\"androidForegroundService\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleMode::IosBgTaskScheduler).unwrap(),
+            "\"iosBgTaskScheduler\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleMode::DesktopInProcess).unwrap(),
+            "\"desktopInProcess\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleMode::DesktopOsService).unwrap(),
+            "\"desktopOsService\""
+        );
+    }
+
+    // --- LifecycleGuarantee tests ---
+
+    #[test]
+    fn lifecycle_guarantee_serde_roundtrip() {
+        for variant in [
+            LifecycleGuarantee::Guaranteed,
+            LifecycleGuarantee::BestEffort,
+            LifecycleGuarantee::Unsupported,
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let de: LifecycleGuarantee = serde_json::from_str(&json).unwrap();
+            assert_eq!(de, variant);
+        }
+    }
+
+    #[test]
+    fn lifecycle_guarantee_json_values_are_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&LifecycleGuarantee::Guaranteed).unwrap(),
+            "\"guaranteed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleGuarantee::BestEffort).unwrap(),
+            "\"bestEffort\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleGuarantee::Unsupported).unwrap(),
+            "\"unsupported\""
+        );
+    }
+
+    // --- PlatformCapabilities tests ---
+
+    #[test]
+    fn platform_capabilities_serde_roundtrip() {
+        let caps = PlatformCapabilities {
+            platform: Platform::Android,
+            lifecycle_mode: LifecycleMode::AndroidForegroundService,
+            survives_app_close: LifecycleGuarantee::BestEffort,
+            survives_reboot: LifecycleGuarantee::BestEffort,
+            survives_force_quit: LifecycleGuarantee::Unsupported,
+            background_execution: LifecycleGuarantee::Guaranteed,
+            limitations: vec!["OEM battery optimization".into()],
+            required_setup: vec!["FOREGROUND_SERVICE permission".into()],
+        };
+        let json = serde_json::to_string(&caps).unwrap();
+        let de: PlatformCapabilities = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, caps);
+    }
+
+    #[test]
+    fn platform_capabilities_json_keys_camel_case() {
+        let caps = PlatformCapabilities {
+            platform: Platform::Linux,
+            lifecycle_mode: LifecycleMode::DesktopInProcess,
+            survives_app_close: LifecycleGuarantee::Unsupported,
+            survives_reboot: LifecycleGuarantee::Unsupported,
+            survives_force_quit: LifecycleGuarantee::Unsupported,
+            background_execution: LifecycleGuarantee::Guaranteed,
+            limitations: vec![],
+            required_setup: vec![],
+        };
+        let json = serde_json::to_string(&caps).unwrap();
+        assert!(json.contains("\"platform\":"), "platform: {json}");
+        assert!(json.contains("\"lifecycleMode\":"), "lifecycleMode: {json}");
+        assert!(
+            json.contains("\"survivesAppClose\":"),
+            "survivesAppClose: {json}"
+        );
+        assert!(
+            json.contains("\"survivesReboot\":"),
+            "survivesReboot: {json}"
+        );
+        assert!(
+            json.contains("\"survivesForceQuit\":"),
+            "survivesForceQuit: {json}"
+        );
+        assert!(
+            json.contains("\"backgroundExecution\":"),
+            "backgroundExecution: {json}"
+        );
+        assert!(json.contains("\"limitations\":"), "limitations: {json}");
+        assert!(json.contains("\"requiredSetup\":"), "requiredSetup: {json}");
+    }
+
+    #[test]
+    fn platform_capabilities_empty_collections_serialize() {
+        let caps = PlatformCapabilities {
+            platform: Platform::Unknown,
+            lifecycle_mode: LifecycleMode::DesktopInProcess,
+            survives_app_close: LifecycleGuarantee::Unsupported,
+            survives_reboot: LifecycleGuarantee::Unsupported,
+            survives_force_quit: LifecycleGuarantee::Unsupported,
+            background_execution: LifecycleGuarantee::Unsupported,
+            limitations: vec![],
+            required_setup: vec![],
+        };
+        let json = serde_json::to_string(&caps).unwrap();
+        assert!(json.contains("\"limitations\":[]"), "{json}");
+        assert!(json.contains("\"requiredSetup\":[]"), "{json}");
+    }
+
+    // --- NativeState tests ---
+
+    #[test]
+    fn native_state_serde_roundtrip() {
+        for variant in [
+            NativeState::Idle,
+            NativeState::Starting,
+            NativeState::Running,
+            NativeState::Stopping,
+            NativeState::Timeout,
+            NativeState::Expired,
+            NativeState::Recovering,
+            NativeState::Error,
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let de: NativeState = serde_json::from_str(&json).unwrap();
+            assert_eq!(de, variant, "roundtrip failed for {variant:?}");
+        }
+    }
+
+    #[test]
+    fn native_state_json_values_are_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&NativeState::Idle).unwrap(),
+            "\"idle\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NativeState::Starting).unwrap(),
+            "\"starting\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NativeState::Running).unwrap(),
+            "\"running\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NativeState::Stopping).unwrap(),
+            "\"stopping\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NativeState::Timeout).unwrap(),
+            "\"timeout\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NativeState::Expired).unwrap(),
+            "\"expired\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NativeState::Recovering).unwrap(),
+            "\"recovering\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NativeState::Error).unwrap(),
+            "\"error\""
+        );
+    }
+
+    // --- Extended ServiceStatus tests ---
+
+    #[test]
+    fn service_status_backward_compat_deserialize_old_json() {
+        let old_json = r#"{"state":"running","lastError":null}"#;
+        let status: ServiceStatus = serde_json::from_str(old_json).unwrap();
+        assert_eq!(status.state, ServiceState::Running);
+        assert_eq!(status.last_error, None);
+        assert_eq!(status.desired_running, None);
+        assert_eq!(status.native_state, None);
+        assert_eq!(status.platform_mode, None);
+        assert_eq!(status.last_start_config, None);
+        assert_eq!(status.last_heartbeat_at, None);
+        assert_eq!(status.restart_attempt, None);
+        assert_eq!(status.recovery_reason, None);
+        assert_eq!(status.platform_error, None);
+    }
+
+    #[test]
+    fn service_status_new_fields_serialize_when_present() {
+        let status = ServiceStatus {
+            state: ServiceState::Running,
+            last_error: None,
+            desired_running: Some(true),
+            native_state: Some(NativeState::Running),
+            platform_mode: Some(LifecycleMode::AndroidForegroundService),
+            last_start_config: Some(StartConfig::default()),
+            last_heartbeat_at: Some(1234567890),
+            restart_attempt: Some(2),
+            recovery_reason: Some("boot recovery".into()),
+            platform_error: Some("timeout exceeded".into()),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"desiredRunning\":true"), "{json}");
+        assert!(json.contains("\"nativeState\":\"running\""), "{json}");
+        assert!(
+            json.contains("\"platformMode\":\"androidForegroundService\""),
+            "{json}"
+        );
+        assert!(json.contains("\"lastHeartbeatAt\":1234567890"), "{json}");
+        assert!(json.contains("\"restartAttempt\":2"), "{json}");
+        assert!(
+            json.contains("\"recoveryReason\":\"boot recovery\""),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"platformError\":\"timeout exceeded\""),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn service_status_new_fields_absent_when_none() {
+        let status = ServiceStatus {
+            state: ServiceState::Idle,
+            last_error: None,
+            desired_running: None,
+            native_state: None,
+            platform_mode: None,
+            last_start_config: None,
+            last_heartbeat_at: None,
+            restart_attempt: None,
+            recovery_reason: None,
+            platform_error: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains("desiredRunning"), "should be absent: {json}");
+        assert!(!json.contains("nativeState"), "should be absent: {json}");
+        assert!(!json.contains("platformMode"), "should be absent: {json}");
+        assert!(
+            !json.contains("lastStartConfig"),
+            "should be absent: {json}"
+        );
+        assert!(
+            !json.contains("lastHeartbeatAt"),
+            "should be absent: {json}"
+        );
+        assert!(!json.contains("restartAttempt"), "should be absent: {json}");
+        assert!(!json.contains("recoveryReason"), "should be absent: {json}");
+        assert!(!json.contains("platformError"), "should be absent: {json}");
+    }
+
+    #[test]
+    fn service_status_default_impl() {
+        let status = ServiceStatus::default();
+        assert_eq!(status.state, ServiceState::Idle);
+        assert_eq!(status.last_error, None);
+        assert_eq!(status.desired_running, None);
+        assert_eq!(status.native_state, None);
+        assert_eq!(status.platform_mode, None);
+        assert_eq!(status.last_start_config, None);
+        assert_eq!(status.last_heartbeat_at, None);
+        assert_eq!(status.restart_attempt, None);
+        assert_eq!(status.recovery_reason, None);
+        assert_eq!(status.platform_error, None);
+    }
+
+    #[test]
+    fn service_status_full_roundtrip_with_all_fields() {
+        let status = ServiceStatus {
+            state: ServiceState::Running,
+            last_error: Some("previous crash".into()),
+            desired_running: Some(true),
+            native_state: Some(NativeState::Recovering),
+            platform_mode: Some(LifecycleMode::IosBgTaskScheduler),
+            last_start_config: Some(StartConfig {
+                service_label: "Sync".into(),
+                foreground_service_type: "dataSync".into(),
+            }),
+            last_heartbeat_at: Some(999),
+            restart_attempt: Some(3),
+            recovery_reason: Some("force stop".into()),
+            platform_error: Some("scheduler busy".into()),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let de: ServiceStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.state, ServiceState::Running);
+        assert_eq!(de.last_error, Some("previous crash".into()));
+        assert_eq!(de.desired_running, Some(true));
+        assert_eq!(de.native_state, Some(NativeState::Recovering));
+        assert_eq!(de.platform_mode, Some(LifecycleMode::IosBgTaskScheduler));
+        assert!(de.last_start_config.is_some());
+        assert_eq!(de.last_heartbeat_at, Some(999));
+        assert_eq!(de.restart_attempt, Some(3));
+        assert_eq!(de.recovery_reason, Some("force stop".into()));
+        assert_eq!(de.platform_error, Some("scheduler busy".into()));
+    }
+
+    #[test]
+    fn platform_capabilities_deserialize_from_json() {
+        let json = r#"{
+            "platform":"ios",
+            "lifecycleMode":"iosBgTaskScheduler",
+            "survivesAppClose":"bestEffort",
+            "survivesReboot":"bestEffort",
+            "survivesForceQuit":"unsupported",
+            "backgroundExecution":"bestEffort",
+            "limitations":["Cannot guarantee continuous execution"],
+            "requiredSetup":["UIBackgroundModes in Info.plist"]
+        }"#;
+        let caps: PlatformCapabilities = serde_json::from_str(json).unwrap();
+        assert_eq!(caps.platform, Platform::Ios);
+        assert_eq!(caps.lifecycle_mode, LifecycleMode::IosBgTaskScheduler);
+        assert_eq!(caps.survives_app_close, LifecycleGuarantee::BestEffort);
+        assert_eq!(caps.background_execution, LifecycleGuarantee::BestEffort);
+        assert_eq!(caps.limitations.len(), 1);
+        assert_eq!(caps.required_setup.len(), 1);
+    }
+
+    // --- IOSSchedulingStatus tests ---
+
+    #[test]
+    fn ios_scheduling_status_both_scheduled() {
+        let json = r#"{"refreshScheduled":true,"processingScheduled":true}"#;
+        let status: IOSSchedulingStatus = serde_json::from_str(json).unwrap();
+        assert!(status.refresh_scheduled);
+        assert!(status.processing_scheduled);
+        assert_eq!(status.refresh_error, None);
+        assert_eq!(status.processing_error, None);
+    }
+
+    #[test]
+    fn ios_scheduling_status_partial_success() {
+        let json = r#"{"refreshScheduled":true,"processingScheduled":false,"processingError":"not permitted"}"#;
+        let status: IOSSchedulingStatus = serde_json::from_str(json).unwrap();
+        assert!(status.refresh_scheduled);
+        assert!(!status.processing_scheduled);
+        assert_eq!(status.refresh_error, None);
+        assert_eq!(status.processing_error, Some("not permitted".to_string()));
+    }
+
+    #[test]
+    fn ios_scheduling_status_with_errors() {
+        let json = r#"{"refreshScheduled":false,"processingScheduled":false,"refreshError":"err1","processingError":"err2"}"#;
+        let status: IOSSchedulingStatus = serde_json::from_str(json).unwrap();
+        assert!(!status.refresh_scheduled);
+        assert!(!status.processing_scheduled);
+        assert_eq!(status.refresh_error, Some("err1".to_string()));
+        assert_eq!(status.processing_error, Some("err2".to_string()));
+    }
+
+    #[test]
+    fn ios_scheduling_status_serde_roundtrip() {
+        let status = IOSSchedulingStatus {
+            refresh_scheduled: true,
+            processing_scheduled: false,
+            refresh_error: None,
+            processing_error: Some("busy".into()),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let de: IOSSchedulingStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, status);
+    }
+
+    #[test]
+    fn ios_scheduling_status_json_keys_camel_case() {
+        let status = IOSSchedulingStatus {
+            refresh_scheduled: true,
+            processing_scheduled: true,
+            refresh_error: Some("err".into()),
+            processing_error: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"refreshScheduled\":"), "{json}");
+        assert!(json.contains("\"processingScheduled\":"), "{json}");
+        assert!(json.contains("\"refreshError\":"), "{json}");
+        assert!(
+            !json.contains("processingError"),
+            "None fields should be absent: {json}"
+        );
+    }
+
+    #[test]
+    fn ios_scheduling_status_from_value_null_errors() {
+        // Simulates the Swift response where errors are NSNull()
+        let json = r#"{"refreshScheduled":true,"processingScheduled":true,"refreshError":null,"processingError":null}"#;
+        let status: IOSSchedulingStatus = serde_json::from_str(json).unwrap();
+        assert!(status.refresh_scheduled);
+        assert!(status.processing_scheduled);
+        assert_eq!(status.refresh_error, None);
+        assert_eq!(status.processing_error, None);
+    }
+
+    #[test]
+    fn ios_scheduling_status_from_value_missing_errors() {
+        // Swift may not include error fields when scheduling succeeds
+        let json = r#"{"refreshScheduled":true,"processingScheduled":true}"#;
+        let status: IOSSchedulingStatus = serde_json::from_str(json).unwrap();
+        assert!(status.refresh_scheduled);
+        assert!(status.processing_scheduled);
+        assert_eq!(status.refresh_error, None);
+        assert_eq!(status.processing_error, None);
+    }
+
+    // --- OsServiceInstallState tests ---
+
+    #[test]
+    fn os_service_install_state_serde_roundtrip() {
+        for variant in [
+            OsServiceInstallState::NotInstalled,
+            OsServiceInstallState::Installed,
+            OsServiceInstallState::Running,
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let de: OsServiceInstallState = serde_json::from_str(&json).unwrap();
+            assert_eq!(de, variant, "roundtrip failed for {variant:?}");
+        }
+    }
+
+    #[test]
+    fn os_service_install_state_json_values_camel_case() {
+        assert_eq!(
+            serde_json::to_string(&OsServiceInstallState::NotInstalled).unwrap(),
+            "\"notInstalled\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OsServiceInstallState::Installed).unwrap(),
+            "\"installed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OsServiceInstallState::Running).unwrap(),
+            "\"running\""
+        );
+    }
+
+    // --- OsServiceStatus tests ---
+
+    #[test]
+    fn os_service_status_serde_roundtrip() {
+        let status = OsServiceStatus {
+            label: "com.example.bg-service".into(),
+            mode: "systemd".into(),
+            installed: OsServiceInstallState::Running,
+            ipc_connected: true,
+            socket_path: Some("/tmp/test.sock".into()),
+            last_error: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let de: OsServiceStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.label, "com.example.bg-service");
+        assert_eq!(de.mode, "systemd");
+        assert_eq!(de.installed, OsServiceInstallState::Running);
+        assert!(de.ipc_connected);
+        assert_eq!(de.socket_path, Some("/tmp/test.sock".into()));
+        assert_eq!(de.last_error, None);
+    }
+
+    #[test]
+    fn os_service_status_json_keys_camel_case() {
+        let status = OsServiceStatus {
+            label: "test".into(),
+            mode: "launchd".into(),
+            installed: OsServiceInstallState::Installed,
+            ipc_connected: false,
+            socket_path: Some("/run/test.sock".into()),
+            last_error: Some("timeout".into()),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"label\":"), "{json}");
+        assert!(json.contains("\"mode\":"), "{json}");
+        assert!(json.contains("\"installed\":"), "{json}");
+        assert!(json.contains("\"ipcConnected\":"), "{json}");
+        assert!(json.contains("\"socketPath\":"), "{json}");
+        assert!(json.contains("\"lastError\":"), "{json}");
+    }
+
+    #[test]
+    fn os_service_status_optional_fields_absent_when_none() {
+        let status = OsServiceStatus {
+            label: "test".into(),
+            mode: "systemd".into(),
+            installed: OsServiceInstallState::NotInstalled,
+            ipc_connected: false,
+            socket_path: None,
+            last_error: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains("socketPath"), "should be absent: {json}");
+        assert!(!json.contains("lastError"), "should be absent: {json}");
+    }
+
+    #[test]
+    fn os_service_status_with_all_optional_fields() {
+        let status = OsServiceStatus {
+            label: "com.test".into(),
+            mode: "launchd".into(),
+            installed: OsServiceInstallState::Running,
+            ipc_connected: true,
+            socket_path: Some("/var/run/com.test.sock".into()),
+            last_error: Some("connection refused".into()),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains("\"socketPath\":\"/var/run/com.test.sock\""),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"lastError\":\"connection refused\""),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn os_service_status_deserialize_from_json() {
+        let json = r#"{
+            "label":"com.example.svc",
+            "mode":"systemd",
+            "installed":"running",
+            "ipcConnected":true,
+            "socketPath":"/tmp/test.sock"
+        }"#;
+        let status: OsServiceStatus = serde_json::from_str(json).unwrap();
+        assert_eq!(status.label, "com.example.svc");
+        assert_eq!(status.mode, "systemd");
+        assert_eq!(status.installed, OsServiceInstallState::Running);
+        assert!(status.ipc_connected);
+        assert_eq!(status.socket_path, Some("/tmp/test.sock".into()));
+        assert_eq!(status.last_error, None);
+    }
+
+    // --- PendingTaskInfo tests ---
+
+    #[test]
+    fn pending_task_info_serde_roundtrip() {
+        let info = PendingTaskInfo {
+            task_kind: "refresh".into(),
+            identifier: "com.example.app.bg-refresh".into(),
+            received_at: 1700000000.123,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let de: PendingTaskInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, info);
+    }
+
+    #[test]
+    fn pending_task_info_json_keys_camel_case() {
+        let info = PendingTaskInfo {
+            task_kind: "processing".into(),
+            identifier: "test-id".into(),
+            received_at: 123456.0,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"taskKind\":"), "{json}");
+        assert!(json.contains("\"identifier\":"), "{json}");
+        assert!(json.contains("\"receivedAt\":"), "{json}");
+    }
+
+    #[test]
+    fn pending_task_info_from_native_response() {
+        // Simulates the Swift response when a pending task exists
+        let json = r#"{"taskKind":"refresh","identifier":"com.example.bg-refresh","receivedAt":1700000000.456}"#;
+        let info: PendingTaskInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.task_kind, "refresh");
+        assert_eq!(info.identifier, "com.example.bg-refresh");
+        assert!((info.received_at - 1700000000.456).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn pending_task_info_processing_kind() {
+        let json = r#"{"taskKind":"processing","identifier":"com.example.bg-processing","receivedAt":1700000000.0}"#;
+        let info: PendingTaskInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.task_kind, "processing");
+        assert_eq!(info.identifier, "com.example.bg-processing");
     }
 }

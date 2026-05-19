@@ -1,15 +1,15 @@
 # iOS Platform Guide
 
-This guide covers iOS-specific behavior for the background service plugin, including the BGTaskScheduler architecture, dual task support (BGAppRefreshTask + BGProcessingTask), timeout configuration, limitations, and debugging.
+This guide covers iOS-specific behavior for the background service plugin, including scheduled background execution via BGTaskScheduler, dual task support (BGAppRefreshTask + BGProcessingTask), scheduling results, desired-state persistence, timeout configuration, limitations, and debugging.
 
 ## How It Works
 
-On iOS, the plugin uses Apple's `BGTaskScheduler` API with **two task types** for background execution:
+On iOS, the plugin uses Apple's `BGTaskScheduler` API with **two task types** for **opportunistic, scheduled background execution**:
 
 1. **`BGAppRefreshTask`** — Short periodic work (~30 seconds). Registered as `{bundleIdentifier}.bg-refresh`.
 2. **`BGProcessingTask`** — Longer maintenance tasks (minutes to hours). Registered as `{bundleIdentifier}.bg-processing`.
 
-iOS background execution is fundamentally different from Android: the OS controls when and for how long your code runs. The plugin registers handlers for both task types and automatically schedules the next task after each completion.
+iOS background execution is fundamentally different from Android: the OS controls when and for how long your code runs. The plugin registers handlers for both task types and automatically schedules the next task after each completion. **iOS cannot guarantee continuous background execution** — your service runs in short, opportunistic windows controlled entirely by the system.
 
 ### Architecture
 
@@ -36,6 +36,88 @@ On expiration:
   → BGTask.setTaskCompleted(success: false)
   → scheduleNext() for next window
 ```
+
+## Background Task Lifecycle
+
+The following diagram shows the complete lifecycle from background transition through BGTask execution:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  App in Foreground                                       │
+│  Service runs continuously (no time limits)              │
+└─────────────────┬───────────────────────────────────────┘
+                  │ User backgrounds app
+                  ▼
+┌─────────────────────────────────────────────────────────┐
+│  appDidEnterBackground                                   │
+│  Plugin detects desired_running=true, no active BGTask   │
+│  → scheduleNext() submits BGAppRefreshTaskRequest        │
+│                    + BGProcessingTaskRequest              │
+└─────────────────┬───────────────────────────────────────┘
+                  │ iOS decides to launch (minutes/hours later)
+                  ▼
+┌─────────────────────────────────────────────────────────┐
+│  iOS launches app for BGTask                             │
+│  handleBackgroundTask() or handleProcessingTask() fires  │
+│  → Stores PendingTaskInfo (taskKind, identifier, time)   │
+│  → Sets expirationHandler                               │
+│  → Starts safety timer (refresh: 28s, processing: opt)   │
+└─────────────────┬───────────────────────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────────────────────┐
+│  Rust Auto-Start                                         │
+│  Plugin setup calls getPendingBgTask()                   │
+│  → PendingTaskInfo found                                │
+│  → Checks ios_desired_running in UserDefaults            │
+│  → If true: sends ManagerCommand::Start with stored cfg  │
+│  → Sets on_complete callback for completeBgTask()        │
+│  → Spawns cancel listener (waitForCancel)                │
+│  → Calls clearPendingBgTask()                            │
+└─────────────────┬───────────────────────────────────────┘
+                  │
+                  ▼
+┌─────────────────────────────────────────────────────────┐
+│  Service Execution                                       │
+│  BackgroundService::run() executes with CancellationToken│
+│  Must check ctx.shutdown.cancelled() via tokio::select!  │
+└────┬────────────────────────┬───────────────────────────┘
+     │                        │
+     ▼                        ▼
+┌──────────────┐   ┌──────────────────────┐
+│ Natural      │   │ Expiration / Timeout │
+│ Completion   │   │ iOS fires expiration │
+│ run() returns│   │ handler or safety    │
+│ on_complete  │   │ timer fires          │
+│ → setTask    │   │ → resolves waitFor   │
+│ Completed    │   │   Cancel             │
+│ (success:    │   │ → Rust cancels via   │
+│  true)       │   │   CancellationToken  │
+│              │   │ → on_complete        │
+│              │   │ → setTaskCompleted   │
+│              │   │   (success: false)   │
+└──────┬───────┘   └──────────┬───────────┘
+       │                      │
+       └──────────┬───────────┘
+                  ▼
+┌─────────────────────────────────────────────────────────┐
+│  Post-Task Cleanup                                       │
+│  scheduleNext() queues next BGAppRefreshTaskRequest      │
+│                    + BGProcessingTaskRequest              │
+│  Cleanup resets: task refs, cancel invoke, safety timer  │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Foreground/Background Transitions
+
+The plugin observes `UIApplication.didEnterBackgroundNotification` and `UIApplication.willEnterForegroundNotification` to manage the scheduling lifecycle:
+
+| Transition | Behavior |
+|------------|----------|
+| **Foreground → Background** | If `ios_desired_running == true` and no BGTask is currently active, the plugin calls `scheduleNext()` to submit both `BGAppRefreshTaskRequest` and `BGProcessingTaskRequest`. This ensures iOS has scheduled tasks that may relaunch the app. |
+| **Background → Foreground** | No special action. The service continues running uninterrupted while the app is active. |
+
+When the app transitions to the background with `desired_running=true`, the scheduling ensures iOS can potentially relaunch the app for a background task. When iOS does relaunch the app, the pending task bridge (described above) auto-starts the Rust service.
 
 ## Foreground vs Background Behavior
 
@@ -187,6 +269,99 @@ iOS cancellation uses the **Pending Invoke pattern**:
    - The BGTask is completed with `success: false`
    - Next task is scheduled
 
+## Completion Safety
+
+iOS requires `BGTask.setTaskCompleted(success:)` to be called **exactly once** per active background task. Calling it zero times causes iOS to kill the app process. Calling it twice causes undefined behavior.
+
+The plugin uses a `completeActiveTask(success:)` guard that ensures exactly-once completion across all terminal paths:
+
+| Terminal Path | What Triggers | `setTaskCompleted` Called |
+|---------------|---------------|---------------------------|
+| **Expiration** | iOS fires `expirationHandler` (~30s for refresh, system-decided for processing) | `completeActiveTask(success: false)` |
+| **Safety timer** | Plugin's internal timer fires before expiration (28s default for refresh, configurable for processing) | `completeActiveTask(success: false)` |
+| **Natural completion** | Rust `run()` returns normally | `completeActiveTask(success: true)` via `on_complete` callback |
+| **Explicit stop** | `stopService()` called from JS/Rust | `completeActiveTask(success: false)` via `stopKeepalive()` |
+
+The guard works by:
+
+1. Checking a `taskCompleted` flag before calling `setTaskCompleted`
+2. Setting the flag to `true` on first call and nil-ing the task reference
+3. Returning `false` (no-op) on subsequent calls
+4. Resetting the flag when a new BGTask handler fires or during cleanup
+
+This prevents double-completion in edge cases like:
+- Expiration handler fires while `completeBgTask` is in flight
+- Safety timer fires simultaneously with natural Rust completion
+- `stopService()` called after expiration already completed the task
+- `completeBgTask` called after `stopKeepalive` already cleaned up
+
+## Scheduling Results
+
+When you call `startService()` on iOS, the plugin submits both a `BGAppRefreshTaskRequest` and a `BGProcessingTaskRequest` to `BGTaskScheduler`. The `startKeepalive` call returns a structured result indicating which tasks were successfully scheduled:
+
+```typescript
+const status = await getSchedulingStatus();
+// {
+//   refreshScheduled: true,
+//   processingScheduled: true,
+//   refreshError: undefined,
+//   processingError: undefined
+// }
+```
+
+### Partial Success
+
+It is possible for one task type to be scheduled while the other fails. For example, `BGAppRefreshTask` may succeed while `BGProcessingTask` fails if the system conditions aren't favorable. The plugin logs partial failures as warnings and continues — at least one scheduled task type is enough for the service to run.
+
+When both scheduling attempts fail, the Swift layer rejects the invoke with `"schedulerUnavailable"`, which surfaces as `ServiceError::Platform("schedulerUnavailable")` in Rust. This typically means:
+
+- `BGTaskSchedulerPermittedIdentifiers` is missing from `Info.plist`
+- `UIBackgroundModes` doesn't include `fetch` and/or `processing`
+- The app is running in a context where BGTaskScheduler is unavailable (e.g. App Extension)
+
+### Querying Scheduling Status
+
+Use `getSchedulingStatus()` to check the current scheduling state at any time:
+
+```typescript
+import { getSchedulingStatus } from 'tauri-plugin-background-service';
+
+const status = await getSchedulingStatus();
+if (!status.refreshScheduled && !status.processingScheduled) {
+  console.warn('No background tasks scheduled:', status.refreshError, status.processingError);
+}
+```
+
+On non-iOS platforms, `getSchedulingStatus()` returns a default status with all fields set to `false`/`undefined`.
+
+## Desired State
+
+The plugin persists scheduling intent to `UserDefaults` so it can detect whether the service should be running across app launches. This is the iOS equivalent of Android's `SharedPreferences`-based durable state.
+
+### Persisted Keys
+
+| Key | Type | Set When |
+|-----|------|----------|
+| `ios_desired_running` | `Bool` | `startService()` sets `true`; `stopService()` sets `false` |
+| `ios_last_start_config` | `String` (JSON) | `startService()` with the start configuration |
+| `ios_last_schedule_error` | `String` | `startService()` if either scheduling attempt fails |
+| `ios_last_task_kind` | `String` | BGTask handler fires (`"refresh"` or `"processing"`) |
+| `ios_last_task_started_at` | `Double` (epoch) | BGTask handler fires |
+| `ios_last_task_completed_at` | `Double` (epoch) | Expiration handler, safety timer, or `stopService()` |
+
+### Lifecycle
+
+- `startService()` sets `ios_desired_running = true`, stores the start config, and clears `ios_last_task_completed_at`.
+- Each time iOS launches a BGTask, the plugin records the task kind and start time.
+- When the task completes (expiration, safety timer, or explicit stop), `ios_last_task_completed_at` is set.
+- `stopService()` sets `ios_desired_running = false` and records the completion time.
+
+### Limitations of Desired State
+
+- `UserDefaults` is **not** written when the user force-quits the app. Force-quit kills all background tasks immediately — iOS will not relaunch force-killed apps.
+- Desired state persists across normal app launches, but iOS provides no mechanism to auto-start your app based on it. It is informational only, useful for displaying UI state (e.g. "Background service was running before — restart?").
+- The values are only as recent as the last successful persistence call. If the app crashes between writes, some keys may be stale.
+
 ## Limitations
 
 ### No Guaranteed Execution
@@ -202,6 +377,19 @@ iOS decides when (or if) your background task runs. Factors that reduce executio
 ### No Auto-Restart
 
 Unlike Android, iOS does **not** automatically restart your service after the app is killed. The plugin schedules the next `BGAppRefreshTask` after each completion, but iOS may never invoke it.
+
+### Force-Quit Kills Everything
+
+When the user force-quits the app (swipe-up in app switcher), iOS:
+1. Immediately terminates all background tasks (`setTaskCompleted` is never called).
+2. Removes the app from BGTaskScheduler's eligible pool until the user manually launches it again.
+3. Does **not** deliver any callback or notification — the app process is simply killed.
+
+This is an iOS design limitation. There is no workaround. Only `location`, `audio`, and `VoIP` background modes can relaunch after force-quit, and App Store review requires legitimate use of these modes.
+
+### No Continuous Background Execution
+
+iOS does not support continuous background execution for general-purpose tasks. Each `BGAppRefreshTask` gives you ~30 seconds. Each `BGProcessingTask` can run longer but requires specific system conditions (device idle, charging). The OS may revoke execution at any time via the expiration handler.
 
 ### Simulator vs Device
 
