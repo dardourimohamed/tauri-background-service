@@ -3158,4 +3158,90 @@ mod tests {
             "desired_running should remain true"
         );
     }
+
+    // ── Cancel-listener actor-level integration tests ────────────────────────
+    //
+    // These tests exercise the full cmd_tx → manager_loop path that
+    // run_cancel_listener (in lib.rs) uses to send StopWithReason commands.
+    // They verify desired-state and keepalive behaviour with both
+    // MockDesiredStateBackend and MockMobile wired into the actor.
+
+    #[tokio::test]
+    async fn cancel_listener_platform_timeout_preserves_desired_and_stops_keepalive() {
+        let mock = MockMobile::new();
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        send_set_mobile(&handle, mock.clone()).await;
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let saves_before = backend.saves.lock().unwrap().len();
+
+        // Simulate what run_cancel_listener sends on timeout
+        send_stop_with_reason(&handle, StopReason::PlatformTimeout)
+            .await
+            .unwrap();
+
+        assert!(!send_is_running(&handle).await, "service should be stopped");
+
+        // PlatformTimeout should call stop_keepalive (unlike PlatformExpiration)
+        assert_eq!(
+            mock.stop_called.load(Ordering::Acquire),
+            1,
+            "PlatformTimeout should call stop_keepalive"
+        );
+
+        // Desired state should be preserved
+        let saves = backend.saves.lock().unwrap();
+        assert_eq!(
+            saves.len(),
+            saves_before,
+            "PlatformTimeout should not save new desired state"
+        );
+        assert!(
+            saves.last().unwrap().desired_running,
+            "desired_running should remain true"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_listener_user_stop_clears_desired_and_stops_keepalive() {
+        let mock = MockMobile::new();
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        send_set_mobile(&handle, mock.clone()).await;
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // UserStop via plain Stop command (delegates to StopWithReason(UserStop))
+        send_stop(&handle).await.unwrap();
+
+        assert!(!send_is_running(&handle).await, "service should be stopped");
+
+        // UserStop should call stop_keepalive
+        assert_eq!(
+            mock.stop_called.load(Ordering::Acquire),
+            1,
+            "UserStop should call stop_keepalive"
+        );
+
+        // Desired state should be cleared
+        let last = backend
+            .last_save()
+            .expect("should have saved desired state");
+        assert!(
+            !last.desired_running,
+            "UserStop should clear desired_running to false"
+        );
+    }
 }
