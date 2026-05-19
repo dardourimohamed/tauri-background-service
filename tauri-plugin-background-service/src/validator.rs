@@ -81,6 +81,20 @@ impl SetupValidator {
                         .into(),
                 ),
             },
+            SetupIssue {
+                code: "android_api35_boot_blocked_type".into(),
+                message:
+                    "Android 15 (API 35) blocks certain FGS types from starting in \
+                          BOOT_COMPLETED receivers: dataSync, camera, mediaPlayback, phoneCall, \
+                          mediaProjection, microphone. Boot recovery will not work with these types"
+                        .into(),
+                platform: Platform::Android,
+                fix: Some(
+                    "Use a non-blocked FGS type (e.g. connectedDevice, health, location, \
+                     mediaProcessing) for boot recovery, or handle re-launch via user interaction"
+                        .into(),
+                ),
+            },
         ];
 
         SetupValidationReport {
@@ -279,6 +293,42 @@ mod tests {
             codes.contains(&"android_special_use_subtype"),
             "Should warn about specialUse subtype: {codes:?}"
         );
+    }
+
+    #[test]
+    fn android_has_api35_boot_blocked_type_warning() {
+        let report = SetupValidator::validate(Platform::Android);
+        let codes: Vec<&str> = report.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert!(
+            codes.contains(&"android_api35_boot_blocked_type"),
+            "Should warn about API 35+ boot-blocked FGS types: {codes:?}"
+        );
+    }
+
+    #[test]
+    fn android_api35_boot_blocked_warning_lists_types() {
+        let report = SetupValidator::validate(Platform::Android);
+        let warning = report
+            .warnings
+            .iter()
+            .find(|w| w.code == "android_api35_boot_blocked_type")
+            .expect("Should have android_api35_boot_blocked_type warning");
+        for ty in &[
+            "dataSync",
+            "camera",
+            "mediaPlayback",
+            "phoneCall",
+            "mediaProjection",
+            "microphone",
+        ] {
+            assert!(
+                warning.message.contains(ty),
+                "Warning message should mention '{}': {}",
+                ty,
+                warning.message
+            );
+        }
+        assert!(warning.fix.is_some(), "Should have a fix suggestion");
     }
 
     #[test]
