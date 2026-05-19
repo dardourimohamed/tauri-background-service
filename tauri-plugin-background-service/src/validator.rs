@@ -137,6 +137,7 @@ impl SetupValidator {
         }
     }
 
+    #[allow(unused_mut)]
     fn desktop_checks(platform: Platform) -> SetupValidationReport {
         let mut errors: Vec<SetupIssue> = vec![];
         let mut warnings: Vec<SetupIssue> = vec![];
@@ -214,6 +215,7 @@ impl SetupValidator {
 }
 
 /// Check if a command exists in PATH.
+#[cfg(feature = "desktop-service")]
 fn which_exists(cmd: &str) -> bool {
     std::process::Command::new("which")
         .arg(cmd)
@@ -543,11 +545,13 @@ mod tests {
         assert!(!report.ok);
     }
 
+    #[cfg(feature = "desktop-service")]
     #[test]
     fn which_exists_true_for_ls() {
         assert!(which_exists("ls"), "ls should exist in PATH");
     }
 
+    #[cfg(feature = "desktop-service")]
     #[test]
     fn which_exists_false_for_nonsense() {
         assert!(

@@ -355,8 +355,7 @@ async fn service_context_fields_populated_on_mobile() {
 #[test]
 fn service_context_desktop_has_no_mobile_fields() {
     // The compile-time proof is inside models.rs unit tests (accesses pub(crate) Notifier).
-    // Here we just assert that we're on desktop where the fields are absent.
-    assert!(!cfg!(mobile), "this test should only run on desktop");
+    // The #[cfg(not(mobile))] gate above already ensures this runs on desktop only.
 }
 
 // ─── Test 10: Trait implementation compiles ───────────────────────────

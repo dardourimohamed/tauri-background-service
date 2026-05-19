@@ -1,4 +1,4 @@
-#![doc(html_root_url = "https://docs.rs/tauri-plugin-background-service/0.4.1")]
+#![doc(html_root_url = "https://docs.rs/tauri-plugin-background-service/0.5.3")]
 
 //! # tauri-plugin-background-service
 //!
@@ -379,9 +379,11 @@ async fn get_service_state<R: Runtime>(app: AppHandle<R>) -> Result<models::Serv
 }
 
 #[tauri::command]
+#[allow(unused_variables)]
 async fn get_platform_capabilities<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<models::PlatformCapabilities, String> {
+    #[cfg(feature = "desktop-service")]
     let plugin_config = app.state::<PluginConfig>();
 
     #[cfg(feature = "desktop-service")]
@@ -392,22 +394,21 @@ async fn get_platform_capabilities<R: Runtime>(
     let (platform, lifecycle_mode) =
         capabilities::CapabilityProvider::detect_platform(desktop_mode);
 
+    #[cfg(all(feature = "desktop-service", unix))]
     let os_service_installed = if matches!(lifecycle_mode, models::LifecycleMode::DesktopOsService)
     {
-        #[cfg(all(feature = "desktop-service", unix))]
-        {
-            use desktop::service_manager::{derive_service_label, DesktopServiceManager};
-            let label = derive_service_label(&app, plugin_config.desktop_service_label.as_deref());
-            let exec = std::env::current_exe().unwrap_or_default();
-            DesktopServiceManager::new(&label, exec)
-                .map(|_| true)
-                .unwrap_or(false)
-        }
-        #[cfg(not(all(feature = "desktop-service", unix)))]
-        false
+        use desktop::service_manager::{derive_service_label, DesktopServiceManager};
+        let label = derive_service_label(&app, plugin_config.desktop_service_label.as_deref());
+        let exec = std::env::current_exe().unwrap_or_default();
+        DesktopServiceManager::new(&label, exec)
+            .map(|_| true)
+            .unwrap_or(false)
     } else {
         false
     };
+
+    #[cfg(not(all(feature = "desktop-service", unix)))]
+    let os_service_installed = false;
 
     Ok(capabilities::CapabilityProvider::capabilities(
         platform,
@@ -561,6 +562,7 @@ async fn get_desired_service_state<R: Runtime>(
 /// Returns a [`SetupValidationReport`] with errors (blocking) and warnings
 /// (non-blocking) about platform-specific prerequisites.
 #[tauri::command]
+#[allow(unused_variables)]
 async fn validate_setup<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<models::SetupValidationReport, String> {
@@ -574,6 +576,7 @@ async fn validate_setup<R: Runtime>(
             .map_err(|e| e.to_string());
     }
 
+    #[cfg(feature = "desktop-service")]
     let plugin_config = app.state::<PluginConfig>();
 
     #[cfg(feature = "desktop-service")]
