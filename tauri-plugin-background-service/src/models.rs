@@ -594,6 +594,35 @@ impl<'de> serde::Deserialize<'de> for StopReason {
     }
 }
 
+/// Native platform lifecycle events sent from Kotlin/Swift to the Rust actor.
+///
+/// These events originate in the native layer and are forwarded to the actor
+/// via [`ManagerCommand::NativeLifecycleEvent`](crate::manager::ManagerCommand).
+/// The actor maps each variant to the appropriate [`StopReason`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+#[non_exhaustive]
+pub enum NativeLifecycleEvent {
+    /// User pressed stop on the Android foreground service notification.
+    AndroidNotificationStop,
+    /// Android system killed the foreground service due to a timeout.
+    AndroidTimeout {
+        /// The foreground service type that timed out (e.g. "dataSync").
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fgs_type: Option<String>,
+    },
+}
+
+impl NativeLifecycleEvent {
+    /// Map this native event to the corresponding [`StopReason`].
+    pub fn to_stop_reason(&self) -> StopReason {
+        match self {
+            Self::AndroidNotificationStop => StopReason::NativeNotificationStop,
+            Self::AndroidTimeout { .. } => StopReason::PlatformTimeout,
+        }
+    }
+}
+
 /// Built-in event types emitted by the runner itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
@@ -1070,6 +1099,56 @@ mod tests {
         assert!(
             result.is_err(),
             "unknown variant should fail to deserialize"
+        );
+    }
+
+    // --- NativeLifecycleEvent tests ---
+
+    #[test]
+    fn native_lifecycle_event_android_notification_stop_roundtrip() {
+        let event = NativeLifecycleEvent::AndroidNotificationStop;
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(json, r#"{"type":"androidNotificationStop"}"#);
+        let de: NativeLifecycleEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, event);
+    }
+
+    #[test]
+    fn native_lifecycle_event_android_timeout_roundtrip() {
+        let event = NativeLifecycleEvent::AndroidTimeout {
+            fgs_type: Some("dataSync".into()),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let de: NativeLifecycleEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, event);
+    }
+
+    #[test]
+    fn native_lifecycle_event_android_timeout_without_fgs_type() {
+        let event = NativeLifecycleEvent::AndroidTimeout { fgs_type: None };
+        let json = serde_json::to_string(&event).unwrap();
+        // skip_serializing_if means fgs_type is omitted when None
+        assert!(!json.contains("fgsType"), "{json}");
+        let de: NativeLifecycleEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, event);
+    }
+
+    #[test]
+    fn native_lifecycle_event_to_stop_reason_mapping() {
+        assert_eq!(
+            NativeLifecycleEvent::AndroidNotificationStop.to_stop_reason(),
+            StopReason::NativeNotificationStop
+        );
+        assert_eq!(
+            NativeLifecycleEvent::AndroidTimeout { fgs_type: None }.to_stop_reason(),
+            StopReason::PlatformTimeout
+        );
+        assert_eq!(
+            NativeLifecycleEvent::AndroidTimeout {
+                fgs_type: Some("dataSync".into())
+            }
+            .to_stop_reason(),
+            StopReason::PlatformTimeout
         );
     }
 

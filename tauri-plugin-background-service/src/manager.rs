@@ -105,6 +105,10 @@ pub enum ManagerCommand<R: Runtime> {
     GetDesiredState {
         reply: oneshot::Sender<Option<crate::desired_state::DesiredState>>,
     },
+    NativeLifecycleEvent {
+        event: crate::models::NativeLifecycleEvent,
+        reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
 }
 
 // ─── Handle ────────────────────────────────────────────────────────────
@@ -237,6 +241,24 @@ impl<R: Runtime> ServiceManagerHandle<R> {
             state: ServiceLifecycle::Idle,
             ..Default::default()
         })
+    }
+
+    /// Send a native lifecycle event to the actor.
+    ///
+    /// Maps the native event to the appropriate [`StopReason`] and delegates
+    /// to [`handle_stop_with_reason`].
+    #[doc(hidden)]
+    pub async fn send_native_lifecycle_event(
+        &self,
+        event: crate::models::NativeLifecycleEvent,
+    ) -> Result<(), ServiceError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ManagerCommand::NativeLifecycleEvent { event, reply })
+            .await
+            .map_err(|_| ServiceError::Runtime("manager actor shut down".into()))?;
+        rx.await
+            .map_err(|_| ServiceError::Runtime("manager actor dropped reply".into()))?
     }
 }
 
@@ -420,6 +442,10 @@ pub async fn manager_loop<R: Runtime>(
             }
             ManagerCommand::GetDesiredState { reply } => {
                 let _ = reply.send(handle_get_desired_state(&state));
+            }
+            ManagerCommand::NativeLifecycleEvent { event, reply } => {
+                let reason = event.to_stop_reason();
+                let _ = reply.send(handle_stop_with_reason(&mut state, reason));
             }
         }
     }
@@ -767,7 +793,7 @@ fn handle_get_desired_state<R: Runtime>(
 mod tests {
     use super::*;
     use crate::desired_state::DesiredState;
-    use crate::models::NativeState;
+    use crate::models::{NativeLifecycleEvent, NativeState};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicI8, AtomicU8, AtomicUsize};
 
@@ -3242,6 +3268,154 @@ mod tests {
         assert!(
             !last.desired_running,
             "UserStop should clear desired_running to false"
+        );
+    }
+
+    // ── Step 10 (task 3f1f): NativeLifecycleEvent command and handler tests ──
+
+    async fn send_native_event(
+        handle: &ServiceManagerHandle<tauri::test::MockRuntime>,
+        event: NativeLifecycleEvent,
+    ) -> Result<(), ServiceError> {
+        let (tx, rx) = oneshot::channel();
+        handle
+            .cmd_tx
+            .send(ManagerCommand::NativeLifecycleEvent { event, reply: tx })
+            .await
+            .unwrap();
+        rx.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn native_lifecycle_notification_stop_clears_desired_state() {
+        let mock = MockMobile::new();
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        send_set_mobile(&handle, mock.clone()).await;
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let saves_before = backend.saves.lock().unwrap().len();
+
+        send_native_event(&handle, NativeLifecycleEvent::AndroidNotificationStop)
+            .await
+            .unwrap();
+
+        assert!(!send_is_running(&handle).await, "service should be stopped");
+
+        // NativeNotificationStop clears desired state
+        let saves = backend.saves.lock().unwrap();
+        assert_eq!(saves.len(), saves_before + 1);
+        assert!(
+            !saves.last().unwrap().desired_running,
+            "AndroidNotificationStop should clear desired_running"
+        );
+
+        // stop_keepalive should have been called
+        assert_eq!(
+            mock.stop_called.load(Ordering::Acquire),
+            1,
+            "AndroidNotificationStop should call stop_keepalive"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_lifecycle_timeout_preserves_desired_state() {
+        let mock = MockMobile::new();
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        send_set_mobile(&handle, mock.clone()).await;
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let saves_before = backend.saves.lock().unwrap().len();
+
+        send_native_event(
+            &handle,
+            NativeLifecycleEvent::AndroidTimeout {
+                fgs_type: Some("dataSync".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!send_is_running(&handle).await, "service should be stopped");
+
+        // PlatformTimeout preserves desired state
+        let saves = backend.saves.lock().unwrap();
+        assert_eq!(
+            saves.len(),
+            saves_before,
+            "AndroidTimeout should not save new desired state"
+        );
+        assert!(
+            saves.last().unwrap().desired_running,
+            "desired_running should remain true"
+        );
+
+        // stop_keepalive should have been called (not PlatformExpiration)
+        assert_eq!(
+            mock.stop_called.load(Ordering::Acquire),
+            1,
+            "AndroidTimeout should call stop_keepalive"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_lifecycle_event_idempotent_when_already_stopped() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Stop first
+        send_stop(&handle).await.unwrap();
+        assert!(!send_is_running(&handle).await);
+
+        let saves_before = backend.saves.lock().unwrap().len();
+
+        // Send native event while already stopped — should be a no-op (NotRunning)
+        let result =
+            send_native_event(&handle, NativeLifecycleEvent::AndroidNotificationStop).await;
+        assert!(
+            matches!(result, Err(ServiceError::NotRunning)),
+            "native event while stopped should return NotRunning: {result:?}"
+        );
+
+        // No additional desired-state saves
+        {
+            let saves = backend.saves.lock().unwrap();
+            assert_eq!(
+                saves.len(),
+                saves_before,
+                "no additional saves when already stopped"
+            );
+        }
+
+        // Same for timeout variant
+        let result = send_native_event(
+            &handle,
+            NativeLifecycleEvent::AndroidTimeout { fgs_type: None },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ServiceError::NotRunning)),
+            "timeout while stopped should return NotRunning: {result:?}"
         );
     }
 }
