@@ -177,9 +177,45 @@ export async function isServiceRunning(): Promise<boolean> {
   return invoke<boolean>('plugin:background-service|is_running');
 }
 
-/** Returns the current service lifecycle state and optional error. */
+/**
+ * Returns the current service lifecycle state and optional error.
+ *
+ * @deprecated Use `getLifecycleStatus()` instead.
+ */
 export async function getServiceState(): Promise<ServiceStatus> {
-  return invoke<ServiceStatus>('plugin:background-service|get_service_state');
+  const status = await getLifecycleStatus();
+  return {
+    state: mapToServiceState(status.state),
+    lastError: status.lastError ?? null,
+    desiredRunning: status.desiredRunning,
+    nativeState: status.lastPlatformState,
+    platformMode: status.capabilities?.lifecycleMode,
+    lastStartConfig: status.lastStartConfig,
+    recoveryReason: status.recoveryReason,
+    platformError: status.lastPlatformError,
+  };
+}
+
+/** Map detailed LifecycleState to the legacy 4-value ServiceState. */
+function mapToServiceState(state: LifecycleState): ServiceState {
+  switch (state) {
+    case 'idle':
+      return 'idle';
+    case 'starting':
+    case 'recovering':
+    case 'recoveryPending':
+      return 'initializing';
+    case 'running':
+    case 'stopping':
+      return 'running';
+    case 'stopped':
+    case 'expired':
+    case 'blocked':
+    case 'error':
+      return 'stopped';
+    default:
+      return 'idle';
+  }
 }
 
 /** Returns platform-specific background execution capabilities. */
@@ -312,9 +348,11 @@ export interface DesiredServiceState {
  * Persists `desired_running=true` with an optional start config WITHOUT
  * starting the service. Platform recovery mechanisms will use this to
  * automatically restart the service after process kill or device reboot.
+ *
+ * @deprecated Use `configureRecovery({ enabled: true, config })` instead.
  */
 export async function enableAutoRestart(config?: StartConfig): Promise<void> {
-  await invoke('plugin:background-service|enable_auto_restart', { config });
+  await configureRecovery({ enabled: true, config });
 }
 
 /**
@@ -322,9 +360,11 @@ export async function enableAutoRestart(config?: StartConfig): Promise<void> {
  *
  * Persists `desired_running=false` and clears recovery fields WITHOUT
  * stopping the service if currently running.
+ *
+ * @deprecated Use `configureRecovery({ enabled: false })` instead.
  */
 export async function disableAutoRestart(): Promise<void> {
-  await invoke('plugin:background-service|disable_auto_restart');
+  await configureRecovery({ enabled: false });
 }
 
 /**
@@ -332,9 +372,20 @@ export async function disableAutoRestart(): Promise<void> {
  *
  * Returns the current recovery intent and metadata, or null if no
  * persistence backend is configured on the current platform.
+ *
+ * @deprecated Use `getLifecycleStatus()` instead.
  */
 export async function getDesiredServiceState(): Promise<DesiredServiceState | null> {
-  return invoke<DesiredServiceState | null>('plugin:background-service|get_desired_service_state');
+  const status = await getLifecycleStatus();
+  return {
+    desiredRunning: status.desiredRunning,
+    lastStartConfig: status.lastStartConfig,
+    lastNativeState: status.lastPlatformState,
+    lastPlatformError: status.lastPlatformError,
+    restartAttempt: 0,
+    recoveryPending: status.recoveryPending,
+    recoveryReason: status.recoveryReason,
+  };
 }
 
 // ─── Lifecycle API ───────────────────────────────────────────────────
