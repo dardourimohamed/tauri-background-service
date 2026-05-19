@@ -153,6 +153,21 @@
 
         .issue-error .issue-code { color: #F44336; }
         .issue-warning .issue-code { color: #FF9800; }
+        .issue-info .issue-code { color: #2196F3; }
+
+        .severity-badge {
+            display: inline-block;
+            padding: 1px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-right: 4px;
+        }
+        .severity-badge.error { background: #FFEBEE; color: #C62828; }
+        .severity-badge.warning { background: #FFF3E0; color: #E65100; }
+        .severity-badge.info { background: #E3F2FD; color: #1565C0; }
 
         .issue-msg {
             font-size: 12px;
@@ -188,6 +203,31 @@
         .log-entry.error { color: #F44336; }
         .log-entry.stopped { color: #F44336; }
 
+        .lifecycle-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .lifecycle-badge.idle { background: #E0E0E0; color: #757575; }
+        .lifecycle-badge.starting { background: #E3F2FD; color: #1565C0; }
+        .lifecycle-badge.running { background: #E8F5E9; color: #2E7D32; }
+        .lifecycle-badge.stopping { background: #FFF3E0; color: #E65100; }
+        .lifecycle-badge.stopped { background: #FFEBEE; color: #C62828; }
+        .lifecycle-badge.recovering { background: #F3E5F5; color: #6A1B9A; }
+        .lifecycle-badge.recoveryPending { background: #E0F2F1; color: #00695C; }
+        .lifecycle-badge.expired { background: #FFF3E0; color: #E65100; }
+        .lifecycle-badge.blocked { background: #FFEBEE; color: #C62828; }
+        .lifecycle-badge.error { background: #FFEBEE; color: #C62828; }
+
+        .kv-row { padding: 2px 0; }
+        .kv-row .label { color: #888; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .kv-row .value { font-weight: 500; color: #333; }
+
         .hidden { display: none; }
     </style>
 </head>
@@ -197,7 +237,7 @@
     <!-- Status -->
     <div class="status-line">
         <div class="status-dot" id="status-dot"></div>
-        <span id="status-text">Stopped</span>
+        <span id="status-text">idle</span>
     </div>
 
     <div class="tick-count">
@@ -209,24 +249,27 @@
     <button id="stop-btn" class="btn-red">Stop Service</button>
     <button id="check-btn" class="btn-blue">Check Status</button>
 
+    <!-- Validation Issues -->
+    <h2>Validation Issues</h2>
+    <div id="validation-issues-card" class="info-card" style="display:none;"></div>
+    <button id="validation-issues-btn" class="btn-teal">Refresh Issues</button>
+
     <!-- Platform Capabilities -->
     <h2>Platform Capabilities</h2>
     <div id="capabilities-card" class="info-card" style="display:none;"></div>
     <button id="capabilities-btn" class="btn-blue">Get Capabilities</button>
 
-    <!-- Extended Service State -->
-    <h2>Service State</h2>
-    <div id="state-card" class="info-card" style="display:none;"></div>
-    <button id="state-btn" class="btn-blue">Get Service State</button>
+    <!-- Lifecycle Status -->
+    <h2>Lifecycle Status</h2>
+    <div id="lifecycle-card" class="info-card" style="display:none;"></div>
+    <button id="lifecycle-btn" class="btn-blue">Get Lifecycle Status</button>
 
-    <!-- Auto-Restart -->
-    <h2>Auto-Restart</h2>
+    <!-- Recovery -->
+    <h2>Recovery</h2>
     <div class="btn-row">
-        <button id="enable-autorestart-btn" class="btn-green">Enable</button>
-        <button id="disable-autorestart-btn" class="btn-red">Disable</button>
+        <button id="enable-recovery-btn" class="btn-green">Enable</button>
+        <button id="disable-recovery-btn" class="btn-red">Disable</button>
     </div>
-    <button id="desired-state-btn" class="btn-blue">Get Desired State</button>
-    <div id="desired-state-card" class="info-card" style="display:none;"></div>
 
     <!-- Validate Setup -->
     <h2>Validate Setup</h2>
@@ -258,11 +301,9 @@
             startService,
             stopService,
             isServiceRunning,
-            getServiceState,
+            getLifecycleStatus,
             getPlatformCapabilities,
-            enableAutoRestart,
-            disableAutoRestart,
-            getDesiredServiceState,
+            configureRecovery,
             validateBackgroundServiceSetup,
             normalizeBackgroundServiceError,
             onPluginEvent,
@@ -275,11 +316,12 @@
         } from '@tauri-apps/plugin-background-service';
         import { listen } from '@tauri-apps/api/event';
 
-        function updateStatus(running) {
+        function updateStatus(state) {
             var statusText = document.getElementById('status-text');
             var statusDot = document.getElementById('status-dot');
-            statusText.textContent = running ? 'Running' : 'Stopped';
-            if (running) {
+            statusText.textContent = state;
+            var activeStates = ['running', 'starting', 'recovering', 'recoveryPending'];
+            if (activeStates.indexOf(state) >= 0) {
                 statusDot.classList.add('running');
             } else {
                 statusDot.classList.remove('running');
@@ -323,11 +365,12 @@
         async function initListeners() {
             await onPluginEvent(function(payload) {
                 if (payload.type === 'started') {
-                    updateStatus(true);
+                    updateStatus('running');
                     addLogEntry('info', 'Service started');
                 } else if (payload.type === 'stopped') {
-                    updateStatus(false);
-                    addLogEntry('stopped', 'Service stopped: ' + (payload.reason || 'unknown'));
+                    updateStatus('stopped');
+                    var reason = payload.reason || 'unknown';
+                    addLogEntry('stopped', 'Service stopped [stopReason: ' + reason + ']');
                 } else if (payload.type === 'error') {
                     addLogEntry('error', 'Service error: ' + (payload.message || 'unknown'));
                 }
@@ -340,9 +383,9 @@
             });
 
             await listen('service-stopped', function(event) {
-                var count = event.payload;
-                updateTickCount(count);
-                addLogEntry('stopped', 'Service stopped at tick #' + count);
+                updateStatus('stopped');
+                updateTickCount(event.payload);
+                addLogEntry('stopped', 'Service stopped at tick #' + event.payload);
             });
 
             addLogEntry('info', 'App initialized');
@@ -370,9 +413,9 @@
 
         document.getElementById('check-btn').addEventListener('click', async function() {
             try {
-                var running = await isServiceRunning();
-                updateStatus(running);
-                addLogEntry('info', 'Status: ' + (running ? 'Running' : 'Stopped'));
+                var status = await getLifecycleStatus();
+                updateStatus(status.state);
+                addLogEntry('info', 'Status: ' + status.state);
             } catch (e) {
                 handleError(e);
             }
@@ -401,87 +444,67 @@
             }
         });
 
-        // ── Extended Service State ─────────────────────────────────────
+        // ── Lifecycle Status ─────────────────────────────────────────────
 
-        document.getElementById('state-btn').addEventListener('click', async function() {
+        function lifecycleBadge(state) {
+            return '<span class="lifecycle-badge ' + state + '">' + esc(state) + '</span>';
+        }
+
+        document.getElementById('lifecycle-btn').addEventListener('click', async function() {
             try {
-                var st = await getServiceState();
-                var card = document.getElementById('state-card');
+                var ls = await getLifecycleStatus();
+                var card = document.getElementById('lifecycle-card');
                 card.style.display = 'block';
-                var rows = '<div class="info-grid">' +
-                    '<div><span class="label">State</span><br><span class="value">' + esc(st.state) + '</span></div>' +
-                    '<div><span class="label">LastError</span><br><span class="value">' + esc(st.lastError) + '</span></div>';
 
-                if (st.desiredRunning != null) {
-                    rows += '<div><span class="label">DesiredRunning</span><br><span class="value">' + esc(st.desiredRunning) + '</span></div>';
+                var html = '<div style="margin-bottom:6px;">' + lifecycleBadge(ls.state) + '</div>';
+                html += '<div class="info-grid">';
+
+                html += '<div class="kv-row"><span class="label">State</span><br><span class="value">' + lifecycleBadge(ls.state) + '</span></div>';
+                html += '<div class="kv-row"><span class="label">Platform</span><br><span class="value">' + esc(ls.platform) + '</span></div>';
+                html += '<div class="kv-row"><span class="label">DesiredRunning</span><br><span class="value">' + esc(ls.desiredRunning) + '</span></div>';
+                html += '<div class="kv-row"><span class="label">RecoveryEnabled</span><br><span class="value">' + esc(ls.recoveryEnabled) + '</span></div>';
+                html += '<div class="kv-row"><span class="label">RecoveryPending</span><br><span class="value">' + esc(ls.recoveryPending) + '</span></div>';
+
+                if (ls.lastError) {
+                    html += '<div class="kv-row"><span class="label">LastError</span><br><span class="value" style="color:#F44336;">' + esc(ls.lastError) + '</span></div>';
                 }
-                if (st.nativeState != null) {
-                    rows += '<div><span class="label">NativeState</span><br><span class="value">' + esc(st.nativeState) + '</span></div>';
+                if (ls.recoveryReason) {
+                    html += '<div class="kv-row"><span class="label">RecoveryReason</span><br><span class="value">' + esc(ls.recoveryReason) + '</span></div>';
                 }
-                if (st.platformMode != null) {
-                    rows += '<div><span class="label">PlatformMode</span><br><span class="value">' + esc(st.platformMode) + '</span></div>';
+                if (ls.lastPlatformState) {
+                    html += '<div class="kv-row"><span class="label">NativeState</span><br><span class="value">' + esc(ls.lastPlatformState) + '</span></div>';
                 }
-                if (st.restartAttempt != null) {
-                    rows += '<div><span class="label">RestartAttempt</span><br><span class="value">' + esc(st.restartAttempt) + '</span></div>';
+                if (ls.lastPlatformError) {
+                    html += '<div class="kv-row"><span class="label">PlatformError</span><br><span class="value" style="color:#F44336;">' + esc(ls.lastPlatformError) + '</span></div>';
                 }
-                if (st.recoveryReason != null) {
-                    rows += '<div><span class="label">RecoveryReason</span><br><span class="value">' + esc(st.recoveryReason) + '</span></div>';
+                if (ls.lastStartConfig) {
+                    html += '<div class="kv-row"><span class="label">StartConfig</span><br><span class="value">' + esc(JSON.stringify(ls.lastStartConfig)) + '</span></div>';
                 }
-                if (st.platformError != null) {
-                    rows += '<div><span class="label">PlatformError</span><br><span class="value">' + esc(st.platformError) + '</span></div>';
-                }
-                if (st.lastHeartbeatAt != null) {
-                    var d = new Date(st.lastHeartbeatAt);
-                    rows += '<div><span class="label">LastHeartbeat</span><br><span class="value">' + esc(d.toLocaleTimeString()) + '</span></div>';
-                }
-                rows += '</div>';
-                card.innerHTML = rows;
-                updateStatus(st.state === 'running');
-                addLogEntry('info', 'State: ' + st.state);
+
+                html += '</div>';
+                card.innerHTML = html;
+                updateStatus(ls.state);
+                addLogEntry('info', 'Lifecycle: ' + ls.state + ' / desired=' + ls.desiredRunning + ' / recovery=' + ls.recoveryEnabled);
             } catch (e) {
                 handleError(e);
             }
         });
 
-        // ── Auto-Restart ───────────────────────────────────────────────
+        // ── Recovery ────────────────────────────────────────────────────
 
-        document.getElementById('enable-autorestart-btn').addEventListener('click', async function() {
+        document.getElementById('enable-recovery-btn').addEventListener('click', async function() {
             try {
-                await enableAutoRestart({ serviceLabel: 'Test Service' });
-                addLogEntry('info', 'Auto-restart enabled');
+                await configureRecovery({ enabled: true, config: { serviceLabel: 'Test Service' } });
+                addLogEntry('info', 'Recovery enabled');
             } catch (e) {
                 handleError(e);
             }
         });
 
-        document.getElementById('disable-autorestart-btn').addEventListener('click', async function() {
+        document.getElementById('disable-recovery-btn').addEventListener('click', async function() {
             try {
-                await disableAutoRestart();
-                addLogEntry('info', 'Auto-restart disabled');
-            } catch (e) {
-                handleError(e);
-            }
-        });
-
-        document.getElementById('desired-state-btn').addEventListener('click', async function() {
-            try {
-                var ds = await getDesiredServiceState();
-                var card = document.getElementById('desired-state-card');
-                card.style.display = 'block';
-                if (ds == null) {
-                    card.innerHTML = '<span class="label">No desired state persisted</span>';
-                } else {
-                    card.innerHTML =
-                        '<div class="info-grid">' +
-                            '<div><span class="label">DesiredRunning</span><br><span class="value">' + esc(ds.desiredRunning) + '</span></div>' +
-                            '<div><span class="label">RestartAttempt</span><br><span class="value">' + esc(ds.restartAttempt) + '</span></div>' +
-                            '<div><span class="label">RecoveryPending</span><br><span class="value">' + esc(ds.recoveryPending) + '</span></div>' +
-                            (ds.recoveryReason != null ? '<div><span class="label">RecoveryReason</span><br><span class="value">' + esc(ds.recoveryReason) + '</span></div>' : '') +
-                            (ds.lastNativeState != null ? '<div><span class="label">LastNativeState</span><br><span class="value">' + esc(ds.lastNativeState) + '</span></div>' : '') +
-                            (ds.lastPlatformError != null ? '<div><span class="label">LastPlatformError</span><br><span class="value">' + esc(ds.lastPlatformError) + '</span></div>' : '') +
-                        '</div>';
-                }
-                addLogEntry('info', 'Desired state: ' + (ds ? (ds.desiredRunning ? 'running' : 'stopped') : 'null'));
+                await configureRecovery({ enabled: false });
+                addLogEntry('info', 'Recovery disabled');
             } catch (e) {
                 handleError(e);
             }
@@ -518,6 +541,41 @@
                 handleError(e);
             }
         });
+
+        // ── Validation Issues ─────────────────────────────────────────
+
+        async function renderValidationIssues() {
+            try {
+                var report = await validateBackgroundServiceSetup();
+                var card = document.getElementById('validation-issues-card');
+                card.style.display = 'block';
+                var issues = report.issues || [];
+                var html = '<div style="margin-bottom:6px;font-weight:600;">' +
+                    (issues.length === 0
+                        ? '<span style="color:#4CAF50;">&#10003; All Clear</span>'
+                        : '<span style="color:#F44336;">&#10007; Issues Found (' + issues.length + ')</span>') +
+                    '</div>';
+
+                if (issues.length > 0) {
+                    issues.forEach(function(issue) {
+                        html += '<div class="issue-item issue-' + esc(issue.severity) + '">' +
+                            '<span class="severity-badge ' + esc(issue.severity) + '">' + esc(issue.severity) + '</span>' +
+                            '<span class="issue-code">[' + esc(issue.code) + ']</span> ' +
+                            '<span class="issue-msg">' + esc(issue.message) + '</span>' +
+                            (issue.fix ? '<br><span class="issue-fix">Fix: ' + esc(issue.fix) + '</span>' : '') +
+                            '<br><span style="font-size:10px;color:#999;">' + esc(issue.platform) + '</span>' +
+                            '</div>';
+                    });
+                }
+
+                card.innerHTML = html;
+                addLogEntry('info', 'Validation issues: ' + issues.length + ' issue(s)');
+            } catch (e) {
+                handleError(e);
+            }
+        }
+
+        document.getElementById('validation-issues-btn').addEventListener('click', renderValidationIssues);
 
         // ── Desktop OS Service (gated) ────────────────────────────────
 
