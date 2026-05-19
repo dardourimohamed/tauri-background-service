@@ -2493,4 +2493,117 @@ mod tests {
             "recovery_reason should be None after stop"
         );
     }
+
+    // ── Step 5 (task 8763): Desktop persistence integration tests ──────────
+
+    use crate::desired_state::FileDesiredStateBackend;
+    use std::path::PathBuf;
+
+    fn temp_state_dir() -> PathBuf {
+        tempfile::tempdir().unwrap().keep()
+    }
+
+    fn file_backend(dir: PathBuf) -> Arc<dyn DesiredStateBackend> {
+        Arc::new(FileDesiredStateBackend::new(dir))
+    }
+
+    #[tokio::test]
+    async fn enable_auto_restart_persists_desired_running_true_to_file() {
+        let dir = temp_state_dir();
+        let backend = file_backend(dir.clone());
+        let handle = setup_manager_with_backend(Some(backend));
+
+        send_enable_auto_restart(&handle, None).await.unwrap();
+
+        // Verify the file was written with desired_running=true
+        let file_backend = FileDesiredStateBackend::new(dir);
+        let state = file_backend.load().unwrap();
+        assert!(
+            state.desired_running,
+            "file should contain desired_running=true after enable_auto_restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn simulated_process_restart_loads_persisted_state() {
+        let dir = temp_state_dir();
+        let backend = file_backend(dir.clone());
+        let config = StartConfig {
+            service_label: "PersistentSvc".into(),
+            foreground_service_type: "dataSync".into(),
+        };
+
+        // Simulate first process: enable auto-restart with config
+        let handle1 = setup_manager_with_backend(Some(backend));
+        send_enable_auto_restart(&handle1, Some(config.clone()))
+            .await
+            .unwrap();
+
+        // Drop the first manager (simulates process death)
+        drop(handle1);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Simulate second process: fresh manager with same backend dir
+        let backend2 = file_backend(dir.clone());
+        let handle2 = setup_manager_with_backend(Some(backend2));
+
+        // The fresh manager should be able to load the persisted state
+        let ds = send_get_desired_state(&handle2)
+            .await
+            .expect("should return persisted state");
+        assert!(
+            ds.desired_running,
+            "persisted desired_running should be true after simulated restart"
+        );
+        let saved_config = ds
+            .last_start_config
+            .expect("config should be persisted across restart");
+        assert_eq!(saved_config["serviceLabel"], "PersistentSvc");
+    }
+
+    #[tokio::test]
+    async fn disable_auto_restart_clears_file_backed_state() {
+        let dir = temp_state_dir();
+        let backend = file_backend(dir.clone());
+        let handle = setup_manager_with_backend(Some(backend));
+
+        // First enable
+        send_enable_auto_restart(&handle, None).await.unwrap();
+        let ds = send_get_desired_state(&handle)
+            .await
+            .expect("should return state");
+        assert!(ds.desired_running, "should be true after enable");
+
+        // Now disable
+        send_disable_auto_restart(&handle).await.unwrap();
+
+        // Verify file-backed state is now false with cleared fields
+        let file_backend = FileDesiredStateBackend::new(dir);
+        let state = file_backend.load().unwrap();
+        assert!(
+            !state.desired_running,
+            "file should contain desired_running=false after disable"
+        );
+        assert!(
+            state.last_start_config.is_none(),
+            "config should be cleared"
+        );
+        assert!(
+            state.last_start_epoch_ms.is_none(),
+            "epoch should be cleared"
+        );
+        assert!(!state.recovery_pending, "recovery should be cleared");
+        assert_eq!(state.restart_attempt, 0, "restart_attempt should be 0");
+    }
+
+    #[tokio::test]
+    async fn file_backend_get_desired_state_returns_none_without_backend() {
+        let handle = setup_manager();
+
+        let ds = send_get_desired_state(&handle).await;
+        assert!(
+            ds.is_none(),
+            "get_desired_state should return None without backend (existing behavior preserved)"
+        );
+    }
 }
