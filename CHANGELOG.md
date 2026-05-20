@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-05-20
+
+### Changed
+
+- Update documentation to reflect v0.7.0 API surface
+- Use npm trusted publishing with provenance in CI workflow
+
 ## [0.7.0] - 2026-05-20
 
 ### Added
@@ -271,7 +278,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Notifier` helper for fire-and-forget local notifications
 - `StartConfig` with configurable `serviceLabel` and `foregroundServiceType`
 
-[Unreleased]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.7.0...HEAD
+[Unreleased]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.7.1...HEAD
+[0.7.1]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.7.0...plugin-v0.7.1
 [0.7.0]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.6.0...plugin-v0.7.0
 [0.6.0]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.5.2...plugin-v0.6.0
 [0.5.2]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.5.1...plugin-v0.5.2
