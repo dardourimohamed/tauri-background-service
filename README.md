@@ -15,6 +15,8 @@ You implement a single `BackgroundService` trait on your own struct. The plugin 
 | Service survives app close | `START_STICKY` | No | In-process: No; OS service: Yes |
 | Local notifications | Yes | Yes | Yes |
 
+**Key features:** Structured stop reasons (`StopReason`), native lifecycle events from OS, full lifecycle status API (`getLifecycleStatus()`), runtime recovery configuration (`configureRecovery()`), enhanced validation with severity levels, desktop file-based persistence, iOS UserDefaults persistence for BGTask info.
+
 ## Installation
 
 ### Rust
@@ -25,7 +27,7 @@ Add the plugin to your app's `Cargo.toml`:
 [dependencies]
 tauri = { version = "2" }
 tauri-plugin-notification = "2"
-tauri-plugin-background-service = "0.5"
+tauri-plugin-background-service = "0.7"
 ```
 
 ### npm (TypeScript API)

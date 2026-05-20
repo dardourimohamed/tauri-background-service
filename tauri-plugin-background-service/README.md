@@ -50,7 +50,7 @@ Add the plugin to your app's `Cargo.toml`:
 [dependencies]
 tauri = { version = "2" }
 tauri-plugin-notification = "2"
-tauri-plugin-background-service = "0.5"
+tauri-plugin-background-service = "0.7"
 ```
 
 ### npm (TypeScript API)
@@ -336,7 +336,7 @@ No special OS integration is needed. The service runs as a standard Tokio task a
 For OS-level daemon mode (systemd / launchd), enable the `desktop-service` Cargo feature:
 
 ```toml
-tauri-plugin-background-service = { version = "0.5", features = ["desktop-service"] }
+tauri-plugin-background-service = { version = "0.7", features = ["desktop-service"] }
 ```
 
 ## Links

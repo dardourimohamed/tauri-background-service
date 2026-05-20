@@ -22,7 +22,7 @@ Add the plugin and its notification dependency to your app's `Cargo.toml`:
 
 ```toml
 [dependencies]
-tauri-plugin-background-service = "0.5"
+tauri-plugin-background-service = "0.7"
 tauri-plugin-notification = "2"
 ```
 
@@ -146,7 +146,7 @@ For OS-service mode on Linux and macOS, enable the `desktop-service` feature fla
 
 ```toml
 [dependencies]
-tauri-plugin-background-service = { version = "0.5", features = ["desktop-service"] }
+tauri-plugin-background-service = { version = "0.7", features = ["desktop-service"] }
 ```
 
 ```json
@@ -219,6 +219,14 @@ The `background-service:default` permission grants access to all commands:
 | Stop OS service | `allow-stop-os-service` |
 | Restart OS service | `allow-restart-os-service` |
 | Get OS service status | `allow-get-os-service-status` |
+
+The following permissions are **opt-in** (not included in `background-service:default`):
+
+| Command | Permission | Description |
+|---------|------------|-------------|
+| Get lifecycle status | `allow-get-lifecycle-status` | Full lifecycle status snapshot with state, recovery config, and issues |
+| Configure recovery | `allow-configure-recovery` | Runtime control of auto-recovery behavior |
+| Native lifecycle event | `allow-native-lifecycle-event` | Internal: receives OS lifecycle transitions from native layer |
 
 To grant permissions individually instead:
 

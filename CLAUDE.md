@@ -15,7 +15,7 @@ tauri-plugin-background-service/     ← Plugin crate
 ├── src/
 │   ├── lib.rs                       ← Plugin builder, Tauri commands, iOS helpers
 │   ├── manager.rs                   ← Actor loop, ServiceManagerHandle, command handlers
-│   ├── models.rs                    ← StartConfig, PluginConfig, PluginEvent, ServiceContext, AutoStartConfig
+│   ├── models.rs                    ← StartConfig, PluginConfig, PluginEvent, ServiceContext, AutoStartConfig, StopReason, NativeLifecycleEvent, LifecycleState, LifecycleStatus, Severity, ValidationIssue
 │   ├── error.rs                     ← ServiceError enum
 │   ├── service_trait.rs             ← BackgroundService<R> trait (object-safe)
 │   ├── notifier.rs                  ← Notifier wrapper over tauri-plugin-notification
@@ -51,9 +51,9 @@ Run from `tauri-plugin-background-service/` directory unless noted:
 ## Code Style
 
 - **Async trait:** `BackgroundService<R>` uses `#[async_trait]` for object safety — `Box<dyn BackgroundService<R>>`.
-- **Non-exhaustive enums:** All public enums (`ServiceError`, `PluginEvent`, `ManagerCommand`) are `#[non_exhaustive]`.
+- **Non-exhaustive enums:** All public enums (`ServiceError`, `PluginEvent`, `ManagerCommand`, `StopReason`, `NativeLifecycleEvent`, `LifecycleState`, `Severity`) are `#[non_exhaustive]`.
 - **Error handling:** `ServiceError` variants: `AlreadyRunning`, `NotRunning`, `Init(String)`, `Runtime(String)`, `Platform(String)`.
-- **Serialization:** `#[serde(rename_all = "camelCase")]` on all JSON-facing types. Tagged enum for `PluginEvent`: `{ "type": "started" }`, `{ "type": "stopped", "reason": "..." }`, `{ "type": "error", "message": "..." }`.
+- **Serialization:** `#[serde(rename_all = "camelCase")]` on all JSON-facing types. Tagged enum for `PluginEvent`: `{ "type": "started" }`, `{ "type": "stopped", "reason": "..." }`, `{ "type": "error", "message": "..." }`. `StopReason` uses legacy string mappings for backward compat (`"completed"` → `TaskCompleted`).
 - **Naming:** Rust modules/files use snake_case. Public types use PascalCase. JS API uses camelCase.
 
 ## Architecture
@@ -66,7 +66,11 @@ init_with_service(factory)        ← Entry point: creates mpsc channel, spawns 
        └─ manager_loop(cmd_rx)    ← Actor: receives ManagerCommand, dispatches
             ├─ Start              → handle_start(): check AlreadyRunning → create CancellationToken → increment generation → start keepalive → spawn service task (init → run)
             ├─ Stop               → handle_stop(): cancel token → stop keepalive
+            ├─ StopWithReason     → handle_stop_with_reason(): cancel token → apply desired-state policy → stop keepalive
             ├─ IsRunning          → check token slot
+            ├─ GetState           → returns ServiceStatus snapshot
+            ├─ GetLifecycleStatus → returns LifecycleStatus (richer snapshot with state, desired state, recovery config, issues)
+            ├─ NativeLifecycleEvent → process OS-signaled lifecycle transitions from Kotlin/Swift
             ├─ SetOnComplete      → store callback (captured at spawn time)
             └─ SetMobile          → store mobile keepalive handle
 ```
@@ -76,6 +80,9 @@ Key mechanisms:
 - **CancellationToken** (`tokio_util`): Cooperative shutdown. Shared via `Arc<Mutex<Option<CancellationToken>>>`.
 - **Factory pattern**: `ServiceFactory<R> = Box<dyn Fn() -> Box<dyn BackgroundService<R>>>`. Fresh instance per start.
 - **Mobile keepalive**: `MobileKeepalive` trait abstracts Android foreground service and iOS BGTaskScheduler. Set via `SetMobile` command during plugin setup.
+- **StopReason**: Structured enum for why a service stopped (user, platform timeout, expiration, boot recovery, etc.). Enables platform-specific desired-state policies on stop.
+- **Desktop persistence**: `FileDesiredStateBackend` persists desired state to filesystem on desktop, enabling auto-recovery across app restarts.
+- **Native lifecycle events**: `NativeLifecycleEvent` enum carries OS-signaled transitions (e.g., Android FGS timeout, iOS expiration) from native layers to the Rust actor.
 
 ## Constraints
 

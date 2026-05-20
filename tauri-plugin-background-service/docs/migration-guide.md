@@ -58,7 +58,7 @@ To use the desktop OS service mode:
 
 ```toml
 [dependencies]
-tauri-plugin-background-service = { version = "0.5", features = ["desktop-service"] }
+tauri-plugin-background-service = { version = "0.7", features = ["desktop-service"] }
 ```
 
 2. Configure in `tauri.conf.json`:
@@ -298,6 +298,86 @@ try {
 - Existing `BackgroundService<R>` trait implementations
 - Existing `onPluginEvent()` listeners
 - Existing `ServiceStatus` consumers — new fields are optional and omitted when not applicable
+
+## 0.6 → 0.7 Migration
+
+There are **no breaking changes** in 0.7. All 0.6 code continues to work unchanged.
+
+### What's New
+
+| Feature | Platform | Description |
+|---------|----------|-------------|
+| `StopReason` enum | All | 9 structured stop reason variants replacing plain strings in `PluginEvent.Stopped` |
+| `NativeLifecycleEvent` | All | OS-signaled lifecycle transitions from Kotlin/Swift to Rust actor |
+| `LifecycleState` / `LifecycleStatus` | All | 10-state lifecycle model with full status snapshot |
+| `getLifecycleStatus()` | All | New command for complete lifecycle status |
+| `configureRecovery()` | All | Runtime control of auto-recovery behavior |
+| `Severity` / `ValidationIssue` | All | Typed validation with severity levels |
+| `issues` field on `SetupValidationReport` | All | Unified issues list with typed severity alongside `errors`/`warnings` |
+| `android_request_notification_permission_on_load` | Android | Configurable notification permission prompt on plugin load (default: `true`) |
+| Desktop `FileDesiredStateBackend` | Desktop | File-based desired state persistence for auto-recovery across app restarts |
+| iOS UserDefaults persistence | iOS | Pending BGTask info persisted to survive timing gaps |
+| `consumedAt` on `PendingTaskInfo` | iOS | Track when auto-start consumed the pending task |
+| `label` serde alias on `StartConfig.service_label` | iOS | Config migration support for iOS |
+| 3 new permissions | All | `allow-get-lifecycle-status`, `allow-configure-recovery`, `allow-native-lifecycle-event` |
+
+### Changed: PluginEvent.Stopped.reason type
+
+The `reason` field in `PluginEvent.Stopped` changed from a plain `String` to a structured `StopReason` enum. The TypeScript type is now:
+
+```typescript
+// Before (0.6):
+type PluginEvent = { type: 'stopped'; reason: string } | ...
+
+// After (0.7):
+type PluginEvent = { type: 'stopped'; reason: StopReason } | ...
+```
+
+**Backward compatibility:** Old string values (`"completed"`, `"cancelled"`, `"user"`) still deserialize correctly via built-in legacy mappings. Existing code that checks `event.reason === "completed"` should update to use the new enum values (`"taskCompleted"`, `"userStop"`).
+
+### New PluginConfig Field
+
+```json
+{
+  "plugins": {
+    "background-service": {
+      "androidRequestNotificationPermissionOnLoad": false
+    }
+  }
+}
+```
+
+Set to `false` if your app handles the `POST_NOTIFICATIONS` permission request manually. Default is `true` for backward compatibility.
+
+### New Permissions
+
+Three new permissions are available but **not** included in `background-service:default` (opt-in):
+
+| Permission | Command |
+|-----------|---------|
+| `allow-get-lifecycle-status` | `getLifecycleStatus()` |
+| `allow-configure-recovery` | `configureRecovery()` |
+| `allow-native-lifecycle-event` | `native_lifecycle_event` (internal) |
+
+Add them to your capabilities file if you use the new APIs:
+
+```json
+{
+  "permissions": [
+    "background-service:default",
+    "background-service:allow-get-lifecycle-status",
+    "background-service:allow-configure-recovery"
+  ]
+}
+```
+
+### No Action Required For
+
+- Existing `startService()` / `stopService()` / `isServiceRunning()` calls
+- Existing `BackgroundService<R>` trait implementations
+- Existing `onPluginEvent()` listeners — backward-compatible deserialization handles legacy strings
+- Existing `ServiceStatus` consumers — no changes to this type
+- Existing `SetupValidationReport` consumers — `issues` field has a default empty array
 
 ## Version History
 

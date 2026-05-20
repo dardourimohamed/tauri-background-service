@@ -152,6 +152,7 @@ pub struct PluginConfig {
     pub android_notification_id: u32,
     pub android_notification_small_icon: Option<String>,
     pub android_show_stop_action: bool,
+    pub android_request_notification_permission_on_load: bool,
     // Behind #[cfg(feature = "desktop-service")]:
     // pub desktop_service_mode: String,
     // pub desktop_service_label: Option<String>,
@@ -177,6 +178,7 @@ pub struct PluginConfig {
 | `android_notification_id` | `number` | Optional | `9001` | Notification ID for the foreground service notification. Must be unique within your app. Android only. |
 | `android_notification_small_icon` | `string?` | Optional | `null` (system default) | Custom small icon resource name (without extension). The resource must exist in `res/drawable/`. Falls back to the system sync icon if not found. Android only. |
 | `android_show_stop_action` | `boolean` | Optional | `true` | Whether to show a "Stop" action button on the foreground notification. Android only. |
+| `android_request_notification_permission_on_load` | `boolean` | Optional | `true` | Whether to automatically request the `POST_NOTIFICATIONS` runtime permission when the plugin loads. Set to `false` if your app handles permission requests manually. Android only. |
 | `desktop_service_mode` | `String` | Optional | `"inProcess"` | Desktop service mode: `"inProcess"` (default) or `"osService"`. Desktop only, requires `desktop-service` feature. |
 | `desktop_service_label` | `Option<String>` | Optional | Auto-derived | Custom label for the OS service. Desktop only, requires `desktop-service` feature. |
 | `desktop_service_autostart` | `boolean` | Optional | `false` | Whether the OS service starts automatically on boot (Linux) or login (macOS). Only applies when `desktopServiceMode` is `"osService"`. Desktop only, requires `desktop-service` feature. |
@@ -204,6 +206,7 @@ pub struct PluginConfig {
       "androidNotificationId": 9100,
       "androidNotificationSmallIcon": "ic_notification",
       "androidShowStopAction": true,
+      "androidRequestNotificationPermissionOnLoad": true,
       "desktopServiceMode": "osService",
       "desktopServiceLabel": "com.example.myapp.background",
       "desktopServiceAutostart": true,
@@ -277,7 +280,7 @@ Built-in event types emitted by the plugin to the JS UI layer. Serialized as a t
 #[non_exhaustive]
 pub enum PluginEvent {
     Started,
-    Stopped { reason: String },
+    Stopped { reason: StopReason },
     Error { message: String },
 }
 ```
@@ -287,8 +290,198 @@ pub enum PluginEvent {
 | Variant | Payload | JSON shape | When emitted |
 |---------|---------|-----------|-------------|
 | `Started` | — | `{ "type": "started" }` | After `init()` completes successfully. |
-| `Stopped` | `reason: String` | `{ "type": "stopped", "reason": "..." }` | When `run()` returns `Ok(())`. Currently always emits `reason: "completed"`. |
+| `Stopped` | `reason: StopReason` | `{ "type": "stopped", "reason": "taskCompleted" }` | When `run()` returns or is cancelled. The `reason` is a structured `StopReason` enum (see below). |
 | `Error` | `message: String` | `{ "type": "error", "message": "..." }` | When `init()` or `run()` returns an error. |
+
+> **Backward compatibility:** The `reason` field in `Stopped` changed from a plain `String` to `StopReason` in v0.7.0. Legacy string values like `"completed"` and `"cancelled"` still deserialize correctly via built-in mappings.
+
+---
+
+### `StopReason`
+
+Structured reason why the background service stopped. Replaces the previous plain `String` reason in `PluginEvent::Stopped`. Marked `#[non_exhaustive]`.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum StopReason {
+    UserStop,
+    AppStop,
+    PlatformTimeout,
+    PlatformExpiration,
+    NativeNotificationStop,
+    OsRestart,
+    BootRecovery,
+    TaskCompleted,
+    Error,
+}
+```
+
+#### Variants
+
+| Variant | JSON value | When |
+|---------|-----------|------|
+| `UserStop` | `"userStop"` | User called `stopService()`. |
+| `AppStop` | `"appStop"` | Application is shutting down gracefully. |
+| `PlatformTimeout` | `"platformTimeout"` | Platform killed the service due to a timeout (e.g. Android FGS timeout). |
+| `PlatformExpiration` | `"platformExpiration"` | Platform expired the background execution window (e.g. iOS BGTask). |
+| `NativeNotificationStop` | `"nativeNotificationStop"` | User pressed stop on the native notification. |
+| `OsRestart` | `"osRestart"` | OS restarted the service after a reboot. |
+| `BootRecovery` | `"bootRecovery"` | Service recovered after device boot. |
+| `TaskCompleted` | `"taskCompleted"` | Service's `run()` returned `Ok(())` naturally. |
+| `Error` | `"error"` | Service's `run()` returned an error. |
+
+> **Backward compatibility:** Legacy string values `"completed"`, `"cancelled"`, and `"user"` still deserialize to `TaskCompleted` and `UserStop` respectively.
+
+---
+
+### `NativeLifecycleEvent`
+
+Events originating in the native layer (Kotlin/Swift) and forwarded to the Rust actor. Tagged JSON enum. Marked `#[non_exhaustive]`.
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+#[non_exhaustive]
+pub enum NativeLifecycleEvent {
+    AndroidNotificationStop,
+    AndroidTimeout { fgs_type: Option<String> },
+}
+```
+
+#### Variants
+
+| Variant | Payload | When |
+|---------|---------|------|
+| `AndroidNotificationStop` | — | User pressed stop on the Android foreground service notification. |
+| `AndroidTimeout` | `fgs_type: Option<String>` | Android system killed the foreground service due to a timeout. |
+
+---
+
+### `LifecycleState`
+
+Fine-grained lifecycle state with 10 states, providing more detail than `ServiceState` (which has 4). Marked `#[non_exhaustive]`.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum LifecycleState {
+    Idle, Starting, Running, Stopping, Stopped,
+    Recovering, RecoveryPending, Expired, Blocked, Error,
+}
+```
+
+#### Variants
+
+| Variant | JSON value | Description |
+|---------|-----------|-------------|
+| `Idle` | `"idle"` | No service has been started. |
+| `Starting` | `"starting"` | Service `init()` is in progress. |
+| `Running` | `"running"` | Service `run()` is executing. |
+| `Stopping` | `"stopping"` | Service is being stopped (cancellation requested). |
+| `Stopped` | `"stopped"` | Service has stopped. |
+| `Recovering` | `"recovering"` | Service is recovering after a platform timeout or expiration. |
+| `RecoveryPending` | `"recoveryPending"` | Recovery is pending (waiting for platform conditions). |
+| `Expired` | `"expired"` | Background execution window has expired (e.g. iOS BGTask). |
+| `Blocked` | `"blocked"` | Service is blocked by a platform issue (e.g. missing permission). |
+| `Error` | `"error"` | Service encountered an error. |
+
+---
+
+### `LifecycleStatus`
+
+Complete snapshot of the background service lifecycle status. Returned by `get_lifecycle_status`. Marked `#[non_exhaustive]`.
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct LifecycleStatus {
+    pub state: LifecycleState,
+    pub desired_running: bool,
+    pub recovery_enabled: bool,
+    pub recovery_pending: bool,
+    pub recovery_reason: Option<String>,
+    pub last_start_config: Option<StartConfig>,
+    pub last_platform_state: Option<String>,
+    pub last_platform_error: Option<String>,
+    pub last_error: Option<String>,
+    pub platform: Platform,
+    pub capabilities: PlatformCapabilities,
+    pub issues: Vec<ValidationIssue>,
+}
+```
+
+#### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `state` | `LifecycleState` | Current lifecycle state (10 possible states). |
+| `desired_running` | `bool` | Whether the service is desired to be running. |
+| `recovery_enabled` | `bool` | Whether auto-recovery is enabled. |
+| `recovery_pending` | `bool` | Whether a recovery is currently pending. |
+| `recovery_reason` | `Option<String>` | Human-readable reason for the current recovery. |
+| `last_start_config` | `Option<StartConfig>` | Configuration used for the last successful start. |
+| `last_platform_state` | `Option<String>` | Last platform-native state string. |
+| `last_platform_error` | `Option<String>` | Last platform-specific error message. |
+| `last_error` | `Option<String>` | Last error message from service execution. |
+| `platform` | `Platform` | Current runtime platform. |
+| `capabilities` | `PlatformCapabilities` | Platform-specific background execution capabilities. |
+| `issues` | `Vec<ValidationIssue>` | Current validation issues with severity levels. |
+
+---
+
+### `Severity`
+
+Severity level for validation issues. Marked `#[non_exhaustive]`.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub enum Severity {
+    Error,
+    Warning,
+    Info,
+}
+```
+
+| Variant | JSON value | Description |
+|---------|-----------|-------------|
+| `Error` | `"error"` | Blocking issue that prevents service from working. |
+| `Warning` | `"warning"` | Non-blocking issue that may cause degraded behavior. |
+| `Info` | `"info"` | Informational note. |
+
+---
+
+### `ValidationIssue`
+
+A single validation issue with severity, code, message, and optional fix. Part of `LifecycleStatus.issues` and `SetupValidationReport.issues`.
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct ValidationIssue {
+    pub severity: Severity,
+    pub code: String,
+    pub message: String,
+    pub fix: Option<String>,
+    pub platform: Platform,
+}
+```
+
+#### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `severity` | `Severity` | Issue severity level. |
+| `code` | `String` | Machine-readable error code. |
+| `message` | `String` | Human-readable description. |
+| `fix` | `Option<String>` | Suggested fix, if available. |
+| `platform` | `Platform` | The platform this issue applies to. |
 
 ---
 
@@ -582,6 +775,13 @@ import {
   normalizeBackgroundServiceError,
   type BackgroundServiceErrorCode,
   type BackgroundServiceError,
+  getLifecycleStatus,
+  configureRecovery,
+  type StopReason,
+  type LifecycleState,
+  type LifecycleStatus,
+  type Severity,
+  type ValidationIssue,
 } from 'tauri-plugin-background-service';
 ```
 
@@ -1116,6 +1316,8 @@ interface SetupValidationReport {
   errors: SetupIssue[];
   /** Non-blocking issues that may cause degraded behavior. */
   warnings: SetupIssue[];
+  /** Unified issues with typed severity. */
+  issues: ValidationIssue[];
 }
 ```
 
@@ -1126,6 +1328,7 @@ interface SetupValidationReport {
 | `ok` | `boolean` | `true` when `errors` is empty. Warnings do not affect this value. |
 | `errors` | `SetupIssue[]` | Blocking issues that prevent the service from working correctly. |
 | `warnings` | `SetupIssue[]` | Non-blocking issues that may cause degraded behavior (e.g. missing boot receiver). |
+| `issues` | `ValidationIssue[]` | Unified list with typed severity (`error`, `warning`, `info`). Combines errors and warnings. |
 
 ---
 
@@ -1625,6 +1828,162 @@ unlisten();
 
 ---
 
+### `getLifecycleStatus()`
+
+Query a complete snapshot of the background service lifecycle status, including state, desired state, recovery config, platform capabilities, and validation issues.
+
+```typescript
+async function getLifecycleStatus(): Promise<LifecycleStatus>
+```
+
+#### Parameters
+
+None.
+
+#### Returns
+
+`Promise<LifecycleStatus>` — a full lifecycle status snapshot.
+
+#### Example
+
+```typescript
+const status = await getLifecycleStatus();
+console.log(status.state);              // 'idle' | 'starting' | 'running' | 'stopped' | ...
+console.log(status.desiredRunning);     // true | false
+console.log(status.recoveryEnabled);    // true | false
+console.log(status.recoveryPending);    // true | false
+console.log(status.platform);           // 'android' | 'ios' | 'linux' | ...
+console.log(status.issues.length);      // number of current validation issues
+```
+
+> **Note:** This command requires the `allow-get-lifecycle-status` permission (not included in `background-service:default`).
+
+---
+
+### `configureRecovery(enabled, config?)`
+
+Enable or disable auto-recovery at runtime. When enabled, the service will be automatically restarted after platform-imposed stops (timeouts, expirations). When disabled, the service stops permanently until manually restarted.
+
+```typescript
+async function configureRecovery(
+  enabled: boolean,
+  config?: StartConfig
+): Promise<void>
+```
+
+#### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `enabled` | `boolean` | Required | `true` to enable auto-recovery, `false` to disable. |
+| `config` | `StartConfig` | Optional | Configuration to use when the service is automatically restarted. |
+
+#### Example
+
+```typescript
+// Enable recovery with a specific config
+await configureRecovery(true, { serviceLabel: 'Background Sync' });
+
+// Disable recovery
+await configureRecovery(false);
+```
+
+> **Note:** This command requires the `allow-configure-recovery` permission (not included in `background-service:default`).
+
+---
+
+### `StopReason` (TypeScript)
+
+String literal union representing structured stop reasons.
+
+```typescript
+type StopReason =
+  | 'userStop'
+  | 'appStop'
+  | 'platformTimeout'
+  | 'platformExpiration'
+  | 'nativeNotificationStop'
+  | 'osRestart'
+  | 'bootRecovery'
+  | 'taskCompleted'
+  | 'error';
+```
+
+| Value | When |
+|-------|------|
+| `'userStop'` | User called `stopService()`. |
+| `'appStop'` | Application is shutting down. |
+| `'platformTimeout'` | Platform killed the service (e.g. Android FGS timeout). |
+| `'platformExpiration'` | Background window expired (e.g. iOS BGTask). |
+| `'nativeNotificationStop'` | User pressed stop on the native notification. |
+| `'osRestart'` | OS restarted the service after reboot. |
+| `'bootRecovery'` | Service recovered after device boot. |
+| `'taskCompleted'` | Service `run()` returned naturally. |
+| `'error'` | Service `run()` returned an error. |
+
+---
+
+### `LifecycleState` (TypeScript)
+
+String literal union representing fine-grained lifecycle states.
+
+```typescript
+type LifecycleState =
+  | 'idle' | 'starting' | 'running' | 'stopping' | 'stopped'
+  | 'recovering' | 'recoveryPending' | 'expired' | 'blocked' | 'error';
+```
+
+---
+
+### `Severity` (TypeScript)
+
+String literal union for validation issue severity.
+
+```typescript
+type Severity = 'error' | 'warning' | 'info';
+```
+
+---
+
+### `ValidationIssue` (TypeScript)
+
+A typed validation issue with severity level.
+
+```typescript
+interface ValidationIssue {
+  severity: Severity;
+  code: string;
+  message: string;
+  fix?: string;
+  platform: string;
+}
+```
+
+---
+
+### `LifecycleStatus` (TypeScript)
+
+Complete lifecycle status snapshot.
+
+```typescript
+interface LifecycleStatus {
+  state: LifecycleState;
+  desiredRunning: boolean;
+  recoveryEnabled: boolean;
+  recoveryPending: boolean;
+  recoveryReason?: string;
+  lastStartConfig?: StartConfig;
+  lastPlatformState?: string;
+  lastPlatformError?: string;
+  lastError?: string;
+  platform: string;
+  capabilities: PlatformCapabilities;
+  issues: ValidationIssue[];
+}
+```
+
+---
+
 ### `StartConfig` (TypeScript)
 
 Startup configuration passed to `startService()`. All fields are optional with sensible defaults.
@@ -1660,7 +2019,7 @@ Discriminated union type representing plugin lifecycle events. Use the `type` fi
 ```typescript
 type PluginEvent =
   | { type: 'started' }
-  | { type: 'stopped';  reason: string }
+  | { type: 'stopped';  reason: StopReason }
   | { type: 'error';    message: string };
 ```
 
@@ -1669,7 +2028,7 @@ type PluginEvent =
 | `type` value | Additional fields | When emitted |
 |-------------|-------------------|-------------|
 | `'started'` | — | After `init()` completes successfully. |
-| `'stopped'` | `reason: string` | When `run()` returns `Ok(())`. Currently always emits `reason: "completed"`. |
+| `'stopped'` | `reason: StopReason` | When `run()` returns or is cancelled. The reason is a structured enum value (e.g. `"taskCompleted"`, `"platformTimeout"`, `"userStop"`). |
 | `'error'` | `message: string` | When `init()` or `run()` returns an error. |
 
 #### Type narrowing

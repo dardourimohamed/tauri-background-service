@@ -132,7 +132,7 @@ Enable the `desktop-service` feature in your app's `Cargo.toml`:
 
 ```toml
 [dependencies]
-tauri-plugin-background-service = { version = "0.5", features = ["desktop-service"] }
+tauri-plugin-background-service = { version = "0.7", features = ["desktop-service"] }
 ```
 
 This pulls in the `service-manager` crate and adds two additional Tauri commands: `install_service` and `uninstall_service`.

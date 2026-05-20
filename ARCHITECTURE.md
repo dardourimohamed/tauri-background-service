@@ -103,8 +103,11 @@ The actor receives `ManagerCommand` variants and dispatches:
 |---------|---------|-------------|
 | `Start` | `handle_start` | Rejects if `AlreadyRunning`. Creates token, increments generation, starts keepalive, spawns service task. |
 | `Stop` | `handle_stop` | Cancels the token, stops keepalive. Returns `NotRunning` if idle. |
+| `StopWithReason` | `handle_stop_with_reason` | Cancels token, applies desired-state policy based on `StopReason`, stops keepalive. Used for platform-initiated stops. |
 | `IsRunning` | inline | Checks if `token` slot is `Some`. |
 | `GetState` | inline | Returns `ServiceStatus` with current state and optional last error. |
+| `GetLifecycleStatus` | inline | Returns `LifecycleStatus` — richer snapshot with state, desired state, recovery config, platform capabilities, and validation issues. |
+| `NativeLifecycleEvent` | inline | Processes OS-signaled lifecycle transitions (Android FGS timeout, notification stop) from native layer. Maps to `StopReason`. |
 | `SetOnComplete` | inline | Stores callback for capture at next spawn. |
 | `SetMobile` | inline | Stores `Arc<dyn MobileKeepalive>` for mobile keepalive. |
 
@@ -181,7 +184,7 @@ flowchart LR
 | Event | Trigger | Payload |
 |-------|---------|---------|
 | `Started` | `init()` succeeded | `{ type: "started" }` |
-| `Stopped` | `run()` returned `Ok(())` | `{ type: "stopped", reason: "completed" }` |
+| `Stopped` | `run()` returned or was cancelled | `{ type: "stopped", reason: StopReason }` — structured stop reason enum |
 | `Error` | `init()` or `run()` returned `Err` | `{ type: "error", message: "..." }` |
 
 Events use a tagged JSON format (`#[serde(tag = "type")]`) with `camelCase` field names.
@@ -252,7 +255,7 @@ The `desktop-service` feature adds an IPC transport layer for communication betw
 
 | Type | Direction | Variants |
 |------|-----------|----------|
-| `IpcRequest` | Client → Server | `Start`, `Stop`, `IsRunning`, `GetState` |
+| `IpcRequest` | Client → Server | `Start`, `Stop`, `IsRunning`, `GetState`, `GetLifecycleStatus`, `ConfigureRecovery` |
 | `IpcResponse` | Server → Client | Command result with optional error |
 | `IpcEvent` | Server → Client | Streaming events (started, stopped, error) |
 
@@ -286,7 +289,7 @@ Sidecar process:
 Enabled via `Cargo.toml`:
 
 ```toml
-tauri-plugin-background-service = { version = "0.5", features = ["desktop-service"] }
+tauri-plugin-background-service = { version = "0.7", features = ["desktop-service"] }
 ```
 
 This pulls in `service-manager` 0.11 and `backon` ~1.5, and adds three Tauri commands: `install_service`, `uninstall_service`, and a desktop IPC client module.
