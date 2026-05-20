@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-20
+
+### Added
+
+#### Structured Stop Reasons
+
+- `StopReason` enum with 9 variants: `userStop`, `appStop`, `platformTimeout`, `platformExpiration`, `nativeNotificationStop`, `osRestart`, `bootRecovery`, `taskCompleted`, `error`
+- `StopWithReason` actor command and `stop_with_reason()` handle method
+- Cancel listener emits platform-specific `StopReason` values (Android: `platformTimeout`, `nativeNotificationStop`; iOS: `platformExpiration`; Desktop: `appStop`)
+
+#### Native Lifecycle Events
+
+- `NativeLifecycleEvent` enum for OS-signaled lifecycle transitions
+- `native_lifecycle_event` Tauri command and permission
+- Android Kotlin callbacks: notification stop and FGS timeout events forwarded from `LifecycleService` to Rust via JS bridge
+
+#### Lifecycle Status API
+
+- `LifecycleState` enum (10 states: `idle`, `starting`, `running`, `stopping`, `stopped`, `recovering`, `recoveryPending`, `expired`, `blocked`, `error`)
+- `LifecycleStatus` struct with full snapshot: state, desired state, recovery config, last config, platform info, issues
+- `get_lifecycle_status` Tauri command and `getLifecycleStatus()` TypeScript API
+
+#### Recovery Configuration
+
+- `configure_recovery` Tauri command and `configureRecovery()` TypeScript API for runtime control of auto-restart behavior
+
+#### Desktop Desired State Persistence
+
+- `FileDesiredStateBackend` for desktop platforms: persists desired state to filesystem for auto-recovery across app restarts
+- Integration tests for file-based persistence
+
+#### iOS BGTask Persistence
+
+- Pending BGTask info persisted to `UserDefaults` to survive timing gaps between native handler and Rust setup
+- `consumedAt` field on `PendingTaskInfo` to track when auto-start consumed the task
+- `getPendingBgTask` reads from `UserDefaults` as source of truth
+
+#### Enhanced Validation
+
+- API 35 (Android 15) boot-blocked FGS type warning in `validate_setup`
+- `ValidationIssue` struct with `severity`, `code`, `message`, `fix`, `platform` fields
+- `Severity` enum: `error`, `warning`, `info`
+- `issues` field on `SetupValidationReport` with unified typed issues
+
+#### Android Notification Permission Control
+
+- `android_request_notification_permission_on_load` config field (default: `true` for backward compat)
+- `getNotificationPermissionStatus()` and `requestNotificationPermission()` Kotlin commands
+- Structured FGS error handling with `startForegroundTyped()` catching `ForegroundServiceStartNotAllowedException`, `SecurityException`, and generic exceptions
+
+#### TypeScript API
+
+- New types: `LifecycleState`, `StopReason`, `Severity`, `ValidationIssue`, `LifecycleStatus`
+- `getLifecycleStatus()`, `configureRecovery()` APIs
+- Compatibility wrappers: deprecated legacy API functions delegate to new lifecycle API
+
+#### Configuration
+
+- `StartConfig.service_label` accepts `label` via serde alias for iOS config migration
+
+#### Tests
+
+- Actor-level cancel listener integration tests with `MockMobile`
+- Desktop `FileDesiredStateBackend` integration tests
+- Android: structured FGS error format tests, permission status tests
+
+#### Build & Tooling
+
+- `build-and-deploy.sh` portability: env check and preflight validation
+- CONTRIBUTING.md: native test harness section and release checklist
+
 ## [0.6.0] - 2026-05-19
 
 ### Added
@@ -200,7 +271,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Notifier` helper for fire-and-forget local notifications
 - `StartConfig` with configurable `serviceLabel` and `foregroundServiceType`
 
-[Unreleased]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.6.0...HEAD
+[Unreleased]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.7.0...HEAD
+[0.7.0]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.6.0...plugin-v0.7.0
 [0.6.0]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.5.2...plugin-v0.6.0
 [0.5.2]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.5.1...plugin-v0.5.2
 [0.5.1]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.5.0...plugin-v0.5.1
