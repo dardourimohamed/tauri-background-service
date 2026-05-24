@@ -115,7 +115,7 @@ jobs:
           TAURI_VERSION=$(grep -A1 'name = "tauri"' Cargo.lock | grep version | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
           TAURI_ANDROID_PATH=$(find ~/.cargo/registry/src -path "*/tauri-${TAURI_VERSION}/mobile/android" -type d | head -1)
           echo "TAURI_ANDROID_PATH=${TAURI_ANDROID_PATH}" >> "$GITHUB_ENV"
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 21
@@ -170,7 +170,7 @@ jobs:
           TAURI_VERSION=$(grep -A1 'name = "tauri"' Cargo.lock | grep version | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
           TAURI_ANDROID_PATH=$(find ~/.cargo/registry/src -path "*/tauri-${TAURI_VERSION}/mobile/android" -type d | head -1)
           echo "TAURI_ANDROID_PATH=${TAURI_ANDROID_PATH}" >> "$GITHUB_ENV"
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 21
