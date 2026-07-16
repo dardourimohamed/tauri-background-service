@@ -1,4 +1,4 @@
-// Copyright 2019-2024 Sila.
+// Copyright The Tauri Background Service Plugin Authors.
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 

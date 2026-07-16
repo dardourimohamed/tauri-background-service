@@ -78,7 +78,7 @@ final class SchedulingStatusContractTests: XCTestCase {
     // MARK: - getDesiredStateStatus = persisted shape (IOSDesiredStateStatus)
 
     func testGetDesiredStateStatus_resolvesPersistedShape_afterStart() {
-        plugin.startKeepalive(InvokeCapture().makeInvoke(args: "{\"label\":\"Sila\"}"))
+        plugin.startKeepalive(InvokeCapture().makeInvoke(args: "{\"label\":\"App\"}"))
 
         let capture = InvokeCapture()
         plugin.getDesiredStateStatus(capture.makeInvoke())

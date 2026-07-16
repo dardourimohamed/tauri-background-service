@@ -7,25 +7,25 @@ import AVFoundation
 ///
 /// Per the spec-01 seam philosophy, only the pure F3 decision + audio-session config choice
 /// is unit-testable here; the `CXProvider` / `AVAudioSession` runtime glue
-/// (`SilaCallKitController`) is exercised on-device in the verify-calls runbook (Step 20).
-final class SilaCallKitTests: XCTestCase {
+/// (`BackgroundCallKitController`) is exercised on-device in the verify-calls runbook (Step 20).
+final class BackgroundCallKitTests: XCTestCase {
 
     // MARK: - F3 degraded-mode decision
 
     func testDeliveryAction_foregroundRings() {
         XCTAssertEqual(
-            SilaCallDecision.deliveryAction(appState: .foreground, offerHasVideo: false),
+            BackgroundCallDecision.deliveryAction(appState: .foreground, offerHasVideo: false),
             .ring(hasVideo: false)
         )
         XCTAssertEqual(
-            SilaCallDecision.deliveryAction(appState: .foreground, offerHasVideo: true),
+            BackgroundCallDecision.deliveryAction(appState: .foreground, offerHasVideo: true),
             .ring(hasVideo: true)
         )
     }
 
     func testDeliveryAction_backgroundActiveRings() {
         XCTAssertEqual(
-            SilaCallDecision.deliveryAction(appState: .backgroundActive, offerHasVideo: true),
+            BackgroundCallDecision.deliveryAction(appState: .backgroundActive, offerHasVideo: true),
             .ring(hasVideo: true)
         )
     }
@@ -34,11 +34,11 @@ final class SilaCallKitTests: XCTestCase {
         // F3(c): a suspended app cannot ring; the caller gets Unreachable (T1) + a
         // missed-call control-outbox record. The hasVideo flag is irrelevant here.
         XCTAssertEqual(
-            SilaCallDecision.deliveryAction(appState: .suspended, offerHasVideo: false),
+            BackgroundCallDecision.deliveryAction(appState: .suspended, offerHasVideo: false),
             .deferToControlOutbox
         )
         XCTAssertEqual(
-            SilaCallDecision.deliveryAction(appState: .suspended, offerHasVideo: true),
+            BackgroundCallDecision.deliveryAction(appState: .suspended, offerHasVideo: true),
             .deferToControlOutbox
         )
     }
@@ -47,7 +47,7 @@ final class SilaCallKitTests: XCTestCase {
         // The has-video flag must propagate into the ring action (drives the CXCallUpdate
         // + audio-session routing). Probe: it is never dropped.
         for hasVideo in [false, true] {
-            let action = SilaCallDecision.deliveryAction(appState: .foreground, offerHasVideo: hasVideo)
+            let action = BackgroundCallDecision.deliveryAction(appState: .foreground, offerHasVideo: hasVideo)
             XCTAssertEqual(action, .ring(hasVideo: hasVideo))
         }
     }
@@ -55,7 +55,7 @@ final class SilaCallKitTests: XCTestCase {
     // MARK: - Audio-session configuration
 
     func testAudioConfig_audioCallUsesVoiceChatNoSpeaker() {
-        let cfg = SilaAudioSessionConfiguration.audioCall
+        let cfg = CallAudioSessionConfiguration.audioCall
         XCTAssertEqual(cfg.category, "AVAudioSessionCategoryPlayAndRecord")
         XCTAssertEqual(cfg.mode, "AVAudioSessionModeVoiceChat")
         // CallKit's didActivate owns routing for audio calls → earpiece, not speaker.
@@ -64,7 +64,7 @@ final class SilaCallKitTests: XCTestCase {
     }
 
     func testAudioConfig_videoCallUsesVideoChatDefaultsToSpeaker() {
-        let cfg = SilaAudioSessionConfiguration.videoCall
+        let cfg = CallAudioSessionConfiguration.videoCall
         XCTAssertEqual(cfg.category, "AVAudioSessionCategoryPlayAndRecord")
         XCTAssertEqual(cfg.mode, "AVAudioSessionModeVideoChat")
         XCTAssertTrue(cfg.defaultToSpeaker)
@@ -72,14 +72,14 @@ final class SilaCallKitTests: XCTestCase {
     }
 
     func testAudioConfig_forCallSelectsByVideoFlag() {
-        XCTAssertEqual(SilaAudioSessionConfiguration.forCall(hasVideo: false), .audioCall)
-        XCTAssertEqual(SilaAudioSessionConfiguration.forCall(hasVideo: true), .videoCall)
+        XCTAssertEqual(CallAudioSessionConfiguration.forCall(hasVideo: false), .audioCall)
+        XCTAssertEqual(CallAudioSessionConfiguration.forCall(hasVideo: true), .videoCall)
     }
 
     func testProviderConfiguration_isSelfManagedNoHoldingNoRecents() {
         // Held is v1.1 (spec §3.3) → supportsHolding is never advertised; calls are not
-        // written to the system recents (Sila keeps its own encrypted call_log).
-        let config = SilaCallKitController.providerConfiguration()
+        // written to the system recents (App keeps its own encrypted call_log).
+        let config = BackgroundCallKitController.providerConfiguration()
         XCTAssertEqual(config.maximumCallGroups, 1)
         XCTAssertEqual(config.maximumCallsPerCallGroup, 1)
         XCTAssertEqual(config.supportsVideo, true)
@@ -98,10 +98,10 @@ final class SilaCallKitTests: XCTestCase {
         // Regression for the review.rejected bug: the prior `UUID(uuidString: callId) ??
         // UUID()` parsed nil for a 32-char hex id and drew an INDEPENDENT random UUID on
         // every call. A deterministic derivation must return the SAME UUID twice.
-        guard let uuidA = SilaCallKitController.callKitUUID(for: Self.hexCallId) else {
+        guard let uuidA = BackgroundCallKitController.callKitUUID(for: Self.hexCallId) else {
             return XCTFail("callKitUUID must be non-nil for a 32-char hex call_id")
         }
-        let uuidB = SilaCallKitController.callKitUUID(for: Self.hexCallId)
+        let uuidB = BackgroundCallKitController.callKitUUID(for: Self.hexCallId)
         XCTAssertEqual(uuidA, uuidB, "callKitUUID must be deterministic for a fixed call_id")
     }
 
@@ -111,8 +111,8 @@ final class SilaCallKitTests: XCTestCase {
         // dismiss the ring it showed. Both sites call the same pure `callKitUUID(for:)`,
         // so this is tautologically true post-fix and impossible under the old random-UUID
         // code — which is exactly why the ring was never dismissed.
-        let reported = SilaCallKitController.callKitUUID(for: Self.hexCallId)
-        let ended = SilaCallKitController.callKitUUID(for: Self.hexCallId)
+        let reported = BackgroundCallKitController.callKitUUID(for: Self.hexCallId)
+        let ended = BackgroundCallKitController.callKitUUID(for: Self.hexCallId)
         XCTAssertNotNil(reported)
         XCTAssertEqual(reported, ended)
     }
@@ -121,8 +121,8 @@ final class SilaCallKitTests: XCTestCase {
         // Sanity: two distinct session keys must not collapse onto the same CallKit UUID
         // (would otherwise cross-dismiss an unrelated call). Only the leading word differs.
         let other = "018f3a2b5c4d6e7f0000000000000000"
-        let a = SilaCallKitController.callKitUUID(for: Self.hexCallId)
-        let b = SilaCallKitController.callKitUUID(for: other)
+        let a = BackgroundCallKitController.callKitUUID(for: Self.hexCallId)
+        let b = BackgroundCallKitController.callKitUUID(for: other)
         XCTAssertNotNil(a)
         XCTAssertNotNil(b)
         XCTAssertNotEqual(a, b)
@@ -131,16 +131,16 @@ final class SilaCallKitTests: XCTestCase {
     func testCallKitUUID_rejectsMalformedIds() {
         // Only the defensive fallback (`?? UUID()`) is reachable for a malformed id.
         // A 32-char hex id is the contract; anything else returns nil.
-        XCTAssertNil(SilaCallKitController.callKitUUID(for: ""))                 // empty
-        XCTAssertNil(SilaCallKitController.callKitUUID(for: "018f3a2b5c4d6e7f019e4b6c7d8e9f0"))  // 30 chars (too short)
-        XCTAssertNil(SilaCallKitController.callKitUUID(for: "018f3a2b5c4d6e7f019e4b6c7d8e9f0a0"))  // 33 chars (too long)
-        XCTAssertNil(SilaCallKitController.callKitUUID(for: "zzzz3a2b5c4d6e7f019e4b6c7d8e9f0a"))  // non-hex
+        XCTAssertNil(BackgroundCallKitController.callKitUUID(for: ""))                 // empty
+        XCTAssertNil(BackgroundCallKitController.callKitUUID(for: "018f3a2b5c4d6e7f019e4b6c7d8e9f0"))  // 30 chars (too short)
+        XCTAssertNil(BackgroundCallKitController.callKitUUID(for: "018f3a2b5c4d6e7f019e4b6c7d8e9f0a0"))  // 33 chars (too long)
+        XCTAssertNil(BackgroundCallKitController.callKitUUID(for: "zzzz3a2b5c4d6e7f019e4b6c7d8e9f0a"))  // non-hex
         // A real RFC-4122 UUID STRING ("8-4-4-4-12" w/ hyphens) is the wrong shape too —
         // the contract is the undashed 32-hex session key, so this also returns nil.
-        XCTAssertNil(SilaCallKitController.callKitUUID(for: "018f3a2b-5c4d-6e7f-019e-4b6c7d8e9f0a"))
+        XCTAssertNil(BackgroundCallKitController.callKitUUID(for: "018f3a2b-5c4d-6e7f-019e-4b6c7d8e9f0a"))
     }
 
-    // MARK: - BGS-10 perform-handlers route answer/reject/end to Rust via `sila_call_action`
+    // MARK: - BGS-10 perform-handlers route answer/reject/end to Rust via the native call-action bridge
 
     /// A second realistic 32-hex `call_id` (only the low word differs from `hexCallId`)
     /// for the interleaved-report L6 case.
@@ -149,24 +149,24 @@ final class SilaCallKitTests: XCTestCase {
     /// Any `CXProvider` — the delegate perform-handlers ignore the provider argument; the
     /// controller drives its own internal provider for real reports. Built fresh per test.
     private func anyProvider() -> CXProvider {
-        CXProvider(configuration: SilaCallKitController.providerConfiguration())
+        CXProvider(configuration: BackgroundCallKitController.providerConfiguration())
     }
 
     func testPerformAnswer_routesAnswerActionWithOriginalCallId() {
         // BGS-10 (Step 18 Task B): tapping Answer in the native CallKit UI delivers
         // CXAnswerCallAction; the perform-handler must reverse-look-up the original
         // 32-hex call_id from the [UUID:String] map populated by reportIncomingCall
-        // and route it DIRECTLY to Rust via `sila_call_action` with action "answer"
+        // and route it DIRECTLY to Rust via the native call-action bridge with action "answer"
         // (CROSS-DOC: doc 04 owns call-control semantics). The seam defaults to the
         // real FFI; here a recorder captures the routed (call_id, action) without a
         // live Core (the real-symbol reachability is pinned host-side by
         // `bgs10_native_accept_drives_fsm`).
-        let controller = SilaCallKitController()
+        let controller = BackgroundCallKitController()
         var actions: [(String, String)] = []
         controller.performCallAction = { callId, action in actions.append((callId, action)) }
 
         controller.reportIncomingCall(callId: Self.hexCallId, callerName: "Alice", hasVideo: false)
-        let uuid = SilaCallKitController.callKitUUID(for: Self.hexCallId)!
+        let uuid = BackgroundCallKitController.callKitUUID(for: Self.hexCallId)!
         controller.provider(anyProvider(), perform: CXAnswerCallAction(call: uuid))
 
         XCTAssertEqual(actions.count, 1, "answer routes exactly one call action")
@@ -177,12 +177,12 @@ final class SilaCallKitTests: XCTestCase {
     func testPerformEnd_afterAnswer_routesEndAction() {
         // BGS-10 (Task B): an end after a successful answer is a hang-up of a live
         // call → action "end" (wasAnswered true), distinguishing a decline ("reject").
-        let controller = SilaCallKitController()
+        let controller = BackgroundCallKitController()
         var actions: [(String, String)] = []
         controller.performCallAction = { callId, action in actions.append((callId, action)) }
 
         controller.reportIncomingCall(callId: Self.hexCallId, callerName: "Alice", hasVideo: false)
-        let uuid = SilaCallKitController.callKitUUID(for: Self.hexCallId)!
+        let uuid = BackgroundCallKitController.callKitUUID(for: Self.hexCallId)!
         controller.provider(anyProvider(), perform: CXAnswerCallAction(call: uuid))
         controller.provider(anyProvider(), perform: CXEndCallAction(call: uuid))
 
@@ -193,12 +193,12 @@ final class SilaCallKitTests: XCTestCase {
     func testPerformEnd_withoutAnswer_routesRejectAction() {
         // BGS-10 (Task B): declining a still-ringing call (no prior answer) → action
         // "reject" (wasAnswered false), so Rust/UI records the right call_log state.
-        let controller = SilaCallKitController()
+        let controller = BackgroundCallKitController()
         var actions: [(String, String)] = []
         controller.performCallAction = { callId, action in actions.append((callId, action)) }
 
         controller.reportIncomingCall(callId: Self.hexCallId, callerName: "Alice", hasVideo: false)
-        let uuid = SilaCallKitController.callKitUUID(for: Self.hexCallId)!
+        let uuid = BackgroundCallKitController.callKitUUID(for: Self.hexCallId)!
         controller.provider(anyProvider(), perform: CXEndCallAction(call: uuid))
 
         XCTAssertEqual(actions.count, 1)
@@ -209,7 +209,7 @@ final class SilaCallKitTests: XCTestCase {
     func testPerformAnswer_unknownUuid_doesNotRoute() {
         // BGS-10 (Task B): a perform action for a call we never reported (stale/
         // cross-app) must not route a bogus action — there is no original call_id.
-        let controller = SilaCallKitController()
+        let controller = BackgroundCallKitController()
         var actions: [(String, String)] = []
         controller.performCallAction = { callId, action in actions.append((callId, action)) }
 
@@ -225,11 +225,11 @@ final class SilaCallKitTests: XCTestCase {
         // reportIncomingCall, so answering an earlier video call after a later audio call
         // was reported configured the session for audio. The flag must come from the
         // ANSWERED call's entry in `activeCalls`, not a shared scalar.
-        let controller = SilaCallKitController()
+        let controller = BackgroundCallKitController()
         controller.reportIncomingCall(callId: Self.hexCallId, callerName: "Alice", hasVideo: true)   // video
         controller.reportIncomingCall(callId: Self.otherHexCallId, callerName: "Bob", hasVideo: false) // audio, later
 
-        let videoUUID = SilaCallKitController.callKitUUID(for: Self.hexCallId)!
+        let videoUUID = BackgroundCallKitController.callKitUUID(for: Self.hexCallId)!
         controller.provider(anyProvider(), perform: CXAnswerCallAction(call: videoUUID))
 
         XCTAssertEqual(
@@ -238,9 +238,9 @@ final class SilaCallKitTests: XCTestCase {
     }
 
     func testAudioConfiguration_answeredAudioCallUsesAudioConfig() {
-        let controller = SilaCallKitController()
+        let controller = BackgroundCallKitController()
         controller.reportIncomingCall(callId: Self.hexCallId, callerName: "Alice", hasVideo: false)
-        let uuid = SilaCallKitController.callKitUUID(for: Self.hexCallId)!
+        let uuid = BackgroundCallKitController.callKitUUID(for: Self.hexCallId)!
         controller.provider(anyProvider(), perform: CXAnswerCallAction(call: uuid))
 
         XCTAssertEqual(controller.audioConfigurationForActiveCall(), .audioCall)
@@ -250,18 +250,18 @@ final class SilaCallKitTests: XCTestCase {
 
     func testShouldRingCallKit_foregroundSuppressesBackgroundFires() {
         XCTAssertFalse(
-            SilaCallDecision.shouldRingCallKit(appForeground: true),
+            BackgroundCallDecision.shouldRingCallKit(appForeground: true),
             "a foreground call must suppress the CallKit ring (the in-app overlay owns it)"
         )
         XCTAssertTrue(
-            SilaCallDecision.shouldRingCallKit(appForeground: false),
+            BackgroundCallDecision.shouldRingCallKit(appForeground: false),
             "a backgrounded/locked call must fire the native CallKit ring"
         )
     }
 
     func testSuspendedIncomingRingSupported_isFalseOnIos() {
         XCTAssertFalse(
-            SilaCallDecision.suspendedIncomingRingSupported,
+            BackgroundCallDecision.suspendedIncomingRingSupported,
             "iOS must NOT claim it can ring a suspended/terminated app (no PushKit/APNs in v1)"
         )
     }
@@ -269,24 +269,24 @@ final class SilaCallKitTests: XCTestCase {
     // MARK: - Device audio route (M-NATIVE-3 / CCF-11, Step 11)
 
     func testAudioRoute_speakerForcesLoudspeaker() {
-        XCTAssertEqual(SilaAudioRoute.speaker.portOverride, .speaker)
+        XCTAssertEqual(CallAudioRoute.speaker.portOverride, .speaker)
     }
 
     func testAudioRoute_earpieceOverridesToNoneReceiver() {
-        XCTAssertEqual(SilaAudioRoute.earpiece.portOverride, AVAudioSession.PortOverride.none)
+        XCTAssertEqual(CallAudioRoute.earpiece.portOverride, AVAudioSession.PortOverride.none)
     }
 
     func testAudioRoute_bluetoothAndSystemDeferToPlatform() {
         // BT selection + the system default are platform/CallKit-owned → no override.
-        XCTAssertNil(SilaAudioRoute.bluetooth.portOverride)
-        XCTAssertNil(SilaAudioRoute.system.portOverride)
+        XCTAssertNil(CallAudioRoute.bluetooth.portOverride)
+        XCTAssertNil(CallAudioRoute.system.portOverride)
     }
 
     func testAudioRoute_parsesWireTokens() {
-        XCTAssertEqual(SilaAudioRoute(rawValue: "speaker"), .speaker)
-        XCTAssertEqual(SilaAudioRoute(rawValue: "earpiece"), .earpiece)
-        XCTAssertEqual(SilaAudioRoute(rawValue: "bluetooth"), .bluetooth)
-        XCTAssertEqual(SilaAudioRoute(rawValue: "system"), .system)
-        XCTAssertNil(SilaAudioRoute(rawValue: "bogus"))
+        XCTAssertEqual(CallAudioRoute(rawValue: "speaker"), .speaker)
+        XCTAssertEqual(CallAudioRoute(rawValue: "earpiece"), .earpiece)
+        XCTAssertEqual(CallAudioRoute(rawValue: "bluetooth"), .bluetooth)
+        XCTAssertEqual(CallAudioRoute(rawValue: "system"), .system)
+        XCTAssertNil(CallAudioRoute(rawValue: "bogus"))
     }
 }
