@@ -110,41 +110,6 @@ impl<R: Runtime> MobileLifecycle<R> {
         Ok(())
     }
 
-    /// Query the Android notification-permission status (BGS-21, doc-08 Step 12).
-    ///
-    /// Calls the Kotlin `getNotificationPermissionStatus` @Command via
-    /// `run_mobile_plugin`. The Kotlin side always resolves a `JSObject`
-    /// `{ status }` with one of `"granted"` / `"denied"` / `"notDetermined"`
-    /// (never null), so this deserializes the typed response and returns the
-    /// inner status string. On Android < API 33 (TIRAMISU) Kotlin resolves
-    /// `"granted"` (POST_NOTIFICATIONS did not exist). iOS notification
-    /// authorization is requested at launch via `UNUserNotificationCenter` and
-    /// is NOT exposed by a plugin @Command, so the command layer gates this on
-    /// Android (`#[cfg(target_os = "android")]`) and returns `"granted"` as the
-    /// non-Android default.
-    pub fn get_notification_permission_status(&self) -> Result<String, ServiceError> {
-        let resp: NotificationPermissionStatusResponse = self
-            .handle
-            .run_mobile_plugin("getNotificationPermissionStatus", ())
-            .map_err(|e| ServiceError::Platform(e.to_string()))?;
-        Ok(resp.status)
-    }
-
-    /// Request Android notification permission (BGS-21, doc-08 Step 12).
-    ///
-    /// Calls the Kotlin `requestNotificationPermission` @Command via
-    /// `run_mobile_plugin`, which issues `activity.requestPermissions` for
-    /// POST_NOTIFICATIONS (API 33+) and persists the `hasAsked` discriminator
-    /// so a later `getNotificationPermissionStatus` maps a denial to `"denied"`
-    /// instead of the never-asked `"notDetermined"`. No-op below API 33. iOS is
-    /// gated out at the command layer (no Swift handler exists).
-    pub fn request_notification_permission(&self) -> Result<(), ServiceError> {
-        self.handle
-            .run_mobile_plugin::<()>("requestNotificationPermission", ())
-            .map_err(|e| ServiceError::Platform(e.to_string()))?;
-        Ok(())
-    }
-
     /// Request the Android battery-optimization (Doze) exemption (BGS-22, doc-08
     /// Step 14).
     ///
@@ -706,6 +671,7 @@ impl<R: Runtime> MobileLifecycle<R> {
 /// Arguments for the native iOS `setDesiredRunning` handler (H4 desired-state
 /// mirror). `last_start_config` is the JSON-serialized `StartConfig` string so
 /// the iOS auto-start can `from_str::<StartConfig>` it back.
+#[cfg(target_os = "ios")]
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SetDesiredRunningArgs {
@@ -765,16 +731,6 @@ struct SetCallAudioRouteArgs {
 #[serde(rename_all = "camelCase")]
 struct CompleteBgTaskArgs {
     success: bool,
-}
-
-/// Response shape from the Kotlin `getNotificationPermissionStatus` @Command
-/// (BGS-21, doc-08 Step 12). The Kotlin side resolves a `JSObject` with a
-/// single `status` field (`"granted"`/`"denied"`/`"notDetermined"`); this
-/// deserializes the typed response so the command layer can return the inner
-/// `String` to JS.
-#[derive(serde::Deserialize)]
-struct NotificationPermissionStatusResponse {
-    status: String,
 }
 
 impl<R: Runtime> MobileKeepalive for MobileLifecycle<R> {
