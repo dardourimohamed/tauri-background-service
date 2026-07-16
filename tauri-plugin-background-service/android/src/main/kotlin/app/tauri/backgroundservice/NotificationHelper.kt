@@ -107,7 +107,7 @@ object NotificationHelper {
         // (foreground/stop/timeout/recovery, below) are intentionally left
         // hardcoded — they belong to doc-08 (BGS-19).
         val answerText = context.getString(
-            if (isVideo) R.string.sila_notif_call_answer_video else R.string.sila_notif_call_answer,
+            if (isVideo) R.string.bg_service_notif_call_answer_video else R.string.bg_service_notif_call_answer,
         )
         // Notification.CallStyle renders its own answer/decline affordances,
         // so it requires non-null answer/decline intents. When either is
@@ -137,8 +137,8 @@ object NotificationHelper {
             .setContentTitle(callerName)
             .setContentText(
                 context.getString(
-                    if (isVideo) R.string.sila_notif_call_incoming_video
-                    else R.string.sila_notif_call_incoming_voice,
+                    if (isVideo) R.string.bg_service_notif_call_incoming_video
+                    else R.string.bg_service_notif_call_incoming_voice,
                 ),
             )
             .setSmallIcon(smallIcon)
@@ -149,7 +149,7 @@ object NotificationHelper {
             builder.addAction(0, answerText, answerIntent)
         }
         if (declineIntent != null) {
-            builder.addAction(0, context.getString(R.string.sila_notif_call_decline), declineIntent)
+            builder.addAction(0, context.getString(R.string.bg_service_notif_call_decline), declineIntent)
         }
         if (useFullScreenIntent && fullScreenIntent != null) {
             builder.setFullScreenIntent(fullScreenIntent, true)

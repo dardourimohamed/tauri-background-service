@@ -13,16 +13,16 @@
   in their own call sites and are NOT moved here.
 -->
 <resources>
-    <string name="sila_notif_reply">Reply</string>
-    <string name="sila_notif_mark_read">Mark as read</string>
-    <string name="sila_notif_reply_input_label">Reply</string>
-    <string name="sila_notif_call_answer">Answer</string>
-    <string name="sila_notif_call_answer_video">Answer (video)</string>
-    <string name="sila_notif_call_decline">Decline</string>
-    <string name="sila_notif_call_incoming_voice">Incoming voice call</string>
-    <string name="sila_notif_call_incoming_video">Incoming video call</string>
+    <string name="bg_service_notif_reply">Reply</string>
+    <string name="bg_service_notif_mark_read">Mark as read</string>
+    <string name="bg_service_notif_reply_input_label">Reply</string>
+    <string name="bg_service_notif_call_answer">Answer</string>
+    <string name="bg_service_notif_call_answer_video">Answer (video)</string>
+    <string name="bg_service_notif_call_decline">Decline</string>
+    <string name="bg_service_notif_call_incoming_voice">Incoming voice call</string>
+    <string name="bg_service_notif_call_incoming_video">Incoming video call</string>
     <!-- NTF-04 (Step 7b): re-presented-notification surface for a recoverable
          reply failure (the user\'s typed replyText is carried in the body). -->
-    <string name="sila_notif_reply_pending_title">Reply pending</string>
-    <string name="sila_notif_reply_pending_body">Tap to retry.</string>
+    <string name="bg_service_notif_reply_pending_title">Reply pending</string>
+    <string name="bg_service_notif_reply_pending_body">Tap to retry.</string>
 </resources>

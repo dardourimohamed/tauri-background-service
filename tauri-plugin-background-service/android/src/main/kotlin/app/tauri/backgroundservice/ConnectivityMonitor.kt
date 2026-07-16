@@ -62,7 +62,7 @@ class ConnectivityMonitor(
     fun register() {
         synchronized(lock) {
             if (callback != null) return
-            val thread = HandlerThread("sila-connectivity").apply { start() }
+            val thread = HandlerThread("bg-connectivity").apply { start() }
             val handler = Handler(thread.looper)
             // The scheduler default posts the trailing fire onto this handler;
             // capture it as a field so the default can reach it.

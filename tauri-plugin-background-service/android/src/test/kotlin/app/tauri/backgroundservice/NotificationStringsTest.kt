@@ -47,8 +47,8 @@ class NotificationStringsTest {
         // English composes byte-identically to the pre-localization literal once
         // the placeholder is substituted (existing English assertions preserved).
         assertEquals(
-            "Tap to resume: Sila",
-            NotificationStrings.lookup("tap_to_resume", LocaleStore.EN).replace("{label}", "Sila"),
+            "Tap to resume: App",
+            NotificationStrings.lookup("tap_to_resume", LocaleStore.EN).replace("{label}", "App"),
         )
     }
 

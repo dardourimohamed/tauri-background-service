@@ -16,8 +16,8 @@ import org.robolectric.annotation.Config
 /**
  * NTF-04 (Step 7b): Robolectric tests for [handleNotificationActionResult] — the
  * re-present-vs-cancel APPLY layer. The Core result is injected via
- * [decideNotificationOutcome] (NO JNI: HeadlessCoreBridge.performNotificationAction
- * is System.loadLibrary(sila_lib) and cannot load under Robolectric).
+ * [decideNotificationOutcome] (NO JNI: HeadlessBridge.performNotificationAction
+ * is System.loadLibrary(the native core) and cannot load under Robolectric).
  *
  * AC3 (load-bearing): the re-presented notification MUST carry the original
  * replyText in its body. Anti-loop: a synthetic permanent code CANCELs (a
@@ -50,7 +50,7 @@ class NotificationActionRePresentTest {
             messageId = "msg-sentinel",
             title = "sentinel",
             body = "sentinel-body",
-            routeUri = "sila://chat?chat_id=chat-sentinel&message_id=msg-sentinel",
+            routeUri = "bg-service://chat?chat_id=chat-sentinel&message_id=msg-sentinel",
             smallIcon = android.R.drawable.sym_def_app_icon,
             launchIntent = null,
         )
@@ -60,7 +60,7 @@ class NotificationActionRePresentTest {
     @Test
     @Config(sdk = [34])
     fun recoverableRustFailure_rePresentsNotificationPreservingReplyText() {
-        val result = HeadlessCoreResult(
+        val result = HeadlessBridgeResult(
             ok = false,
             state = "failed",
             message = "core not running",
@@ -86,7 +86,7 @@ class NotificationActionRePresentTest {
     @Config(sdk = [34])
     fun success_cancels() {
         postSentinel()
-        val result = HeadlessCoreResult(
+        val result = HeadlessBridgeResult(
             ok = true,
             state = "running",
             message = null,
@@ -104,7 +104,7 @@ class NotificationActionRePresentTest {
     fun permanentSyntheticCode_cancels_antiLoop() {
         postSentinel()
         // failure() hardcodes recoverable=true for a PERMANENT env failure.
-        val result = HeadlessCoreResult.failure("native_library_load_failed", "load err")
+        val result = HeadlessBridgeResult.failure("native_library_load_failed", "load err")
 
         handleNotificationActionResult(context, decideNotificationOutcome(result, "x"), "chat-sentinel", "m", notificationId)
 
@@ -116,7 +116,7 @@ class NotificationActionRePresentTest {
     fun permanentRustNotRecoverable_cancels() {
         postSentinel()
         // Rust empty-reply verdict: recoverable == false (headless_core.rs:313).
-        val result = HeadlessCoreResult(
+        val result = HeadlessBridgeResult(
             ok = false,
             state = "failed",
             message = "empty notification reply",

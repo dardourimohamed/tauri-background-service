@@ -56,7 +56,7 @@ class LifecycleServiceTest {
 
     @After
     fun tearDown() {
-        LifecycleService.bridgeProvider = { HeadlessCoreBridgeImpl() }
+        LifecycleService.bridgeProvider = { HeadlessBridgeImpl() }
         LifecycleService.coreStartExecutor = LifecycleService.DEFAULT_CORE_START_EXECUTOR
         LifecycleService.coreStopExecutor = LifecycleService.DEFAULT_CORE_STOP_EXECUTOR
         LifecycleService.isRunning = false
@@ -1655,7 +1655,7 @@ class LifecycleServiceTest {
         // so the assertion after onStartCommand is deterministic AND the worker
         // differs from main. (Inline `{ _, task -> task() }` runs on main → vacuous.)
         LifecycleService.coreStopExecutor = { _, task ->
-            val worker = Thread({ task() }, "sila-core-stop-test")
+            val worker = Thread({ task() }, "bg-core-stop-test")
             worker.start()
             worker.join()
         }
@@ -1880,14 +1880,14 @@ class LifecycleServiceTest {
         // Use a bridge that captures DurableState at start time
         var stateAtStart: DurableState? = null
         val recordingBridge = object : CoreBridge {
-            override fun start(context: Context, reason: String): HeadlessCoreResult {
+            override fun start(context: Context, reason: String): HeadlessBridgeResult {
                 stateAtStart = DurableState.load(context)
                 return FakeCoreBridge(result = "running").start(context, reason)
             }
-            override fun stop(context: Context, reason: String): HeadlessCoreResult {
+            override fun stop(context: Context, reason: String): HeadlessBridgeResult {
                 return FakeCoreBridge().stop(context, reason)
             }
-            override fun notifyNetworkChanged(): HeadlessCoreResult {
+            override fun notifyNetworkChanged(): HeadlessBridgeResult {
                 return FakeCoreBridge().notifyNetworkChanged()
             }
         }
@@ -2271,7 +2271,7 @@ class LifecycleServiceTest {
         prefs.edit().clear().apply()
         // Updated APK over an old native lib: the new JNI export is missing.
         val fakeBridge = FakeCoreBridge(result = "running").apply {
-            networkChangedError = UnsatisfiedLinkError("no notifyNetworkChanged in sila_lib")
+            networkChangedError = UnsatisfiedLinkError("no notifyNetworkChanged in the native core")
         }
         LifecycleService.bridgeProvider = { fakeBridge }
 

@@ -39,7 +39,7 @@ class Bgs19NotifierLocalizationTest {
     fun setup() {
         context = ApplicationProvider.getApplicationContext()
         // Rust writes `{app_data}/data/locale.json` (AppData/"data" == applicationInfo.dataDir/"data"
-        // per HeadlessCoreBridge.dataDir). Point applicationInfo.dataDir at a temp dir so the test
+        // per HeadlessBridge.dataDir). Point applicationInfo.dataDir at a temp dir so the test
         // can stage locale.json deterministically. Save/restore the real value.
         savedDataDir = context.applicationInfo.dataDir
         realDataDir = context.applicationInfo.dataDir
@@ -62,7 +62,7 @@ class Bgs19NotifierLocalizationTest {
             messageId = "msg-ar",
             title = "Alice",
             body = "مرحبة",
-            routeUri = "sila://chat?chat_id=chat-ar&message_id=msg-ar",
+            routeUri = "bg-service://chat?chat_id=chat-ar&message_id=msg-ar",
             smallIcon = android.R.drawable.sym_def_app_icon,
             launchIntent = Intent(Intent.ACTION_MAIN).setPackage(context.packageName),
         )
@@ -91,7 +91,7 @@ class Bgs19NotifierLocalizationTest {
             messageId = "msg-fr",
             title = "Alice",
             body = "bonjour",
-            routeUri = "sila://chat?chat_id=chat-fr&message_id=msg-fr",
+            routeUri = "bg-service://chat?chat_id=chat-fr&message_id=msg-fr",
             smallIcon = android.R.drawable.sym_def_app_icon,
             launchIntent = Intent(Intent.ACTION_MAIN).setPackage(context.packageName),
         )
@@ -115,7 +115,7 @@ class Bgs19NotifierLocalizationTest {
             messageId = "msg-en",
             title = "Alice",
             body = "hello",
-            routeUri = "sila://chat?chat_id=chat-en&message_id=msg-en",
+            routeUri = "bg-service://chat?chat_id=chat-en&message_id=msg-en",
             smallIcon = android.R.drawable.sym_def_app_icon,
             launchIntent = Intent(Intent.ACTION_MAIN).setPackage(context.packageName),
         )
@@ -132,27 +132,27 @@ class Bgs19NotifierLocalizationTest {
     @Config(sdk = [34])
     fun recoveryBody_localized_underArabic() {
         writeLocale("ar")
-        BootReceiver.postRecoveryNotification(context, "Sila")
+        BootReceiver.postRecoveryNotification(context, "App")
 
         val notification = shadowOf(
             context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager,
         ).getNotification(BootReceiver.RECOVERY_NOTIFICATION_ID)
         assertNotNull(notification)
         val text = notification!!.extras.getCharSequence(Notification.EXTRA_TEXT).toString()
-        // Arabic "Tap to resume: {label}" ⇒ "اضغط للاستئناف: Sila".
-        assertEquals("اضغط للاستئناف: Sila", text)
+        // Arabic "Tap to resume: {label}" ⇒ "اضغط للاستئناف: App".
+        assertEquals("اضغط للاستئناف: App", text)
     }
 
     @Test
     @Config(sdk = [34])
     fun recoveryBody_englishWhenNoLocaleStore() {
-        BootReceiver.postRecoveryNotification(context, "Sila")
+        BootReceiver.postRecoveryNotification(context, "App")
         val notification = shadowOf(
             context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager,
         ).getNotification(BootReceiver.RECOVERY_NOTIFICATION_ID)
         assertNotNull(notification)
         val text = notification!!.extras.getCharSequence(Notification.EXTRA_TEXT).toString()
-        assertEquals("Tap to resume: Sila", text)
+        assertEquals("Tap to resume: App", text)
     }
 
     /** Stage a `locale.json` (`{"locale":<code>}`) at `{dataDir}/data/locale.json`. */

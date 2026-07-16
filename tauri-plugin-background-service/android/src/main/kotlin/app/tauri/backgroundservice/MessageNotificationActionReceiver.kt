@@ -41,7 +41,7 @@ class RealMessageNotificationActionDispatcher : MessageNotificationActionDispatc
         notificationId: Int,
         replyText: String,
     ) {
-        val result = HeadlessCoreBridge.performNotificationAction(context, action, chatId, messageId, replyText)
+        val result = HeadlessBridge.performNotificationAction(context, action, chatId, messageId, replyText)
         if (!result.ok) {
             Log.w(TAG, "notification action '$action' failed for chat=$chatId message=$messageId: ${result.message}")
         }
@@ -50,7 +50,7 @@ class RealMessageNotificationActionDispatcher : MessageNotificationActionDispatc
         // reply typed while the Core is locked/dead is LOST SILENTLY. Cancel only
         // on success or permanent failure (see decideNotificationOutcome's anti-loop
         // `code` discriminator; the JNI bridge call stays here so the apply layer is
-        // Robolectric-testable without loading sila_lib).
+        // Robolectric-testable without loading the native core).
         handleNotificationActionResult(
             context,
             decideNotificationOutcome(result, replyText),
@@ -81,14 +81,14 @@ class MessageNotificationActionReceiver : BroadcastReceiver() {
         // BGS-20 (doc-08 Step 11): a SINGLE goAsync() wraps BOTH the reply and
         // mark_read branches (one PendingResult, one executor dispatch covering
         // whichever branch the action selects). Both reach
-        // HeadlessCoreBridge.performNotificationAction → lib.rs block_on
+        // HeadlessBridge.performNotificationAction → lib.rs block_on
         // (notification_action) — the same ANR class as reply (the Rust export
         // handles both); BGS-20 evidence named only reply but markRead is in
         // scope. Only the dispatcher.* call moves off main; the RemoteInput
         // extraction stays in the reply branch. PendingResult.finish() runs
         // exactly once in the finally (and on exception, so it is never leaked).
         val pendingResult = pendingResultOrNoop()
-        actionExecutor("sila-message-action") {
+        actionExecutor("bg-msg-action") {
             try {
                 when (action) {
                     ActionableMessageNotifier.ACTION_MARK_READ -> {

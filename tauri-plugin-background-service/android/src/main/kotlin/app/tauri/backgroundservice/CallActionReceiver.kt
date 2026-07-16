@@ -23,7 +23,7 @@ interface CallActionDispatcher {
 
 /**
  * Production dispatcher: routes to the in-process headless Core via the JNI
- * bridge ([HeadlessCoreBridge.performCallAction]). The Core runs in this process
+ * bridge ([HeadlessBridge.performCallAction]). The Core runs in this process
  * under the call FGS — it received the offer that rang the device — so the hop
  * reaches the same Core with **no webview loaded**, while the device is locked.
  * A failure surfaces as a logged diagnostic + terminal reason (non-payload).
@@ -34,7 +34,7 @@ class RealCallActionDispatcher : CallActionDispatcher {
     override fun endCall(context: Context, callId: String) = dispatch(callId, "end")
 
     private fun dispatch(callId: String, action: String) {
-        val result = HeadlessCoreBridge.performCallAction(callId, action)
+        val result = HeadlessBridge.performCallAction(callId, action)
         if (!result.ok) {
             Log.w(TAG, "callAction '$action' for $callId did not reach core: ${result.message}")
         }
@@ -82,7 +82,7 @@ class CallActionReceiver : BroadcastReceiver() {
 
         // BGS-20 (doc-08 Step 11): move the call-action JNI hop OFF the main
         // looper. `BroadcastReceiver.onReceive` runs on the main thread; the
-        // dispatcher hop reaches HeadlessCoreBridge.performCallAction → lib.rs
+        // dispatcher hop reaches HeadlessBridge.performCallAction → lib.rs
         // block_on(call_action) (incl. a fresh QUIC dial), which ANRs if it runs
         // inline while the user taps Answer/Decline from the lock-screen
         // notification. goAsync() acquires the broadcast's PendingResult so the
@@ -98,7 +98,7 @@ class CallActionReceiver : BroadcastReceiver() {
         // answerCall/rejectCall and the routing test goes RED while
         // load_registersSelfManagedPhoneAccount stays GREEN.
         val pendingResult = pendingResultOrNoop()
-        actionExecutor("sila-call-action") {
+        actionExecutor("bg-call-action") {
             try {
                 when (action) {
                     IncomingCallNotifier.ACTION_ANSWER -> {
@@ -107,7 +107,7 @@ class CallActionReceiver : BroadcastReceiver() {
                         // (our primary answer surface) to the live Telecom
                         // connection so it goes ACTIVE. No-op when no self-managed
                         // connection is live for this call.
-                        SilaConnectionService.markCallActive(callId)
+                        BackgroundCallConnectionService.markCallActive(callId)
                     }
                     IncomingCallNotifier.ACTION_DECLINE -> CallActionDispatch.dispatcher.rejectCall(context, callId)
                 }

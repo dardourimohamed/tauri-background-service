@@ -39,11 +39,11 @@ import java.util.concurrent.ConcurrentHashMap
  * is the runbook half (plan §Step 20); the in-repo class is the compilable,
  * manifest-registered seam.
  */
-class SilaConnectionService : ConnectionService() {
+class BackgroundCallConnectionService : ConnectionService() {
 
     companion object {
-        private const val TAG = "SilaConnectionService"
-        const val PHONE_ACCOUNT_ID = "sila_self_managed_call"
+        private const val TAG = "BackgroundCallConnectionService"
+        const val PHONE_ACCOUNT_ID = "bg_self_managed_call"
 
         /**
          * Register the self-managed phone account (idempotent). Call once during
@@ -60,7 +60,7 @@ class SilaConnectionService : ConnectionService() {
             )
                 .setCapabilities(PhoneAccount.CAPABILITY_SELF_MANAGED)
                 .setHighlightColor(0)
-                .setShortDescription("Sila calls")
+                .setShortDescription("Background calls")
                 .build()
             try {
                 tm.registerPhoneAccount(account)
@@ -71,7 +71,7 @@ class SilaConnectionService : ConnectionService() {
         }
 
         fun phoneAccountHandle(context: Context): PhoneAccountHandle {
-            val componentName = ComponentName(context, SilaConnectionService::class.java)
+            val componentName = ComponentName(context, BackgroundCallConnectionService::class.java)
             return PhoneAccountHandle(componentName, PHONE_ACCOUNT_ID)
         }
 
@@ -103,13 +103,13 @@ class SilaConnectionService : ConnectionService() {
         //
         // Step 9 wired every Connection callback + the full audio-focus lifecycle,
         // but nothing issued `addNewIncomingCall`/`placeCall`, so the OS never
-        // created a `SilaCallConnection` and the focus path was dead. Step 11
+        // created a `BackgroundCallConnection` and the focus path was dead. Step 11
         // issues them so the platform call pipeline (audio focus, MODE_IN_
-        // COMMUNICATION, BT routing) engages for a real Sila call.
+        // COMMUNICATION, BT routing) engages for a real call.
 
         /**
          * Issue [TelecomManager.addNewIncomingCall] for an inbound offer so the OS
-         * creates a [SilaCallConnection] through [onCreateIncomingConnection]. The
+         * creates a [BackgroundCallConnection] through [onCreateIncomingConnection]. The
          * `call_id` rides the extras (top-level + nested under
          * [TelecomManager.EXTRA_INCOMING_CALL_EXTRAS]) so `onAnswer`/`onReject`
          * (Step 9) and the audio-focus lifecycle bind to it. Idempotent-safe,
@@ -141,8 +141,8 @@ class SilaConnectionService : ConnectionService() {
 
         /**
          * Issue [TelecomManager.placeCall] for an outbound dial so the OS creates a
-         * [SilaCallConnection] through [onCreateOutgoingConnection] (which activates
-         * audio focus immediately). The address is a synthetic `sila:` URI (the real
+         * [BackgroundCallConnection] through [onCreateOutgoingConnection] (which activates
+         * audio focus immediately). The address is a synthetic `bg-call:` URI (the real
          * peer is the Iroh node; Telecom only needs a non-null address for routing).
          *
          * NOTE: there is no native outbound-dial hook today — outbound calls are
@@ -165,7 +165,7 @@ class SilaConnectionService : ConnectionService() {
                 putBundle(TelecomManager.EXTRA_OUTGOING_CALL_EXTRAS, csExtras)
                 putString(IncomingCallNotifier.EXTRA_CALL_ID, callId)
             }
-            val address = Uri.fromParts("sila", callId, null)
+            val address = Uri.fromParts("bg-call", callId, null)
             try {
                 tm.placeCall(address, extras)
                 Log.i(TAG, "placeCall: callId=$callId")
@@ -175,16 +175,16 @@ class SilaConnectionService : ConnectionService() {
         }
 
         /**
-         * Process-level registry of the live [SilaCallConnection] per `call_id`,
+         * Process-level registry of the live [BackgroundCallConnection] per `call_id`,
          * so the notification-answer path ([CallActionReceiver], the primary answer
          * surface) and the route command ([setCallAudioRoute]) can reach the OS
          * connection the OS created in [onCreateIncomingConnection]. Populated on
          * connection create, cleared on disconnect.
          */
-        private val liveConnections = ConcurrentHashMap<String, SilaCallConnection>()
+        private val liveConnections = ConcurrentHashMap<String, BackgroundCallConnection>()
 
         @VisibleForTesting
-        internal fun registerConnection(callId: String, connection: SilaCallConnection) {
+        internal fun registerConnection(callId: String, connection: BackgroundCallConnection) {
             if (callId.isNotEmpty()) liveConnections[callId] = connection
         }
 
@@ -253,7 +253,7 @@ class SilaConnectionService : ConnectionService() {
         }
 
         /** Extras key for the offer's video flag carried into the connection. */
-        const val EXTRA_HAS_VIDEO = "sila.has_video"
+        const val EXTRA_HAS_VIDEO = "bg_service.has_video"
 
         @VisibleForTesting
         fun foregroundServiceType(): Int {
@@ -265,7 +265,7 @@ class SilaConnectionService : ConnectionService() {
 
     @VisibleForTesting
     internal var connectionFactory: (PhoneAccountHandle, ConnectionRequest) -> Connection =
-        { handle, request -> SilaCallConnection(this, handle, request) }
+        { handle, request -> BackgroundCallConnection(this, handle, request) }
 
     override fun onCreateIncomingConnection(
         connectionManagerPhoneAccount: PhoneAccountHandle?,
@@ -278,7 +278,7 @@ class SilaConnectionService : ConnectionService() {
         configureSelfManaged(connection)
         // Track the live connection so the notification-answer path (markCallActive)
         // and the route command (setCallAudioRoute) can reach it (Step 11).
-        (connection as? SilaCallConnection)?.let { registerConnection(it.callId, it) }
+        (connection as? BackgroundCallConnection)?.let { registerConnection(it.callId, it) }
         connection.setRinging()
         return connection
     }
@@ -292,7 +292,7 @@ class SilaConnectionService : ConnectionService() {
             ?: phoneAccountHandle(applicationContext)
         val connection = connectionFactory(handle, request)
         configureSelfManaged(connection)
-        (connection as? SilaCallConnection)?.let { registerConnection(it.callId, it) }
+        (connection as? BackgroundCallConnection)?.let { registerConnection(it.callId, it) }
         connection.setDialing()
         // Outgoing calls activate audio focus immediately on Android.
         connection.setActive()
@@ -316,7 +316,7 @@ class SilaConnectionService : ConnectionService() {
      * `VOICE_COMMUNICATION` stream and releases it on disconnect.
      */
     @RequiresApi(Build.VERSION_CODES.M)
-    class SilaCallConnection(
+    class BackgroundCallConnection(
         private val context: Context,
         @Suppress("UNUSED_PARAMETER") handle: PhoneAccountHandle,
         request: ConnectionRequest,

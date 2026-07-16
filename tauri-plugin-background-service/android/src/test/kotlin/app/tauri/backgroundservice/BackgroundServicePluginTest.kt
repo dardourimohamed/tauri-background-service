@@ -67,7 +67,7 @@ class BackgroundServicePluginTest {
         CallActionDispatch.dispatcher = RealCallActionDispatcher()
         // Drop any live Telecom connections registered by a Step-11 test so the
         // process-static registry doesn't leak across tests.
-        SilaConnectionService.clearLiveConnectionsForTest()
+        BackgroundCallConnectionService.clearLiveConnectionsForTest()
     }
 
     // ── startKeepalive: persists label and service type ────────────────
@@ -474,9 +474,9 @@ class BackgroundServicePluginTest {
     /**
      * spec 08 C6 (Step 15): `load()` must register the self-managed
      * `PhoneAccount` so the OS can route audio focus, Bluetooth, and the
-     * system call sheet through `SilaConnectionService` while the webview is
+     * system call sheet through `BackgroundCallConnectionService` while the webview is
      * closed. Without this single registration call the whole
-     * `SilaConnectionService` audio-focus / system-call-UI path is inert at
+     * `BackgroundCallConnectionService` audio-focus / system-call-UI path is inert at
      * runtime — this is the regression guard for the init wiring.
      *
      * The plugin *can* be constructed directly: `Plugin`'s constructor only
@@ -499,8 +499,8 @@ class BackgroundServicePluginTest {
             val registeredHandles = shadowOf(tm).allPhoneAccounts
                 .map { it.accountHandle }
             assertTrue(
-                "load() must register the self-managed Sila phone account",
-                registeredHandles.contains(SilaConnectionService.phoneAccountHandle(act))
+                "load() must register the self-managed App phone account",
+                registeredHandles.contains(BackgroundCallConnectionService.phoneAccountHandle(act))
             )
         }
     }
@@ -590,30 +590,30 @@ class BackgroundServicePluginTest {
 
     @Test
     fun callIdFromRequest_readsCallIdExtra() {
-        val handle = SilaConnectionService.phoneAccountHandle(context)
+        val handle = BackgroundCallConnectionService.phoneAccountHandle(context)
         val extras = Bundle().apply {
             putString(IncomingCallNotifier.EXTRA_CALL_ID, "tele-call-1")
         }
         val request = ConnectionRequest(handle, null, extras)
-        assertEquals("tele-call-1", SilaConnectionService.callIdFromRequest(request))
+        assertEquals("tele-call-1", BackgroundCallConnectionService.callIdFromRequest(request))
 
         // Absent extra → empty (the broadcast route stays the primary binding).
         val bare = ConnectionRequest(handle, null, Bundle())
-        assertEquals("", SilaConnectionService.callIdFromRequest(bare))
+        assertEquals("", BackgroundCallConnectionService.callIdFromRequest(bare))
     }
 
     @Test
-    @Config(sdk = [33]) // >= M for SilaCallConnection
-    fun silaCallConnection_onAnswer_onReject_routeToCore() {
+    @Config(sdk = [33]) // >= M for BackgroundCallConnection
+    fun backgroundCallConnection_onAnswer_onReject_routeToCore() {
         val fake = FakeCallActionDispatcher()
         CallActionDispatch.dispatcher = fake
 
-        val handle = SilaConnectionService.phoneAccountHandle(context)
+        val handle = BackgroundCallConnectionService.phoneAccountHandle(context)
         val extras = Bundle().apply {
             putString(IncomingCallNotifier.EXTRA_CALL_ID, "tele-call-2")
         }
         val request = ConnectionRequest(handle, null, extras)
-        val connection = SilaConnectionService.SilaCallConnection(context, handle, request)
+        val connection = BackgroundCallConnectionService.BackgroundCallConnection(context, handle, request)
         assertEquals("connection binds the request call_id", "tele-call-2", connection.callId)
 
         connection.onAnswer()
@@ -645,14 +645,14 @@ class BackgroundServicePluginTest {
     @Test
     @Config(sdk = [34])
     fun inboundOffer_issuesAddNewIncomingCallCarryingCallId() {
-        SilaConnectionService.addNewIncomingCall(context, "tele-in-1", isVideo = false)
+        BackgroundCallConnectionService.addNewIncomingCall(context, "tele-in-1", isVideo = false)
 
         val tm = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
         val record = shadowOf(tm).onlyIncomingCall
         assertNotNull("an inbound offer must DRIVE the account via addNewIncomingCall", record)
         assertEquals(
-            "addNewIncomingCall must target the Sila self-managed account",
-            SilaConnectionService.phoneAccountHandle(context),
+            "addNewIncomingCall must target the App self-managed account",
+            BackgroundCallConnectionService.phoneAccountHandle(context),
             record.phoneAccount,
         )
         assertEquals(
@@ -669,7 +669,7 @@ class BackgroundServicePluginTest {
         // self-managed outgoing call carrying the call_id. (Its production wire to a
         // live dial event is a follow-on — there is no native outbound hook today;
         // outbound is core-initiated via start_call.)
-        SilaConnectionService.placeOutgoingCall(context, "tele-out-1")
+        BackgroundCallConnectionService.placeOutgoingCall(context, "tele-out-1")
 
         val tm = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
         val record = shadowOf(tm).onlyOutgoingCall
@@ -683,11 +683,11 @@ class BackgroundServicePluginTest {
     }
 
     @Test
-    @Config(sdk = [33]) // >= M for SilaCallConnection + AudioFocusRequest
+    @Config(sdk = [33]) // >= M for BackgroundCallConnection + AudioFocusRequest
     fun activeConnection_requestsVoiceFocusAndCommunicationModeThenAbandons() {
-        val handle = SilaConnectionService.phoneAccountHandle(context)
+        val handle = BackgroundCallConnectionService.phoneAccountHandle(context)
         val extras = Bundle().apply { putString(IncomingCallNotifier.EXTRA_CALL_ID, "focus-1") }
-        val connection = SilaConnectionService.SilaCallConnection(
+        val connection = BackgroundCallConnectionService.BackgroundCallConnection(
             context, handle, ConnectionRequest(handle, null, extras)
         )
         val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -722,9 +722,9 @@ class BackgroundServicePluginTest {
     fun onAnswer_routesCoreAndActivatesConnectionEngagingFocus() {
         val fake = FakeCallActionDispatcher()
         CallActionDispatch.dispatcher = fake
-        val handle = SilaConnectionService.phoneAccountHandle(context)
+        val handle = BackgroundCallConnectionService.phoneAccountHandle(context)
         val extras = Bundle().apply { putString(IncomingCallNotifier.EXTRA_CALL_ID, "ans-active") }
-        val connection = SilaConnectionService.SilaCallConnection(
+        val connection = BackgroundCallConnectionService.BackgroundCallConnection(
             context, handle, ConnectionRequest(handle, null, extras)
         )
         val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -742,54 +742,54 @@ class BackgroundServicePluginTest {
     @Test
     @Config(sdk = [33])
     fun markCallActive_bridgesNotificationAnswerToConnectionFocus() {
-        val handle = SilaConnectionService.phoneAccountHandle(context)
+        val handle = BackgroundCallConnectionService.phoneAccountHandle(context)
         val extras = Bundle().apply { putString(IncomingCallNotifier.EXTRA_CALL_ID, "notif-ans") }
-        val connection = SilaConnectionService.SilaCallConnection(
+        val connection = BackgroundCallConnectionService.BackgroundCallConnection(
             context, handle, ConnectionRequest(handle, null, extras)
         )
-        SilaConnectionService.registerConnection("notif-ans", connection)
+        BackgroundCallConnectionService.registerConnection("notif-ans", connection)
         val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
         // The notification-answer bridge (CallActionReceiver answer → markCallActive).
-        SilaConnectionService.markCallActive("notif-ans")
+        BackgroundCallConnectionService.markCallActive("notif-ans")
         assertEquals("markCallActive drives the live connection ACTIVE", Connection.STATE_ACTIVE, connection.state)
         assertNotNull("the bridged answer engages audio focus", shadowOf(am).lastAudioFocusRequest)
         assertEquals(AudioManager.MODE_IN_COMMUNICATION, am.mode)
 
         // Unknown call_id → no crash, nothing driven.
-        SilaConnectionService.markCallActive("no-such-call")
+        BackgroundCallConnectionService.markCallActive("no-such-call")
 
         // Disconnect drops the registry entry (no leak).
         connection.setDisconnected(DisconnectCause(DisconnectCause.LOCAL))
-        assertEquals("disconnect clears the live-connection registry", 0, SilaConnectionService.liveConnectionCount())
+        assertEquals("disconnect clears the live-connection registry", 0, BackgroundCallConnectionService.liveConnectionCount())
     }
 
     @Test
     fun audioRouteFor_mapsRouteStringsToCallAudioStateRoutes() {
-        assertEquals("speaker → ROUTE_SPEAKER", CallAudioState.ROUTE_SPEAKER, SilaConnectionService.audioRouteFor("speaker"))
-        assertEquals("earpiece → ROUTE_EARPIECE", CallAudioState.ROUTE_EARPIECE, SilaConnectionService.audioRouteFor("earpiece"))
-        assertEquals("bluetooth → ROUTE_BLUETOOTH", CallAudioState.ROUTE_BLUETOOTH, SilaConnectionService.audioRouteFor("bluetooth"))
-        assertNull("system is platform-managed (no override)", SilaConnectionService.audioRouteFor("system"))
-        assertNull("unknown routes are ignored, not crashed", SilaConnectionService.audioRouteFor("bogus"))
+        assertEquals("speaker → ROUTE_SPEAKER", CallAudioState.ROUTE_SPEAKER, BackgroundCallConnectionService.audioRouteFor("speaker"))
+        assertEquals("earpiece → ROUTE_EARPIECE", CallAudioState.ROUTE_EARPIECE, BackgroundCallConnectionService.audioRouteFor("earpiece"))
+        assertEquals("bluetooth → ROUTE_BLUETOOTH", CallAudioState.ROUTE_BLUETOOTH, BackgroundCallConnectionService.audioRouteFor("bluetooth"))
+        assertNull("system is platform-managed (no override)", BackgroundCallConnectionService.audioRouteFor("system"))
+        assertNull("unknown routes are ignored, not crashed", BackgroundCallConnectionService.audioRouteFor("bogus"))
     }
 
     @Test
     @Config(sdk = [33])
     fun setCallAudioRoute_appliesToLiveConnection_noopWhenAbsent() {
         // No live connection → no-op (no crash).
-        SilaConnectionService.setCallAudioRoute("ghost", "speaker")
+        BackgroundCallConnectionService.setCallAudioRoute("ghost", "speaker")
 
-        val handle = SilaConnectionService.phoneAccountHandle(context)
+        val handle = BackgroundCallConnectionService.phoneAccountHandle(context)
         val extras = Bundle().apply { putString(IncomingCallNotifier.EXTRA_CALL_ID, "route-1") }
-        val connection = SilaConnectionService.SilaCallConnection(
+        val connection = BackgroundCallConnectionService.BackgroundCallConnection(
             context, handle, ConnectionRequest(handle, null, extras)
         )
-        SilaConnectionService.registerConnection("route-1", connection)
+        BackgroundCallConnectionService.registerConnection("route-1", connection)
         // Reaches the live connection (the physical route switch is device-verified;
         // here we prove the command resolves the route + reaches setAudioRoute without
         // throwing). `system` is a no-override no-op.
-        SilaConnectionService.setCallAudioRoute("route-1", "speaker")
-        SilaConnectionService.setCallAudioRoute("route-1", "system")
+        BackgroundCallConnectionService.setCallAudioRoute("route-1", "speaker")
+        BackgroundCallConnectionService.setCallAudioRoute("route-1", "system")
     }
 
     // ── Preflight FGS type validation ────────────────────────────────────
@@ -1054,7 +1054,7 @@ class BackgroundServicePluginTest {
         // commit() returns boolean, apply() returns Unit.
         // Verify that commit() is the call used for immediately-required prefs.
         val result = prefs.edit()
-            .putString("bg_service_label", "Sila")
+            .putString("bg_service_label", "App")
             .putString("bg_service_type", "remoteMessaging")
             .putString("bg_notif_channel_id", "bg_service")
             .putString("bg_notif_channel_name", "Background Service")
@@ -1065,7 +1065,7 @@ class BackgroundServicePluginTest {
             .commit()
 
         assertTrue("commit() should return true on successful write", result)
-        assertEquals("Sila", prefs.getString("bg_service_label", null))
+        assertEquals("App", prefs.getString("bg_service_label", null))
         assertEquals("remoteMessaging", prefs.getString("bg_service_type", null))
     }
 
@@ -1074,13 +1074,13 @@ class BackgroundServicePluginTest {
         // Verify that prefs written with commit() are immediately available
         // (unlike apply() which is async and may not be visible to onStartCommand)
         prefs.edit()
-            .putString("bg_service_label", "Sila")
+            .putString("bg_service_label", "App")
             .putString("bg_service_type", "remoteMessaging")
             .commit()
 
         // In production, LifecycleService.onStartCommand would read these prefs
         // immediately after startForegroundService returns.
-        assertEquals("Sila", prefs.getString("bg_service_label", null))
+        assertEquals("App", prefs.getString("bg_service_label", null))
         assertEquals("remoteMessaging", prefs.getString("bg_service_type", null))
     }
 
@@ -1133,7 +1133,7 @@ class BackgroundServicePluginTest {
     fun rollbackActivePrefs_clearsServicePrefs() {
         // Simulate: prefs were committed before start, start failed, rollback needed
         prefs.edit()
-            .putString("bg_service_label", "Sila")
+            .putString("bg_service_label", "App")
             .putString("bg_service_type", "remoteMessaging")
             .putString("bg_notif_channel_id", "bg_service")
             .putString("bg_notif_channel_name", "Background Service")
@@ -1164,7 +1164,7 @@ class BackgroundServicePluginTest {
     fun rollbackActivePrefs_preservesDurableStateRecovery() {
         // Set up active service prefs and DurableState recovery
         prefs.edit()
-            .putString("bg_service_label", "Sila")
+            .putString("bg_service_label", "App")
             .putString("bg_service_type", "remoteMessaging")
             .commit()
         DurableState.save(context, DurableState(
@@ -1199,7 +1199,7 @@ class BackgroundServicePluginTest {
         assertNotNull("mapServiceStartException should return non-null", errorJson)
         val durableState = DurableState(
             desiredRunning = false,
-            lastServiceLabel = "Sila",
+            lastServiceLabel = "App",
             lastServiceType = "remoteMessaging",
             lastStartEpochMs = System.currentTimeMillis(),
             lastPlatformError = errorJson,
@@ -1265,7 +1265,7 @@ class BackgroundServicePluginTest {
         assertFalse("ack wait must not resolve synchronously", resolved.get())
 
         // The service ("onStartCommand" worker) now completes the ack.
-        awaitWorkerParked("sila-start-ack")
+        awaitWorkerParked("bg-start-ack")
         ServiceStartAckRegistry.complete(id, true, "{\"ok\":true}")
 
         awaitTrue(resolved)
@@ -1293,7 +1293,7 @@ class BackgroundServicePluginTest {
         assertFalse("ack wait must not reject synchronously", failed.get())
 
         val payload = "{\"ok\":false,\"code\":\"core_start_failed\"}"
-        awaitWorkerParked("sila-start-ack")
+        awaitWorkerParked("bg-start-ack")
         ServiceStartAckRegistry.complete(id, false, payload)
 
         awaitTrue(failed)

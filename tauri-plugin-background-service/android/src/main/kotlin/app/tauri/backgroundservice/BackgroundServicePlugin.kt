@@ -109,9 +109,9 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
 
         // spec 08 C6 (Step 15): register the self-managed Telecom phone account
         // once at init so the OS can route audio focus, Bluetooth, and the
-        // system call sheet through SilaConnectionService while the webview is
+        // system call sheet through BackgroundCallConnectionService while the webview is
         // closed. Idempotent, API26+-guarded, and SecurityException-safe.
-        SilaConnectionService.registerPhoneAccount(activity)
+        BackgroundCallConnectionService.registerPhoneAccount(activity)
 
         // Register timeout callback so LifecycleService can emit events to JS.
         onTimeoutEvent = { errorMessage ->
@@ -410,21 +410,21 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
                 .getLaunchIntentForPackage(activity.packageName),
         )
         // M-NATIVE-3 (Step 11): DRIVE the registered self-managed Telecom account
-        // on the inbound offer so the OS creates a SilaCallConnection and its
+        // on the inbound offer so the OS creates a BackgroundCallConnection and its
         // audio-focus / MODE_IN_COMMUNICATION path (Step 9) engages — no longer a
         // registered-but-undriven account.
-        SilaConnectionService.addNewIncomingCall(activity, args.callId, args.isVideo)
+        BackgroundCallConnectionService.addNewIncomingCall(activity, args.callId, args.isVideo)
         invoke.resolve()
     }
 
     // M-NATIVE-3 (Step 11 / CCF-11): set the active call's device audio route
     // (speaker/earpiece/bluetooth/system). Applied to the live self-managed
-    // SilaCallConnection via Connection.setAudioRoute (the route command's GUI path
+    // BackgroundCallConnection via Connection.setAudioRoute (the route command's GUI path
     // reaches this through ServiceManagerHandle::set_call_audio_route).
     @Command
     fun setCallAudioRoute(invoke: Invoke) {
         val args = invoke.parseArgs(SetCallAudioRouteArgs::class.java)
-        SilaConnectionService.setCallAudioRoute(args.callId, args.route)
+        BackgroundCallConnectionService.setCallAudioRoute(args.callId, args.route)
         invoke.resolve()
     }
 
@@ -669,7 +669,7 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
             onSuccess: () -> Unit,
             onFailure: (ServiceStartAckRegistry.Ack) -> Unit,
         ) {
-            ackWaitExecutor("sila-start-ack") {
+            ackWaitExecutor("bg-start-ack") {
                 val ack = ServiceStartAckRegistry.await(startAckId, START_ACK_TIMEOUT_MS)
                 if (ack.success) onSuccess() else onFailure(ack)
             }
@@ -733,7 +733,7 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
  * an OS start-restriction (background-start `IllegalStateException` on Android O+,
  * `ForegroundServiceStartNotAllowedException` on Android 12+) is logged rather
  * than crashing the host process. Mirrors the guarded pattern in
- * `HeadlessCoreBridge.revertForegroundServiceType` (catch `Throwable` + `Log.w`).
+ * `HeadlessBridge.revertForegroundServiceType` (catch `Throwable` + `Log.w`).
  *
  * Shared by every edge-branch start site in this plugin AND by
  * [BootReceiver.startRecoveryService] (same module/package), so each call site

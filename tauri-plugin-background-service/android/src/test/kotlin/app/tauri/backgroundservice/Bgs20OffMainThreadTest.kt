@@ -21,7 +21,7 @@ import org.robolectric.annotation.Config
  * their JNI dispatch OFF the Android main looper.
  *
  * `BroadcastReceiver.onReceive` runs on the main thread; both receivers reach a
- * `HeadlessCoreBridge` JNI export that does `block_on` (a fresh QUIC dial for
+ * `HeadlessBridge` JNI export that does `block_on` (a fresh QUIC dial for
  * call actions; storage + network work for notification actions) — an ANR risk
  * exactly during headless use (lock-screen Answer/Decline/Reply/Mark-as-read).
  * The fix wraps each dispatch in `goAsync()` + an injected worker executor
@@ -68,7 +68,7 @@ class Bgs20OffMainThreadTest {
         // post-onReceive assertions are deterministic AND the worker differs
         // from main. (Inline `{ _, task -> task() }` runs on main → vacuous.)
         CallActionReceiver.actionExecutor = { _, task ->
-            val worker = Thread({ task() }, "sila-call-action-test")
+            val worker = Thread({ task() }, "bg-call-action-test")
             worker.start()
             worker.join()
         }
@@ -109,7 +109,7 @@ class Bgs20OffMainThreadTest {
         val fake = FakeMessageNotificationActionDispatcher()
         MessageNotificationActionDispatch.dispatcher = fake
         MessageNotificationActionReceiver.actionExecutor = { _, task ->
-            val worker = Thread({ task() }, "sila-message-action-test")
+            val worker = Thread({ task() }, "bg-message-action-test")
             worker.start()
             worker.join()
         }

@@ -1,15 +1,15 @@
 # Consumer R8/ProGuard rules for tauri-plugin-background-service.
 #
 # These are packaged with the library and merged into the CONSUMING app's R8 run
-# (the Sila app sets `isMinifyEnabled = true` on release). The Tauri framework's
+# (the host app sets `isMinifyEnabled = true` on release). The Tauri framework's
 # own consumer rules already keep `app.tauri.**`, but scoping the guarantees to
 # this plugin here keeps it correct independently of that and documents intent.
 
-# JNI bridge: the Rust cdylib (`sila_lib`) resolves these native methods by their
-# exact `Java_app_tauri_backgroundservice_HeadlessCoreBridge_*` symbol names
+# JNI bridge: the Rust cdylib (`the native core`) resolves these native methods by their
+# exact `Java_app_tauri_backgroundservice_HeadlessBridge_*` symbol names
 # (see tauri/src/lib.rs), so the class and its native methods must not be
 # renamed, moved, or stripped.
--keep class app.tauri.backgroundservice.HeadlessCoreBridge {
+-keep class app.tauri.backgroundservice.HeadlessBridge {
     native <methods>;
 }
 

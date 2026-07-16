@@ -5,7 +5,7 @@ import android.content.Context
 /**
  * Resolves notification small icons from app-owned resources.
  *
- * Sila's generated app icon lives in `mipmap/ic_launcher`, while older plugin
+ * The host app's generated app icon lives in `mipmap/ic_launcher`, while older plugin
  * config only looked in `drawable` and then fell back to Android's sync icon.
  * This resolver prefers configured app resources, then the generated launcher
  * icon, then the manifest application icon. The system sync icon is retained
@@ -14,7 +14,7 @@ import android.content.Context
 object NotificationIconResolver {
     fun resolve(context: Context, configuredName: String? = null): Int {
         resolveNamed(context, configuredName)?.let { return it }
-        resolveNamed(context, "ic_stat_sila")?.let { return it }
+        resolveNamed(context, "ic_stat_bg_service")?.let { return it }
         resolveNamed(context, "ic_launcher")?.let { return it }
         resolveNamed(context, "ic_launcher_foreground")?.let { return it }
 
