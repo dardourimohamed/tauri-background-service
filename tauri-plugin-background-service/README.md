@@ -4,7 +4,7 @@
 
 A Tauri v2 plugin that manages long-lived background service lifecycle across all platforms (Android, iOS, Windows, macOS, Linux).
 
-You implement a single `BackgroundService` trait on your own struct. The plugin spawns it in a Tokio task, manages OS-specific keepalive mechanisms (Android foreground service, iOS BGTaskScheduler, desktop OS service), and provides helpers for notifications and event emission. No business logic lives in the plugin — only lifecycle management.
+You implement a single `BackgroundService` trait on your own struct. The plugin spawns it in a Tokio task, manages OS-specific keepalive mechanisms (Android foreground service, iOS BGTaskScheduler, desktop OS service), and provides helpers for notifications and event emission. No business logic lives in the plugin — only lifecycle management, plus **opt-in, pluggable integration seams** for calling/telecom and notification surfaces that a host app wires up (the plugin ships no native library; defaults are no-ops).
 
 Use [`getPlatformCapabilities()`](./docs/api-reference.md#getplatformcapabilities) at runtime to query what the current platform can guarantee for background execution survival.
 
@@ -50,7 +50,7 @@ Add the plugin to your app's `Cargo.toml`:
 [dependencies]
 tauri = { version = "2" }
 tauri-plugin-notification = "2"
-tauri-plugin-background-service = "0.7"
+tauri-plugin-background-service = "1.0"
 ```
 
 ### npm (TypeScript API)
@@ -336,7 +336,7 @@ No special OS integration is needed. The service runs as a standard Tokio task a
 For OS-level daemon mode (systemd / launchd), enable the `desktop-service` Cargo feature:
 
 ```toml
-tauri-plugin-background-service = { version = "0.7", features = ["desktop-service"] }
+tauri-plugin-background-service = { version = "1.0", features = ["desktop-service"] }
 ```
 
 ## Links

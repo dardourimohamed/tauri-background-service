@@ -379,6 +379,73 @@ Add them to your capabilities file if you use the new APIs:
 - Existing `ServiceStatus` consumers — no changes to this type
 - Existing `SetupValidationReport` consumers — `issues` field has a default empty array
 
+## 0.7 → 1.0 Migration
+
+1.0 is the first stable release. It ports the production implementation and
+**decouples the plugin from any host-app native core** — the plugin ships no
+native library, and apps that bridge to their own native core do so via
+pluggable seams (no-op by default).
+
+### Breaking: `AutoStartConfig` removed
+
+The legacy `AutoStartConfig` struct (and its `#[doc(hidden)]` re-export) is gone,
+replaced by the desired-state recovery machinery.
+
+- Before: `AutoStartConfig { ... }` + `get_auto_start_config` / `clear_auto_start_config`.
+- After: `enable_auto_restart()` / `disable_auto_restart()` / `configure_recovery(...)`
+  + `get_desired_service_state()`, backed by `DesiredState` / `FileDesiredStateBackend`.
+
+### Breaking: Android native core renamed + decoupled
+
+- `HeadlessCoreBridge` → `HeadlessBridge` (JNI symbols are now
+  `Java_app_tauri_backgroundservice_HeadlessBridge_*`).
+- `SilaConnectionService` → `BackgroundCallConnectionService`.
+- The native library name is now configurable via `HeadlessBridge.nativeLibName`
+  (default `"app_core"`). Set it to your cdylib name before the service starts:
+
+  ```kotlin
+  HeadlessBridge.nativeLibName = "app_core"
+  ```
+
+  A missing library yields a typed `native_library_load_failed` result (no crash);
+  the lifecycle-only path (foreground service + Rust `BackgroundService<R>` task)
+  is unaffected.
+
+### Breaking: iOS `SilaNativeFFI` removed
+
+The four `@_silgen_name("sila_*")` symbols are deleted, so the Swift package now
+links for any host app. If you bridged CallKit perform-actions or PushKit tokens
+to a native core, inject closures instead:
+
+```swift
+callKitController.performCallAction = { callId, action in /* route to your core */ }
+backgroundServicePlugin.pushTokenSink = { token in /* persist; nil clears */ }
+```
+
+Defaults are no-ops, so the plugin builds and runs standalone.
+
+### New `desktop-service` feature (opt-in)
+
+Managed OS service support (systemd / launchd / Windows service) is behind the
+`desktop-service` cargo feature:
+
+```toml
+tauri-plugin-background-service = { version = "1.0", features = ["desktop-service"] }
+```
+
+### New notification / permission APIs (additive)
+
+`getNotificationPermissionStatus`, `requestNotificationPermission`,
+`requestBatteryExemption`, `canUseFullScreenIntent`,
+`openFullScreenIntentSettings`, `getDesiredStateStatus`,
+`startNativeLifecycleBridge`, `onPlatformError`.
+
+### No action required for
+
+- `startService()` / `stopService()` / `isServiceRunning()` and
+  `BackgroundService<R>` trait implementations.
+- `onPluginEvent()` listeners (backward-compatible deserialization).
+
 ## Version History
 
 _No versions with breaking changes yet._
