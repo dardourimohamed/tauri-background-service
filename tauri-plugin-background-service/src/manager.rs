@@ -129,7 +129,7 @@ pub(crate) trait MobileKeepalive: Send + Sync {
     }
     /// Set the active call's device audio route (M-NATIVE-3 / CCF-11, Step 11):
     /// `speaker`/`earpiece`/`bluetooth`/`system`. Android applies it to the live
-    /// self-managed `SilaCallConnection` via `Connection.setAudioRoute`; iOS via
+    /// self-managed `BackgroundCallConnection` via `Connection.setAudioRoute`; iOS via
     /// `AVAudioSession.overrideOutputAudioPort`. Default no-op on non-mobile / desktop.
     fn set_call_audio_route(&self, _call_id: &str, _route: &str) -> Result<(), ServiceError> {
         Ok(())
@@ -709,7 +709,7 @@ pub async fn manager_loop<R: Runtime>(
     // reply). `None` for GUI in-process + IPC-client callers (no boot-replay).
     boot_app: Option<AppHandle<R>>,
     // BGS-05 re-fix (Critic Blocker 2 — Leg A/Leg B coordination): the boot
-    // Start-replay fires ONLY when the Sila app's consent policy allows
+    // Start-replay fires ONLY when the host app's consent policy allows
     // auto-unlock (`consent.enabled && consent.auto_unlock`, computed LIVE in
     // `run_headless` and threaded through `headless_main_with_desired_state`).
     // Before this, the replay guard was `desired_running`-ONLY — consent-blind —
@@ -823,7 +823,7 @@ pub async fn manager_loop<R: Runtime>(
             ManagerCommand::ShutdownGracefully { reply } => {
                 // BGS-31 (doc-08 Step 9): bounded Core-level drain driven from
                 // the SIGTERM/SIGINT handler. The service override reaches
-                // process-wide state (the Sila Core) through `ctx.app`; the
+                // process-wide state (the host app core) through `ctx.app`; the
                 // running service task is owned by a spawned task and is not
                 // reachable here, so `handle_shutdown_gracefully` constructs a
                 // fresh service via the factory + a context from the last
@@ -1226,7 +1226,7 @@ fn handle_stop<R: Runtime>(state: &mut ServiceState<R>) -> Result<(), ServiceErr
 /// [`BackgroundService::shutdown_gracefully`] hook. The running service task is
 /// owned by a spawned task and is not reachable from the actor loop; the hook
 /// is intentionally STATELESS w.r.t. the instance — an override reaches
-/// process-wide state (the Sila `Core`) through `ctx.app.state::<AppState>()`,
+/// process-wide state (the host app core) through `ctx.app.state::<AppState>()`,
 /// so invoking it on a fresh factory instance is equivalent to invoking it on
 /// the running one.
 ///
@@ -1312,7 +1312,7 @@ fn handle_stop_with_reason<R: Runtime>(
                 if let Some(ref sink) = state.notify_sink {
                     sink.notify(
                         "bg-timeout",
-                        "Sila background service paused",
+                        "Background service paused",
                         "The OS paused background delivery; it will resume automatically.",
                     );
                 }
@@ -1450,7 +1450,7 @@ fn handle_native_lifecycle_event<R: Runtime>(
             if let Some(ref sink) = state.notify_sink {
                 sink.notify(
                     "bg-recovery",
-                    "Sila background service restored",
+                    "Background service restored",
                     "Background delivery restored.",
                 );
             }
@@ -1465,7 +1465,7 @@ fn handle_native_lifecycle_event<R: Runtime>(
 ///
 /// Pure (host-testable). The desktop lifecycle gate + the `handle_start`
 /// dispatch live in `manager_loop`'s pre-loop block; mobile uses its own native
-/// resubmit at the platform layer. Consent is the Sila app's concern (Leg A) —
+/// resubmit at the platform layer. Consent is the host app's concern (Leg A) —
 /// this fn is `desired_running`-only. NV-MUT (force `false`) REDs only the
 /// replay test; NV-MUT (force `true`) REDs the no-replay guards.
 fn should_replay_on_boot(ds: &crate::desired_state::DesiredState) -> bool {
@@ -4082,7 +4082,7 @@ mod tests {
                 desired_running: true,
                 last_start_config: Some(
                     serde_json::to_value(StartConfig {
-                        service_label: "Sila".into(),
+                        service_label: "App".into(),
                         foreground_service_type: "remoteMessaging".into(),
                     })
                     .unwrap(),
@@ -4163,7 +4163,7 @@ mod tests {
         // `true` here) ⇒ the replay fires ⇒ `BlockingService` sets is_running ⇒
         // the `!send_is_running` assert flips ⇒ RED. Pairs with the F3 builder
         // pin (`bgs05_start_headless_core_consent_off_stays_locked_despite_credential`
-        // in the Sila crate): F2 gates the replay dispatch, F3 gates the builder
+        // in the host crate): F2 gates the replay dispatch, F3 gates the builder
         // itself — together they close every boot-reachable auto-unlock path.
         let backend = MockDesiredStateBackend::new();
         backend
@@ -4171,7 +4171,7 @@ mod tests {
                 desired_running: true,
                 last_start_config: Some(
                     serde_json::to_value(StartConfig {
-                        service_label: "Sila".into(),
+                        service_label: "App".into(),
                         foreground_service_type: "remoteMessaging".into(),
                     })
                     .unwrap(),
@@ -6705,13 +6705,13 @@ mod tests {
         send_set_mobile(&handle, mock.clone()).await;
 
         let mut ns = native_state(false);
-        ns.data_dir = "/data/app/com.sila".into();
+        ns.data_dir = "/data/app/com.example".into();
         mock.set_native_state(ns);
 
         let status = send_get_lifecycle_status(&handle).await;
         assert_eq!(
             status.data_dir,
-            Some("/data/app/com.sila".to_string()),
+            Some("/data/app/com.example".to_string()),
             "data_dir from native should surface in status"
         );
     }

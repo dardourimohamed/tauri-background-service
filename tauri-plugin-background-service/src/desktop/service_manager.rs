@@ -331,7 +331,7 @@ mod tests {
     fn service_level_is_user_on_unix() {
         assert!(
             matches!(service_level_for_platform(), ServiceLevel::User),
-            "Unix service managers (systemd, launchd) run Sila per-user"
+            "Unix service managers (systemd, launchd) run the service per-user"
         );
     }
 

@@ -548,7 +548,7 @@ impl<R: Runtime> MobileLifecycle<R> {
 
     /// Fire an actionable native message notification.
     ///
-    /// **sila-doc-06 NTF-07 iOS actionable message-surface DEFERRED to Step-13
+    /// **doc-06 NTF-07 iOS actionable message-surface DEFERRED to Step-13
     /// iOS runbook.** The active arm below is `#[cfg(target_os = "android")]`:
     /// Android dispatches via the Kotlin `showMessageNotification` `@Command`
     /// (`BackgroundServicePlugin.kt`:415 → `ActionableMessageNotifier.kt`:35),
@@ -607,7 +607,7 @@ impl<R: Runtime> MobileLifecycle<R> {
         }
         #[cfg(not(target_os = "android"))]
         {
-            // sila-doc-06 NTF-07 iOS actionable message-surface DEFERRED to
+            // doc-06 NTF-07 iOS actionable message-surface DEFERRED to
             // Step-13 iOS runbook: this arm conflates desktop (correctly a
             // no-op — desktop routes actionable notifications via
             // emit_system_notification) with iOS (which has no Swift
@@ -634,7 +634,7 @@ impl<R: Runtime> MobileLifecycle<R> {
     }
 
     /// Set the active call's device audio route (M-NATIVE-3 / CCF-11, Step 11):
-    /// Android applies it to the live self-managed `SilaCallConnection` via
+    /// Android applies it to the live self-managed `BackgroundCallConnection` via
     /// `Connection.setAudioRoute`; iOS via `AVAudioSession.overrideOutputAudioPort`.
     pub fn set_call_audio_route(&self, call_id: &str, route: &str) -> Result<(), ServiceError> {
         log::info!(
