@@ -2,7 +2,7 @@ import XCTest
 @testable import tauri_plugin_background_service
 
 /// M-NATIVE-4 / NR-6 (Step 12): proves `showIncomingCall` honors the
-/// `SilaCallDecision.shouldRingCallKit` foreground gate (DEC-060 "one ring owner
+/// `BackgroundCallDecision.shouldRingCallKit` foreground gate (DEC-060 "one ring owner
 /// per app-state"). While the webview is foreground the in-app IncomingCallScreen
 /// owns the ring, so the CallKit ring must be suppressed (no double-ring); while
 /// backgrounded the native CallKit ring fires. The gate reads the live UIKit app

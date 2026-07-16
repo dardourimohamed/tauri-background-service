@@ -865,7 +865,7 @@ import Tauri
         // registry state (Task A's status surface). The token is re-issued on
         // every launch via PKPushRegistry, so an in-memory store is sufficient.
         let token = pushCredentials.token.map { String(format: "%02x", $0) }.joined()
-        token.withCString { SilaNativeFFI.silaSetPushToken($0) }
+        pushTokenSink(token)
     }
 
     func pushRegistry(
@@ -897,19 +897,25 @@ import Tauri
     ) {
         // Token revoked (user unregisters / capabilities invalidated) — clear the
         // store so `push_relay_configured` returns to false.
-        SilaNativeFFI.silaClearPushToken()
+        pushTokenSink(nil)
     }
 
     // MARK: - CallKit incoming-call commands (spec 08 C6, Step 16)
+
+    /// Sink for the host app's VoIP push-token store. The default is a no-op
+    /// (the plugin ships no native library); a host app that persists/clears its
+    /// PushKit token in a native core injects a closure here — `Some(token)` on
+    /// `didUpdate`, `nil` on `didInvalidatePushTokenCapabilitiesForType`.
+    var pushTokenSink: (String?) -> Void = { _ in }
 
     /// Lazily-initialized CallKit controller. Reports calls to the system and configures the
     /// VOIP audio session. Reached while foreground/background-active (F3 degraded mode) AND
     /// from the VoIP-push delegate (`pushRegistry(_:didReceiveIncomingPushWith:for:completion:)`),
     /// which iOS 13+ wakes a suspended app to deliver.
-    lazy var callKitController: SilaCallKitController = {
-        let controller = SilaCallKitController()
+    lazy var callKitController: BackgroundCallKitController = {
+        let controller = BackgroundCallKitController()
         // DEPRECATED FALLBACK (BGS-10, Step 18 Task B): the perform-handlers now
-        // route Answer/Reject/End DIRECTLY to Rust via `sila_call_action` (the
+        // route Answer/Reject/End DIRECTLY to Rust via the native call-action bridge (the
         // webview is suspended when CallKit rings), so this `onCallEvent` →
         // `trigger` wiring is NO LONGER the active path for those actions.
         // Retained as the dormant fallback seam for a future webview-foreground
@@ -934,7 +940,7 @@ import Tauri
             // L5: a malformed call_id would strand a random-UUID call CallKit can
             // never dismiss; an empty callerName has nothing to show. Reject so the
             // call never rings rather than ringing a broken call.
-            guard SilaCallKitController.isValidCallId(callId) else {
+            guard BackgroundCallKitController.isValidCallId(callId) else {
                 invoke.reject("invalidCallId")
                 return
             }
@@ -948,7 +954,7 @@ import Tauri
             // Rust `should_ring_native` gate already suppresses this path when
             // foreground; this is the independent iOS-side check reading the real OS
             // app state — defense-in-depth behind that gate.
-            guard SilaCallDecision.shouldRingCallKit(appForeground: self.appIsForeground()) else {
+            guard BackgroundCallDecision.shouldRingCallKit(appForeground: self.appIsForeground()) else {
                 invoke.resolve()
                 return
             }
@@ -965,7 +971,7 @@ import Tauri
             let callId = (args?["callId"] as? String) ?? ""
             // L5: reject a malformed id (it could never have been reported, so
             // there is nothing to dismiss) rather than ending a random-UUID call.
-            guard SilaCallKitController.isValidCallId(callId) else {
+            guard BackgroundCallKitController.isValidCallId(callId) else {
                 invoke.reject("invalidCallId")
                 return
             }
@@ -981,7 +987,7 @@ import Tauri
     @objc public func setCallAudioRoute(_ invoke: Invoke) {
         onMain {
             let routeRaw = (invoke.anyArgs?["route"] as? String) ?? "system"
-            let route = SilaAudioRoute(rawValue: routeRaw) ?? .system
+            let route = CallAudioRoute(rawValue: routeRaw) ?? .system
             self.callKitController.setAudioRoute(route)
             invoke.resolve()
         }

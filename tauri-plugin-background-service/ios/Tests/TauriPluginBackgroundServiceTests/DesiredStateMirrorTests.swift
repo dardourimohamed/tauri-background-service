@@ -46,7 +46,7 @@ final class DesiredStateMirrorTests: XCTestCase {
         let capture = InvokeCapture()
         plugin.setDesiredRunning(
             capture.makeInvoke(
-                args: "{\"desiredRunning\":true,\"lastStartConfig\":\"{\\\"serviceLabel\\\":\\\"Sila\\\"}\"}"
+                args: "{\"desiredRunning\":true,\"lastStartConfig\":\"{\\\"serviceLabel\\\":\\\"App\\\"}\"}"
             )
         )
 
@@ -55,7 +55,7 @@ final class DesiredStateMirrorTests: XCTestCase {
         XCTAssertTrue(UserDefaults.standard.bool(forKey: "ios_desired_running"))
         XCTAssertEqual(
             UserDefaults.standard.string(forKey: "ios_last_start_config"),
-            "{\"serviceLabel\":\"Sila\"}",
+            "{\"serviceLabel\":\"App\"}",
             "lastStartConfig should be persisted verbatim for auto-start to parse"
         )
         // BGTasks scheduled (refresh + processing submitted via the fake scheduler).

@@ -1,5 +1,5 @@
 // swift-tools-version:5.5
-// Copyright 2019-2024 Sila. Tauri iOS plugin manifest for the background-service plugin.
+// Copyright The Tauri Background Service Plugin Authors. Tauri iOS plugin manifest for the background-service plugin.
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 

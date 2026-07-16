@@ -12,7 +12,7 @@ import os.log
 /// inbound QUIC packet, so v1 (no APNs push relay) gives the caller a fast `Unreachable`
 /// (offer-ack timeout T1, Step 4) and queues a missed-call notice through the control
 /// outbox (Step 5) for delivery on the next wake.
-enum SilaAppCallState: String, Equatable {
+enum BackgroundCallAppState: String, Equatable {
     /// App visible; report the call to CallKit (system ring + in-call UI).
     case foreground
     /// Short background-active window / live BGTask; report the call to CallKit.
@@ -23,7 +23,7 @@ enum SilaAppCallState: String, Equatable {
 }
 
 /// What the iOS side does with an inbound call offer, given the app's lifecycle state.
-enum SilaCallDeliveryAction: Equatable {
+enum CallDeliveryAction: Equatable {
     /// Report the call to CallKit so the system rings and shows the in-call UI.
     case ring(hasVideo: Bool)
     /// App is suspended: skip CallKit entirely. The caller's T1 yields `Unreachable` and a
@@ -36,8 +36,8 @@ enum SilaCallDeliveryAction: Equatable {
 /// Mirrors the Kotlin/Android fast-path but expresses iOS's honest constraint: there is no
 /// push relay in v1, so a suspended app simply cannot ring. Decoupled from `CXProvider` /
 /// UIKit so it is unit-testable without the iOS runtime (spec-01 seam philosophy).
-enum SilaCallDecision {
-    static func deliveryAction(appState: SilaAppCallState, offerHasVideo: Bool) -> SilaCallDeliveryAction {
+enum BackgroundCallDecision {
+    static func deliveryAction(appState: BackgroundCallAppState, offerHasVideo: Bool) -> CallDeliveryAction {
         switch appState {
         case .foreground, .backgroundActive:
             return .ring(hasVideo: offerHasVideo)
@@ -65,15 +65,15 @@ enum SilaCallDecision {
     }
 
     /// Step 13 (M-NATIVE-5 = CCF-14/NR-5): the iOS twin of the Rust
-    /// `sila_core::call_capabilities("ios").suspended_incoming_ring_supported`.
+    /// `the host core("ios").suspended_incoming_ring_supported`.
     ///
     /// **`false` on iOS, honestly.** Step 17 declares the `voip` UIBackgroundMode
     /// and Step 18 Task B lands the on-device `PKPushRegistry`
-    /// (`BackgroundServicePlugin` → `sila_set_push_token`), but the APNs **relay**
+    /// (`BackgroundServicePlugin` → `the push-token sink`), but the APNs **relay**
     /// that actually delivers a VoIP push to a suspended app is an EXTERNAL
     /// dependency (Fork 2) and not yet device-verified. Until it is, a suspended
     /// app gets the documented missed-call path
-    /// (`SilaCallDeliveryAction.deferToControlOutbox`), never a reliable ring —
+    /// (`CallDeliveryAction.deferToControlOutbox`), never a reliable ring —
     /// so this must never be presented as native incoming-call parity. The
     /// registry-vs-relay distinction is observable via
     /// `MobilePackagingValidation.push_relay_configured` (token registered, NOT
@@ -87,8 +87,8 @@ enum SilaCallDecision {
 /// Pure description of the desired `AVAudioSession` configuration for a call.
 ///
 /// Decoupled from `AVAudioSession` so the routing choice is unit-testable; applied by
-/// `SilaCallKitController` inside `CXProviderDelegate.didActivate`.
-struct SilaAudioSessionConfiguration: Equatable {
+/// `BackgroundCallKitController` inside `CXProviderDelegate.didActivate`.
+struct CallAudioSessionConfiguration: Equatable {
     let category: String
     let mode: String
     /// Route to the speaker (default for video; CallKit owns routing for audio).
@@ -98,7 +98,7 @@ struct SilaAudioSessionConfiguration: Equatable {
 
     /// VOIP audio call: `playAndRecord` + `voiceChat`. CallKit's `didActivate` owns routing,
     /// so `defaultToSpeaker` is false (honor the system call UI / earpiece).
-    static let audioCall = SilaAudioSessionConfiguration(
+    static let audioCall = CallAudioSessionConfiguration(
         category: "AVAudioSessionCategoryPlayAndRecord",
         mode: "AVAudioSessionModeVoiceChat",
         defaultToSpeaker: false,
@@ -107,14 +107,14 @@ struct SilaAudioSessionConfiguration: Equatable {
 
     /// Video call: `playAndRecord` + `videoChat`, default to speaker — speakerphone is the
     /// sensible default when the camera is active and the screen is away from the ear.
-    static let videoCall = SilaAudioSessionConfiguration(
+    static let videoCall = CallAudioSessionConfiguration(
         category: "AVAudioSessionCategoryPlayAndRecord",
         mode: "AVAudioSessionModeVideoChat",
         defaultToSpeaker: true,
         allowsBluetoothA2DP: true
     )
 
-    static func forCall(hasVideo: Bool) -> SilaAudioSessionConfiguration {
+    static func forCall(hasVideo: Bool) -> CallAudioSessionConfiguration {
         hasVideo ? .videoCall : .audioCall
     }
 }
@@ -122,8 +122,8 @@ struct SilaAudioSessionConfiguration: Equatable {
 /// Device audio route for an active call (M-NATIVE-3 / CCF-11, Step 11) — mirrors
 /// the Rust `CallAudioRoute` / Android `audioRouteFor`. The routing choice is
 /// decoupled from `AVAudioSession` so it is unit-testable like
-/// `SilaAudioSessionConfiguration`; applied by `SilaCallKitController.setAudioRoute`.
-enum SilaAudioRoute: String {
+/// `CallAudioSessionConfiguration`; applied by `BackgroundCallKitController.setAudioRoute`.
+enum CallAudioRoute: String {
     case speaker
     case earpiece
     case bluetooth
@@ -143,94 +143,31 @@ enum SilaAudioRoute: String {
     }
 }
 
-// MARK: - Rust direct-FFI bridge (BGS-10 + BGS-08, doc-08 Step 18 Task B)
+// MARK: - Native core bridge (host-provided; no native lib ships with the plugin)
 
-/// Swift bindings for the iOS C-FFI `extern "C"` entries in
-/// `tauri/src/ios_ffi.rs`.
-///
-/// CallKit perform-handlers route Answer/Reject/End DIRECTLY to the Rust control
-/// plane through these symbols — not through the suspended webview — so a
-/// lock-screen action reaches the running Core even while the app is backgrounded
-/// (BGS-10: the webview bridge `onCallEvent → trigger → useNativeCallActions.ts
-/// → Tauri cmd` is suspended exactly when CallKit rings, so a webview-routed
-/// lock-screen answer may never connect). The symbols resolve at app link time
-/// from the Rust cdylib (`sila_lib`).
-///
-/// Host-validation (no macOS toolchain on this host — written + runbook-gated,
-/// xcodebuild iOS-Simulator in Step 21): the `sila_call_action` routing is
-/// pinned by `bgs10_native_accept_drives_fsm` and the PushKit token shims by
-/// `bgs08_pushkit_ffi_shim_plumbed` (`tauri/src/ios_ffi.rs` + `headless_core.rs`).
-///
-/// CROSS-DOC: doc 04 owns call-control semantics (`answer_call`/`reject_call`/
-/// `end_call`); these bindings are the iOS transport, mirroring the Android JNI
-/// `callAction` single-symbol contract.
-enum SilaNativeFFI {
-    /// `sila_call_action(call_id, action) -> *mut c_char` — route an
-    /// `"answer"`/`"reject"`/`"end"` action for `call_id` to
-    /// `headless_core::call_action` → the Core control plane. Returns an OWNED
-    /// JSON report the caller MUST reclaim via `silaFreeString` (a
-    /// `CString::into_raw` allocation — Rust allocator-matched, not Swift's).
-    ///
-    /// Call-context precondition (documented on the Rust entry): invoke from a
-    /// thread with NO ambient tokio runtime. CallKit perform-handlers run on the
-    /// `CXProvider` queue (no ambient runtime — safe); a future tokio-spawned
-    /// re-entry would panic (panic=abort aborts the process).
-    @_silgen_name("sila_call_action")
-    private static func silaCallAction(
-        _ callId: UnsafePointer<CChar>?,
-        _ action: UnsafePointer<CChar>?
-    ) -> UnsafeMutablePointer<CChar>?
-
-    /// `sila_free_string(ptr)` — reclaim a report C string returned by
-    /// `silaCallAction`. No-op on null. Must be called exactly once per
-    /// returned pointer.
-    @_silgen_name("sila_free_string")
-    private static func silaFreeString(_ ptr: UnsafeMutablePointer<CChar>?)
-
-    /// `sila_set_push_token(token)` — persist the PushKit device token into the
-    /// doc-08 token store (null/empty clears). Used by `BackgroundServicePlugin`'s
-    /// `PKPushRegistry` delegate.
-    @_silgen_name("sila_set_push_token")
-    static func silaSetPushToken(_ token: UnsafePointer<CChar>?)
-
-    /// `sila_clear_push_token()` — clear the stored PushKit token
-    /// (invalidate/logout).
-    @_silgen_name("sila_clear_push_token")
-    static func silaClearPushToken()
-
-    /// Default production bridge: route a CallKit perform action to Rust and
-    /// free the returned report (the perform-handlers do not consume it). Exposed
-    /// so `SilaCallKitController.performCallAction` can default to it while
-    /// XCTest injects a recorder — asserting the perform→action mapping without a
-    /// live Core.
-    static func bridgeCallAction(callId: String, action: String) {
-        callId.withCString { cCallId in
-            action.withCString { cAction in
-                if let raw = silaCallAction(cCallId, cAction) {
-                    silaFreeString(raw)
-                }
-            }
-        }
-    }
-}
+// The plugin ships no native library. A host app that bridges CallKit perform-
+// actions (Answer/Reject/End) and PushKit tokens to its own native core injects
+// closures: BackgroundCallKitController.performCallAction and
+// BackgroundServicePlugin.pushTokenSink. Defaults are no-ops, so the plugin
+// builds and runs standalone.
 
 // MARK: - CallKit + AVAudioSession wrapper (runtime glue; device-tested)
 
-/// CallKit + `AVAudioSession` wrapper for Sila calls (spec 08 C6, Step 16).
+/// CallKit + `AVAudioSession` wrapper for incoming calls (spec 08 C6, Step 16).
 ///
 /// The headless Rust core signals an incoming call via the Tauri mobile-plugin invoke
 /// `showIncomingCall` (routed by `MobileLifecycle::show_incoming_call`); this controller
 /// reports it to CallKit (system ring + in-call UI) and configures the VOIP audio session.
 ///
 /// Degraded mode (F3): because there is no APNs push relay in v1, this path is only
-/// reached while the app is foreground/background-active — exactly `SilaCallDecision`'s
+/// reached while the app is foreground/background-active — exactly `BackgroundCallDecision`'s
 /// `.ring` arm. A suspended app is never woken to reach this path; the caller instead gets
 /// `Unreachable` + a missed-call control-outbox record. The PushKit/APNs relay (F3(b)) is
 /// the documented, explicitly-deferred path; since iOS 13 a VoIP push must report to
 /// CallKit, so this controller is a prerequisite for any future push anyway.
-final class SilaCallKitController: NSObject, CXProviderDelegate {
+final class BackgroundCallKitController: NSObject, CXProviderDelegate {
 
-    private static let logger = OSLog(subsystem: "social.sila", category: "CallKit")
+    private static let logger = OSLog(subsystem: "app.tauri.backgroundservice", category: "CallKit")
 
     private let provider: CXProvider
     private let callController: CXCallController
@@ -269,19 +206,19 @@ final class SilaCallKitController: NSObject, CXProviderDelegate {
     /// touches it).
     var onCallEvent: ((_ event: String, _ callId: String) -> Void)?
 
-    /// The active CallKit→Rust call-action bridge (BGS-10, Step 18 Task B).
-    /// Defaults to the real FFI (`SilaNativeFFI.bridgeCallAction`); XCTest
-    /// swaps in a recorder to assert the perform→action mapping without a live
-    /// Core. The perform-handlers invoke this with `("answer" | "reject" | "end")`
-    /// + the ORIGINAL 32-hex `call_id`, mirroring the Android JNI `callAction`
-    /// single-symbol contract.
-    var performCallAction: (String, String) -> Void = { callId, action in
-        SilaNativeFFI.bridgeCallAction(callId: callId, action: action)
-    }
+    /// The active CallKit→native-core call-action bridge (BGS-10, Step 18 Task B).
+    /// The default is a no-op — the plugin ships no native library, so a consumer
+    /// that doesn't bridge to a native core simply drops lock-screen call actions.
+    /// A host app that bridges Answer/Reject/End to its own native core injects a
+    /// closure here; XCTest swaps in a recorder to assert the perform→action
+    /// mapping without a live core. The perform-handlers invoke this with
+    /// `("answer" | "reject" | "end")` + the ORIGINAL 32-hex `call_id`, mirroring
+    /// the Android JNI `callAction` single-symbol contract.
+    var performCallAction: (String, String) -> Void = { _, _ in }
 
     override init() {
         self.callController = CXCallController()
-        self.provider = CXProvider(configuration: SilaCallKitController.providerConfiguration())
+        self.provider = CXProvider(configuration: BackgroundCallKitController.providerConfiguration())
         super.init()
         provider.setDelegate(self, queue: nil)
     }
@@ -347,10 +284,10 @@ final class SilaCallKitController: NSObject, CXProviderDelegate {
     /// mapped to the CallKit UUID via `callKitUUID(for:)` so `endCall` can dismiss the same
     /// call; falls back to a random UUID only for a malformed id.
     func reportIncomingCall(callId: String, callerName: String, hasVideo: Bool) {
-        let derived = SilaCallKitController.callKitUUID(for: callId)
+        let derived = BackgroundCallKitController.callKitUUID(for: callId)
         if derived == nil {
             os_log("reportIncomingCall: malformed call_id, using random UUID fallback",
-                   log: SilaCallKitController.logger, type: .error)
+                   log: BackgroundCallKitController.logger, type: .error)
         }
         let uuid = derived ?? UUID()
         let update = CXCallUpdate()
@@ -368,7 +305,7 @@ final class SilaCallKitController: NSObject, CXProviderDelegate {
         provider.reportNewIncomingCall(with: uuid, update: update) { error in
             if let error = error {
                 os_log("reportNewIncomingCall failed: %{public}@",
-                       log: SilaCallKitController.logger, type: .error, "\(error)")
+                       log: BackgroundCallKitController.logger, type: .error, "\(error)")
             }
         }
     }
@@ -379,7 +316,7 @@ final class SilaCallKitController: NSObject, CXProviderDelegate {
     /// end is reported against the call CallKit actually has (otherwise the native ring
     /// screen would persist until `providerDidReset` and `activeCalls` would leak).
     func endCall(callId: String, reason: CXCallEndedReason) {
-        let uuid = SilaCallKitController.callKitUUID(for: callId) ?? UUID()
+        let uuid = BackgroundCallKitController.callKitUUID(for: callId) ?? UUID()
         provider.reportCall(with: uuid, endedAt: Date(), reason: reason)
         forgetCall(uuid)
     }
@@ -416,7 +353,7 @@ final class SilaCallKitController: NSObject, CXProviderDelegate {
         activeAudioCallUUID = action.callUUID
         action.fulfill()
         // BGS-10 (Step 18 Task B): route Answer DIRECTLY to the Rust control plane
-        // via `sila_call_action` (FFI), not the suspended webview. CROSS-DOC: doc
+        // via the native call-action bridge (FFI), not the suspended webview. CROSS-DOC: doc
         // 04 owns call-control semantics (answer_call/reject_call/end_call).
         performCallAction(callId, "answer")
     }
@@ -435,7 +372,7 @@ final class SilaCallKitController: NSObject, CXProviderDelegate {
         action.fulfill()
         // BGS-10 (Step 18 Task B): Decline of a still-ringing call → "reject"; an
         // End of a live (answered) call → "end". Routed DIRECTLY to Rust via
-        // `sila_call_action` (FFI), not the suspended webview.
+        // the native call-action bridge (FFI), not the suspended webview.
         performCallAction(callId, wasAnswered ? "end" : "reject")
     }
 
@@ -443,7 +380,7 @@ final class SilaCallKitController: NSObject, CXProviderDelegate {
     /// answered call, deriving `hasVideo` from `activeCalls` (L6) so an interleaved
     /// second report can no longer clobber the routing of the call being activated.
     func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
-        SilaCallKitController.configure(
+        BackgroundCallKitController.configure(
             audioSession: audioSession,
             configuration: audioConfigurationForActiveCall()
         )
@@ -454,7 +391,7 @@ final class SilaCallKitController: NSObject, CXProviderDelegate {
     /// active call (defensive — `maximumCallsPerCallGroup == 1`), else audio.
     /// Separated from `didActivate` so the per-call video derivation (L6) is
     /// unit-testable without a live `AVAudioSession`.
-    func audioConfigurationForActiveCall() -> SilaAudioSessionConfiguration {
+    func audioConfigurationForActiveCall() -> CallAudioSessionConfiguration {
         let hasVideo = activeAudioCallUUID.flatMap { activeCalls[$0] }
             ?? activeCalls.values.first
             ?? false
@@ -468,8 +405,8 @@ final class SilaCallKitController: NSObject, CXProviderDelegate {
 
     // MARK: - Audio-session configuration (separated for isolation)
 
-    /// Apply a `SilaAudioSessionConfiguration` to a real `AVAudioSession`.
-    static func configure(audioSession: AVAudioSession, configuration: SilaAudioSessionConfiguration) {
+    /// Apply a `CallAudioSessionConfiguration` to a real `AVAudioSession`.
+    static func configure(audioSession: AVAudioSession, configuration: CallAudioSessionConfiguration) {
         let category = AVAudioSession.Category(rawValue: configuration.category)
         let mode = AVAudioSession.Mode(rawValue: configuration.mode)
         var options: AVAudioSession.CategoryOptions = [.allowBluetoothHFP]
@@ -480,26 +417,26 @@ final class SilaCallKitController: NSObject, CXProviderDelegate {
             try audioSession.setActive(true, options: [])
         } catch {
             os_log("audio session config failed: %{public}@",
-                   log: SilaCallKitController.logger, type: .error, "\(error)")
+                   log: BackgroundCallKitController.logger, type: .error, "\(error)")
         }
     }
 
     /// Apply a device audio route (M-NATIVE-3 / CCF-11, Step 11) to the live call via
     /// `AVAudioSession.overrideOutputAudioPort`. `.bluetooth`/`.system` are
     /// platform-managed (no override); the system route picker owns BT selection.
-    func setAudioRoute(_ route: SilaAudioRoute) {
+    func setAudioRoute(_ route: CallAudioRoute) {
         guard let override = route.portOverride else {
             os_log("audio route %{public}@ is platform-managed (no override)",
-                   log: SilaCallKitController.logger, type: .info, route.rawValue)
+                   log: BackgroundCallKitController.logger, type: .info, route.rawValue)
             return
         }
         do {
             try AVAudioSession.sharedInstance().overrideOutputAudioPort(override)
             os_log("set audio route %{public}@",
-                   log: SilaCallKitController.logger, type: .info, route.rawValue)
+                   log: BackgroundCallKitController.logger, type: .info, route.rawValue)
         } catch {
             os_log("overrideOutputAudioPort failed: %{public}@",
-                   log: SilaCallKitController.logger, type: .error, "\(error)")
+                   log: BackgroundCallKitController.logger, type: .error, "\(error)")
         }
     }
 }
