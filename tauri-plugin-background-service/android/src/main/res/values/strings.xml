@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Platform-owned notification strings (NTF-12, doc-06).
+
+  These are the notification strings that Android renders directly from its own
+  resource set (the RemoteInput label and the message action buttons), so they
+  follow the device system locale rather than a Rust-passed value. Notification
+  *content* (title/body) is resolved by Rust from the in-app locale and passed
+  through `native_message`; only these platform-owned labels live here.
+
+  Merge boundary (doc-08 BGS-19): doc-06 owns these message-notification
+  strings; doc-08's lifecycle strings (foreground/stop/recovery) stay hardcoded
+  in their own call sites and are NOT moved here.
+-->
+<resources>
+    <string name="sila_notif_reply">Reply</string>
+    <string name="sila_notif_mark_read">Mark as read</string>
+    <string name="sila_notif_reply_input_label">Reply</string>
+    <string name="sila_notif_call_answer">Answer</string>
+    <string name="sila_notif_call_answer_video">Answer (video)</string>
+    <string name="sila_notif_call_decline">Decline</string>
+    <string name="sila_notif_call_incoming_voice">Incoming voice call</string>
+    <string name="sila_notif_call_incoming_video">Incoming video call</string>
+    <!-- NTF-04 (Step 7b): re-presented-notification surface for a recoverable
+         reply failure (the user\'s typed replyText is carried in the body). -->
+    <string name="sila_notif_reply_pending_title">Reply pending</string>
+    <string name="sila_notif_reply_pending_body">Tap to retry.</string>
+</resources>

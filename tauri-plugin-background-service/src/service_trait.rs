@@ -31,6 +31,27 @@ pub trait BackgroundService<R: Runtime>: Send + 'static {
     /// Use `tokio::select!` with `ctx.shutdown.cancelled()` for
     /// cooperative cancellation.
     async fn run(&mut self, ctx: &ServiceContext<R>) -> Result<(), ServiceError>;
+
+    /// Gracefully shut down service-owned state before the host process exits
+    /// (BGS-31, doc-08 Step 9).
+    ///
+    /// Called from the `ManagerCommand::ShutdownGracefully` arm of
+    /// [`manager_loop`](crate::manager::manager_loop) on a SIGTERM/SIGINT, AFTER
+    /// the bookkeeping `Stop`. The default is a no-op `Ok(())` so sibling/other
+    /// services are unaffected (additive, non-breaking). A service that owns
+    /// process-wide state unreachable from `Drop` — e.g. the Sila `Core`, which
+    /// lives in `AppState` behind a separate crate boundary the plugin cannot
+    /// name — overrides this to perform a BOUNDED drain (abort background tasks
+    /// + an awaited network shutdown) instead of the abrupt `Drop` abort.
+    ///
+    /// The hook receives a fresh [`ServiceContext`] built from the last
+    /// `AppHandle` provided to `Start`; the running service task itself is owned
+    /// by a spawned task and is not reachable here, so the override reaches
+    /// shared state through `ctx.app` (e.g. `ctx.app.state::<AppState>()`),
+    /// NOT through `&mut self` fields populated by `init`/`run`.
+    async fn shutdown_gracefully(&mut self, _ctx: &ServiceContext<R>) -> Result<(), ServiceError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -114,16 +114,27 @@ impl SetupValidator {
     }
 
     fn ios_checks() -> SetupValidationReport {
+        Self::ios_checks_for_plist(read_runtime_ios_plist().as_deref())
+    }
+
+    /// Host-testable core of [`Self::ios_checks`].
+    ///
+    /// When `plist` is `None` (no runtime bundle plist available — e.g. the
+    /// macOS host gate) only advisory warnings are returned. When a plist is
+    /// supplied, the **required** keys are probed and any missing background
+    /// modes / scheduler identifiers / bundle-id mismatch becomes a hard
+    /// `Severity::Error` so misconfiguration cannot be reported as `ok: true`.
+    fn ios_checks_for_plist(plist: Option<&str>) -> SetupValidationReport {
         let warnings = vec![
             SetupIssue {
                 code: "ios_ui_background_modes".into(),
-                message: "UIBackgroundModes must include 'background-fetch' and \
-                          'background-processing' in Info.plist"
+                message: "UIBackgroundModes must include 'fetch' and \
+                          'processing' in Info.plist"
                     .into(),
                 platform: Platform::Ios,
                 fix: Some(
-                    "Add UIBackgroundModes array with 'background-fetch' and \
-                     'background-processing' to Info.plist"
+                    "Add UIBackgroundModes array with 'fetch' and \
+                     'processing' to Info.plist"
                         .into(),
                 ),
             },
@@ -153,14 +164,83 @@ impl SetupValidator {
             },
         ];
 
-        let issues: Vec<_> = warnings
+        let mut errors: Vec<SetupIssue> = vec![];
+
+        if let Some(plist) = plist {
+            // Scope the mode checks to the UIBackgroundModes array so a value
+            // appearing elsewhere in the plist (e.g. the always-present
+            // `social.sila.bg-processing` scheduler identifier, which contains
+            // the substring "processing") cannot mask a background mode that is
+            // actually absent.
+            let bg_modes_array = plist_array_after_key(plist, "UIBackgroundModes");
+            let has_fetch = bg_modes_array.is_some_and(|a| a.contains("fetch"));
+            let has_processing = bg_modes_array.is_some_and(|a| a.contains("processing"));
+            let has_bg_task = plist.contains("BGTaskSchedulerPermittedIdentifiers");
+
+            if !(has_fetch && has_processing) {
+                errors.push(SetupIssue {
+                    code: "ios_ui_background_modes_missing".into(),
+                    message: "Built Info.plist is missing UIBackgroundModes 'fetch' and/or \
+                              'processing' — BGTaskScheduler will not run"
+                        .into(),
+                    platform: Platform::Ios,
+                    fix: Some(
+                        "Add 'fetch' and 'processing' to the UIBackgroundModes array in \
+                         Info.ios.plist and rebuild"
+                            .into(),
+                    ),
+                });
+            }
+
+            if !has_bg_task {
+                errors.push(SetupIssue {
+                    code: "ios_bg_task_identifiers_missing".into(),
+                    message: "Built Info.plist is missing BGTaskSchedulerPermittedIdentifiers \
+                              — background tasks cannot be scheduled"
+                        .into(),
+                    platform: Platform::Ios,
+                    fix: Some(
+                        "Add BGTaskSchedulerPermittedIdentifiers with your bg-refresh and \
+                         bg-processing identifiers to Info.ios.plist and rebuild"
+                            .into(),
+                    ),
+                });
+            } else if let Some(bundle_id) = extract_bundle_identifier(plist) {
+                // The permitted identifiers are namespaced under the bundle id
+                // (e.g. `<bundle-id>.bg-refresh`); if none carry that prefix the
+                // identifiers belong to a different app and registration fails.
+                // (`bundle_id` alone always appears in CFBundleIdentifier, so the
+                // trailing dot is what distinguishes a namespaced identifier.)
+                if !plist.contains(&format!("{bundle_id}.")) {
+                    errors.push(SetupIssue {
+                        code: "ios_bundle_id_mismatch".into(),
+                        message: "BGTaskSchedulerPermittedIdentifiers do not match the bundle \
+                                  identifier — task registration will fail"
+                            .into(),
+                        platform: Platform::Ios,
+                        fix: Some(
+                            "Namespace the scheduler identifiers under the app bundle id \
+                             (e.g. '<bundle-id>.bg-refresh')"
+                                .into(),
+                        ),
+                    });
+                }
+            }
+        }
+
+        let issues: Vec<_> = errors
             .iter()
-            .map(|w| w.to_validation_issue(Severity::Warning))
+            .map(|e| e.to_validation_issue(Severity::Error))
+            .chain(
+                warnings
+                    .iter()
+                    .map(|w| w.to_validation_issue(Severity::Warning)),
+            )
             .collect();
 
         SetupValidationReport {
-            ok: true,
-            errors: vec![],
+            ok: errors.is_empty(),
+            errors,
             warnings,
             issues,
         }
@@ -173,6 +253,10 @@ impl SetupValidator {
 
         #[cfg(feature = "desktop-service")]
         {
+            // Host probes for systemd (binaries, linger state, `libc::getuid`)
+            // only compile and only make sense on a Linux host; `platform` is
+            // only ever `Linux` there.
+            #[cfg(target_os = "linux")]
             if matches!(platform, Platform::Linux) {
                 let systemctl = std::path::Path::new("/usr/bin/systemctl").exists()
                     || std::path::Path::new("/bin/systemctl").exists()
@@ -254,8 +338,64 @@ impl SetupValidator {
     }
 }
 
-/// Check if a command exists in PATH.
-#[cfg(feature = "desktop-service")]
+/// Read the built app's `Info.plist` at runtime.
+///
+/// An iOS `.app` bundle is flat: the executable and `Info.plist` live side by
+/// side. Resolving relative to the current executable reflects the **actually
+/// shipped** plist rather than a compile-time snapshot. Off iOS there is no
+/// bundle plist to probe, so the setup report falls back to warnings only.
+#[cfg(target_os = "ios")]
+fn read_runtime_ios_plist() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let plist_path = exe.parent()?.join("Info.plist");
+    std::fs::read_to_string(plist_path).ok()
+}
+
+#[cfg(not(target_os = "ios"))]
+fn read_runtime_ios_plist() -> Option<String> {
+    None
+}
+
+/// Return the contents of the `<array>…</array>` that immediately follows the
+/// given `<key>` in a plist, if present.
+///
+/// Used to scope substring checks to one specific array (e.g.
+/// `UIBackgroundModes`) so values appearing elsewhere in the plist cannot be
+/// mistaken for array members. The search is bounded to before the next `<key>`
+/// so a key whose value is not an array does not accidentally match a later
+/// array.
+fn plist_array_after_key<'a>(plist_xml: &'a str, key: &str) -> Option<&'a str> {
+    let key_tag = format!("<key>{key}</key>");
+    let key_pos = plist_xml.find(&key_tag)?;
+    let after = &plist_xml[key_pos + key_tag.len()..];
+    let value_region = match after.find("<key>") {
+        Some(next_key) => &after[..next_key],
+        None => after,
+    };
+    let arr_start = value_region.find("<array>")? + "<array>".len();
+    let arr_end = value_region[arr_start..].find("</array>")?;
+    Some(&value_region[arr_start..arr_start + arr_end])
+}
+
+/// Extract the `CFBundleIdentifier` value from a plist XML string.
+///
+/// Returns `None` when the value is absent, empty, or still an unexpanded build
+/// variable (e.g. `$(PRODUCT_BUNDLE_IDENTIFIER)` in the pre-build template).
+fn extract_bundle_identifier(plist_xml: &str) -> Option<String> {
+    let key_pos = plist_xml.find("CFBundleIdentifier")?;
+    let after = &plist_xml[key_pos..];
+    let start = after.find("<string>")? + "<string>".len();
+    let end = after[start..].find("</string>")?;
+    let value = after[start..start + end].trim();
+    if value.is_empty() || value.starts_with("$(") {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+/// Check if a command exists in PATH (via the Unix `which` utility).
+#[cfg(all(feature = "desktop-service", target_os = "linux"))]
 fn which_exists(cmd: &str) -> bool {
     std::process::Command::new("which")
         .arg(cmd)
@@ -382,15 +522,150 @@ mod tests {
         }
     }
 
+    const VALID_IOS_PLIST: &str = r#"<plist><dict>
+    <key>CFBundleIdentifier</key>
+    <string>social.sila</string>
+    <key>UIBackgroundModes</key>
+    <array><string>fetch</string><string>processing</string></array>
+    <key>BGTaskSchedulerPermittedIdentifiers</key>
+    <array><string>social.sila.bg-refresh</string><string>social.sila.bg-processing</string></array>
+</dict></plist>"#;
+
     #[test]
     fn ios_returns_no_errors() {
+        // On the macOS host gate there is no runtime bundle plist to probe, so
+        // `ios_checks` cannot prove misconfiguration and returns warnings only.
+        // The hard-error path is exercised by `ios_checks_for_plist` below.
         let report = SetupValidator::validate(Platform::Ios);
         assert!(
             report.errors.is_empty(),
-            "iOS should have no hard errors (checks happen at build/Swift level)"
+            "iOS validate() has no hard errors when no runtime plist is available"
         );
         assert!(!report.warnings.is_empty(), "iOS should have warnings");
         assert!(report.ok, "ok should be true when errors is empty");
+    }
+
+    #[test]
+    fn ios_checks_no_plist_warnings_only() {
+        let report = SetupValidator::ios_checks_for_plist(None);
+        assert!(report.ok);
+        assert!(report.errors.is_empty());
+        assert!(!report.warnings.is_empty());
+    }
+
+    #[test]
+    fn ios_checks_valid_plist_has_no_errors() {
+        let report = SetupValidator::ios_checks_for_plist(Some(VALID_IOS_PLIST));
+        assert!(report.ok, "valid plist should produce no hard errors");
+        assert!(report.errors.is_empty());
+        assert!(
+            !report.warnings.is_empty(),
+            "warnings still advise the user"
+        );
+    }
+
+    #[test]
+    fn ios_checks_missing_background_modes_emits_error() {
+        let bad = r#"<plist><dict>
+    <key>CFBundleIdentifier</key><string>social.sila</string>
+    <key>BGTaskSchedulerPermittedIdentifiers</key>
+    <array><string>social.sila.bg-refresh</string></array>
+</dict></plist>"#;
+        let report = SetupValidator::ios_checks_for_plist(Some(bad));
+        assert!(!report.ok);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.code.contains("background_modes")),
+            "missing UIBackgroundModes must be a hard error: {:?}",
+            report.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ios_checks_missing_processing_mode_masked_by_identifier_emits_error() {
+        // Regression: `processing` is absent from UIBackgroundModes, but the
+        // always-present `social.sila.bg-processing` scheduler identifier
+        // contains the substring "processing". A whole-plist substring search
+        // would falsely treat the mode as present and report ok:true. The mode
+        // check must be scoped to the UIBackgroundModes array.
+        let bad = r#"<plist><dict>
+    <key>CFBundleIdentifier</key><string>social.sila</string>
+    <key>UIBackgroundModes</key>
+    <array><string>fetch</string></array>
+    <key>BGTaskSchedulerPermittedIdentifiers</key>
+    <array><string>social.sila.bg-refresh</string><string>social.sila.bg-processing</string></array>
+</dict></plist>"#;
+        let report = SetupValidator::ios_checks_for_plist(Some(bad));
+        assert!(
+            !report.ok,
+            "missing 'processing' UIBackgroundMode must be a hard error even when \
+             a bg-processing scheduler identifier is present"
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.code.contains("background_modes")),
+            "missing UIBackgroundModes mode must be a hard error: {:?}",
+            report.errors.iter().map(|e| &e.code).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn ios_checks_missing_bg_identifiers_emits_error() {
+        let bad = r#"<plist><dict>
+    <key>CFBundleIdentifier</key><string>social.sila</string>
+    <key>UIBackgroundModes</key>
+    <array><string>fetch</string><string>processing</string></array>
+</dict></plist>"#;
+        let report = SetupValidator::ios_checks_for_plist(Some(bad));
+        assert!(!report.ok);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.code.contains("bg_task_identifiers")),
+            "missing BGTaskSchedulerPermittedIdentifiers must be a hard error"
+        );
+    }
+
+    #[test]
+    fn ios_checks_bundle_id_mismatch_emits_error() {
+        let mismatch = r#"<plist><dict>
+    <key>CFBundleIdentifier</key><string>com.other.app</string>
+    <key>UIBackgroundModes</key>
+    <array><string>fetch</string><string>processing</string></array>
+    <key>BGTaskSchedulerPermittedIdentifiers</key>
+    <array><string>social.sila.bg-refresh</string></array>
+</dict></plist>"#;
+        let report = SetupValidator::ios_checks_for_plist(Some(mismatch));
+        assert!(!report.ok);
+        assert!(
+            report.errors.iter().any(|e| e.code.contains("bundle_id")),
+            "bundle-id mismatch must be a hard error"
+        );
+    }
+
+    #[test]
+    fn ios_checks_errors_have_error_severity_in_issues() {
+        let bad = r#"<plist><dict>
+    <key>CFBundleIdentifier</key><string>social.sila</string>
+    <key>UIBackgroundModes</key><array><string>fetch</string></array>
+</dict></plist>"#;
+        let report = SetupValidator::ios_checks_for_plist(Some(bad));
+        let error_issues = report
+            .issues
+            .iter()
+            .filter(|vi| vi.severity == Severity::Error)
+            .count();
+        assert_eq!(
+            error_issues,
+            report.errors.len(),
+            "every hard error must appear in issues with Error severity"
+        );
+        assert!(error_issues > 0);
     }
 
     #[test]
@@ -625,13 +900,13 @@ mod tests {
         assert!(!report.ok);
     }
 
-    #[cfg(feature = "desktop-service")]
+    #[cfg(all(feature = "desktop-service", target_os = "linux"))]
     #[test]
     fn which_exists_true_for_ls() {
         assert!(which_exists("ls"), "ls should exist in PATH");
     }
 
-    #[cfg(feature = "desktop-service")]
+    #[cfg(all(feature = "desktop-service", target_os = "linux"))]
     #[test]
     fn which_exists_false_for_nonsense() {
         assert!(

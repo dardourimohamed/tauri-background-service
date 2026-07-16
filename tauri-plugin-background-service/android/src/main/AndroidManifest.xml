@@ -4,7 +4,17 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- spec 08 C6 (Step 15): typed call FGS + native ringing. The typed
+         permissions and foregroundServiceType values land on API 34+; on older
+         platforms they are ignored (the call still works, just untyped). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
@@ -21,14 +31,45 @@
             </intent-filter>
         </receiver>
 
+        <!-- spec 08 / M-NATIVE-1 (Step 9): native ring Answer/Decline → Rust
+             control plane. The notification action PendingIntents are
+             getBroadcast intents targeting this receiver; it runs while the
+             device is locked / the webview is closed and drives
+             answer_call/reject_call in the in-process headless Core. Not
+             exported — only the app's own notification PendingIntents fire it. -->
+        <receiver
+            android:name=".CallActionReceiver"
+            android:enabled="true"
+            android:exported="false" />
+
+        <!-- Message notification actions: inline Reply and Mark as read route
+             through a broadcast receiver so they can reach the headless Rust
+             Core without opening the webview. -->
+        <receiver
+            android:name=".MessageNotificationActionReceiver"
+            android:enabled="true"
+            android:exported="false" />
+
         <service
             android:name=".LifecycleService"
-            android:foregroundServiceType="dataSync|specialUse"
+            android:foregroundServiceType="dataSync|remoteMessaging|specialUse|phoneCall|microphone"
             android:exported="false"
             android:stopWithTask="false">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Background service for continuous task execution" />
+        </service>
+
+        <!-- spec 08 C6 (Step 15): self-managed Telecom ConnectionService so the
+             OS call UI, audio focus, and Bluetooth routing follow the system
+             call path while the webview is closed. Requires MANAGE_OWN_CALLS. -->
+        <service
+            android:name=".SilaConnectionService"
+            android:exported="false"
+            android:permission="android.permission.BIND_TELECOM_CONNECTION_SERVICE">
+            <intent-filter>
+                <action android:name="android.telecom.ConnectionService" />
+            </intent-filter>
         </service>
     </application>
 

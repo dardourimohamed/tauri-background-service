@@ -1,10 +1,9 @@
 //! IPC protocol types and framing for desktop OS service mode.
 //!
-//! The desktop OS service uses length-prefixed JSON over Unix domain sockets
-//! for IPC between the GUI process and the headless service process.
-//!
-//! **Unix-only** — the IPC transport currently requires Unix domain sockets.
-//! Windows named pipe support is not yet implemented.
+//! The desktop OS service uses length-prefixed JSON for IPC between the GUI
+//! process and the headless service process, over Unix domain sockets on
+//! Linux/macOS and named pipes on Windows (see
+//! [`crate::desktop::transport`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +12,25 @@ use crate::models::StopReason;
 
 /// Maximum allowed frame size (16 MB).
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
+/// Plugin IPC protocol version (doc-09/PROTO-14).
+///
+/// Frozen at `1`. The GUI sends [`IpcRequest::Hello`] carrying this version on
+/// connect; the headless service echoes its own. A divergence (or an
+/// [`IpcResponse`] carrying `VERSION_MISMATCH_CODE`) means the GUI and the
+/// possibly-still-running older headless process speak different protocol
+/// versions, so the GUI surfaces a "version mismatch — restart" state instead
+/// of hanging on an opaque error.
+pub const PLUGIN_IPC_VERSION: u32 = 1;
+
+/// Stable wire code carried by [`IpcResponse::code`] when the headless service
+/// cannot decode a request frame (unknown variant / future skew), so a
+/// version-skewed GUI can branch deterministically instead of tearing the
+/// connection (doc-09/PROTO-14). Follows the daemon-plane STABLE-CODE PATTERN
+/// (PROTO-13 used `"unknown_command"` on the daemon plane; this plane uses
+/// `"version_mismatch"`) so both planes converge on codeable signals. The
+/// string itself is plane-specific.
+pub(crate) const VERSION_MISMATCH_CODE: &str = "version_mismatch";
 
 /// IPC request sent from the GUI process to the headless service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +61,19 @@ pub enum IpcRequest {
     ValidateSetup,
     /// Get the complete lifecycle status snapshot.
     GetLifecycleStatus,
+    /// Protocol version handshake (doc-09/PROTO-14).
+    ///
+    /// Sent by the GUI on connect. The service echoes its own
+    /// [`PLUGIN_IPC_VERSION`] in the response `data.version`. A mismatch — or
+    /// an [`IpcResponse`] whose [`IpcResponse::code`] is
+    /// `VERSION_MISMATCH_CODE` — signals that the GUI and headless process
+    /// are version-skewed. `version` is `#[serde(default)]` so frames with or
+    /// without the field interoperate (additive / backward-compatible).
+    Hello {
+        /// The sender's plugin IPC protocol version.
+        #[serde(default)]
+        version: u32,
+    },
 }
 
 /// IPC response sent from the headless service to the GUI process.
@@ -57,6 +88,34 @@ pub struct IpcResponse {
     /// Optional error message on failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Optional well-known typed code (doc-09/PROTO-14).
+    ///
+    /// Carries a stable, codeable signal (e.g. `VERSION_MISMATCH_CODE` =
+    /// `"version_mismatch"`) so a version-skewed GUI can branch deterministically
+    /// instead of parsing an opaque error string. `None` on every existing
+    /// response path ⇒ existing responses serialize byte-identically. The field
+    /// is additive and backward-compatible on the wire: `#[serde(default)]` ⇒
+    /// legacy frames decode to `None`; `skip_serializing_if = "Option::is_none"`
+    /// ⇒ `None` is omitted from the JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+/// Build the response for a request the service could not decode — a stable
+/// "version mismatch" signal (doc-09/PROTO-14).
+///
+/// Used at the server's decode-error chokepoint (an unknown / future-skew
+/// [`IpcRequest`] variant) INSTEAD OF leaking the raw serde error string to the
+/// GUI. The GUI branches on `VERSION_MISMATCH_CODE` to surface a "restart"
+/// state. The opaque serde detail is logged server-side, not exposed to the
+/// client. Mirrors the daemon-plane `err_response_code` helper (PROTO-13).
+pub(crate) fn version_mismatch_response() -> IpcResponse {
+    IpcResponse {
+        ok: false,
+        data: None,
+        error: Some("version mismatch".into()),
+        code: Some(VERSION_MISMATCH_CODE.to_string()),
+    }
 }
 
 /// IPC event streamed from the headless service to the GUI process.
@@ -132,7 +191,11 @@ pub fn socket_path(label: &str) -> Result<std::path::PathBuf, ServiceError> {
     {
         Ok(std::path::PathBuf::from(format!("/tmp/{label}.sock")))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        Ok(std::path::PathBuf::from(format!(r"\\.\pipe\{label}")))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         Ok(std::path::PathBuf::from(format!("/tmp/{label}.sock")))
     }
@@ -251,6 +314,7 @@ mod tests {
             ok: true,
             data: Some(serde_json::json!({"running": true})),
             error: None,
+            code: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let de: IpcResponse = serde_json::from_str(&json).unwrap();
@@ -265,6 +329,7 @@ mod tests {
             ok: false,
             data: None,
             error: Some("Service is already running".into()),
+            code: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let de: IpcResponse = serde_json::from_str(&json).unwrap();
@@ -279,6 +344,7 @@ mod tests {
             ok: true,
             data: None,
             error: None,
+            code: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("\"data\""), "Should skip null data: {json}");
@@ -294,6 +360,7 @@ mod tests {
             ok: true,
             data: None,
             error: None,
+            code: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"ok\""), "ok key: {json}");
@@ -389,6 +456,7 @@ mod tests {
             ok: true,
             data: Some(serde_json::json!(42)),
             error: None,
+            code: None,
         };
         let msg = IpcMessage::Response(resp);
         let encoded = encode_frame(&msg).unwrap();
@@ -434,6 +502,7 @@ mod tests {
             ok: true,
             data: Some(serde_json::json!({"status": "ok"})),
             error: None,
+            code: None,
         };
         let msg = IpcMessage::Response(resp);
         let payload = serde_json::to_vec(&msg).unwrap();
@@ -462,6 +531,7 @@ mod tests {
             ok: true,
             data: Some(serde_json::json!({"running": true})),
             error: None,
+            code: None,
         });
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"kind\":\"response\""), "kind tag: {json}");
@@ -522,6 +592,7 @@ mod tests {
 
     // --- socket_path tests ---
 
+    #[cfg(unix)]
     #[test]
     fn socket_path_unix_format() {
         let path = socket_path("com.example.svc").unwrap();
@@ -551,17 +622,28 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn socket_path_windows_pipe_format() {
+        let path = socket_path("com.example.svc").unwrap();
+        assert_eq!(
+            path.to_str().unwrap(),
+            r"\\.\pipe\com.example.svc",
+            "Windows must derive a named-pipe path, not a Unix socket path"
+        );
+    }
+
     #[test]
     fn socket_path_nonempty_label() {
         let path = socket_path("my-app").unwrap();
         #[cfg(unix)]
-        {
-            assert!(
-                path.to_str().unwrap().ends_with("my-app.sock"),
-                "Expected path ending with my-app.sock, got: {:?}",
-                path
-            );
-        }
+        assert!(
+            path.to_str().unwrap().ends_with("my-app.sock"),
+            "Expected path ending with my-app.sock, got: {:?}",
+            path
+        );
+        #[cfg(windows)]
+        assert_eq!(path.to_str().unwrap(), r"\\.\pipe\my-app");
     }
 
     #[test]
@@ -594,5 +676,111 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("empty"), "Error: {err}");
+    }
+
+    // --- [doc-09/PROTO-14]: Hello/version handshake + defined mismatch code ---
+
+    #[test]
+    fn ipc_request_hello_serde_roundtrip() {
+        let req = IpcRequest::Hello {
+            version: PLUGIN_IPC_VERSION,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let de: IpcRequest = serde_json::from_str(&json).unwrap();
+        match de {
+            IpcRequest::Hello { version } => assert_eq!(version, PLUGIN_IPC_VERSION),
+            other => panic!("Expected Hello, got {other:?}"),
+        }
+        // A Hello frame WITHOUT version decodes via #[serde(default)]
+        // (additive / backward-compatible: a peer omitting the field still works).
+        let de2: IpcRequest = serde_json::from_str(r#"{"type":"hello"}"#).unwrap();
+        match de2 {
+            IpcRequest::Hello { version } => assert_eq!(version, 0, "default u32 is 0"),
+            other => panic!("Expected Hello (defaulted), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipc_request_hello_json_tag() {
+        let req = IpcRequest::Hello {
+            version: PLUGIN_IPC_VERSION,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"type\":\"hello\""), "Tagged JSON: {json}");
+        assert!(
+            json.contains("\"version\":1"),
+            "version field present: {json}"
+        );
+    }
+
+    #[test]
+    fn ipc_response_code_field_is_additive_on_wire() {
+        // None is omitted ⇒ existing responses serialize byte-identically.
+        let resp = IpcResponse {
+            ok: false,
+            data: None,
+            error: Some("boom".into()),
+            code: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(
+            !json.contains("\"code\""),
+            "None code must be omitted: {json}"
+        );
+
+        // Some("version_mismatch") round-trips.
+        let resp2 = IpcResponse {
+            ok: false,
+            data: None,
+            error: Some("version mismatch".into()),
+            code: Some(VERSION_MISMATCH_CODE.into()),
+        };
+        let json2 = serde_json::to_string(&resp2).unwrap();
+        assert!(json2.contains("\"code\":\"version_mismatch\""), "{json2}");
+        let de: IpcResponse = serde_json::from_str(&json2).unwrap();
+        assert_eq!(de.code.as_deref(), Some(VERSION_MISMATCH_CODE));
+
+        // A legacy frame (no code field) decodes to code: None.
+        let legacy = r#"{"ok":false,"error":"legacy"}"#;
+        let de2: IpcResponse = serde_json::from_str(legacy).unwrap();
+        assert!(de2.code.is_none(), "legacy frame must decode to code: None");
+        assert_eq!(de2.error.as_deref(), Some("legacy"));
+    }
+
+    /// LOAD-BEARING (doc-09/PROTO-14): a future-skew request variant the
+    /// service cannot decode yields a STABLE `version_mismatch` code — not an
+    /// opaque serde error string. This is the codeable signal a version-skewed
+    /// GUI branches on to surface "restart" instead of hanging.
+    #[test]
+    fn ipc_request_unknown_variant_yields_stable_mismatch_code() {
+        // Simulated future skew: a variant tag this version does not know.
+        // Decoding as IpcRequest MUST fail (the service cannot interpret it).
+        let skew = br#"{"type":"someFutureVariant"}"#;
+        let decode_err = serde_json::from_slice::<IpcRequest>(skew);
+        assert!(
+            decode_err.is_err(),
+            "unknown variant must fail serde decode (skew), got {:?}",
+            decode_err
+        );
+
+        // The server maps this decode failure to the STABLE mismatch response.
+        let resp = version_mismatch_response();
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.code.as_deref(),
+            Some(VERSION_MISMATCH_CODE),
+            "decode failure must carry the stable mismatch code"
+        );
+        // The opaque serde detail is NOT leaked to the client.
+        assert!(
+            resp.error.is_some(),
+            "error must be Some for decode failures"
+        );
+        let opaque = decode_err.unwrap_err().to_string();
+        assert!(
+            !resp.error.as_deref().unwrap_or_default().contains(&opaque),
+            "response must not leak the opaque serde string: {:?}",
+            resp.error
+        );
     }
 }

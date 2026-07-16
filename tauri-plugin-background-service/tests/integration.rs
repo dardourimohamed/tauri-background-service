@@ -96,7 +96,22 @@ fn setup_manager() -> ServiceManagerHandle<tauri::test::MockRuntime> {
     let handle = ServiceManagerHandle::new(cmd_tx);
     let factory: ServiceFactory<tauri::test::MockRuntime> = Box::new(|| Box::new(BlockingService));
     tokio::spawn(manager_loop(
-        cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false, None,
+        cmd_rx,
+        factory,
+        28.0,
+        0.0,
+        15.0,
+        15.0,
+        false,
+        false,
+        4.0,
+        None,
+        vec!["remoteMessaging".into()],
+        true,
+        tauri_plugin_background_service::NotifierPolicy::default(),
+        None,
+        None,
+        false,
     ));
     handle
 }
@@ -107,7 +122,22 @@ fn setup_manager_with_factory(
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
     let handle = ServiceManagerHandle::new(cmd_tx);
     tokio::spawn(manager_loop(
-        cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false, None,
+        cmd_rx,
+        factory,
+        28.0,
+        0.0,
+        15.0,
+        15.0,
+        false,
+        false,
+        4.0,
+        None,
+        vec!["remoteMessaging".into()],
+        true,
+        tauri_plugin_background_service::NotifierPolicy::default(),
+        None,
+        None,
+        false,
     ));
     handle
 }
@@ -371,4 +401,138 @@ fn trait_implementation_compiles() {
     }
     assert_impl::<tauri::Wry>();
     assert_impl::<tauri::test::MockRuntime>();
+}
+
+// ─── Permission count test ────────────────────────────────────────────
+
+#[test]
+fn default_toml_has_at_least_20_permissions() {
+    let content = include_str!("../permissions/default.toml");
+    let count = content
+        .lines()
+        .filter(|line| line.trim().starts_with("\"allow-"))
+        .count();
+    assert!(
+        count >= 20,
+        "default.toml must have >= 20 permissions, found {count}"
+    );
+}
+
+// ─── NTF-16 (Step 12c) full-screen-intent static wire gate ────────────
+// The Android-active arm of `can_use_full_screen_intent` /
+// `open_full_screen_intent_settings` is COMPILE-INVISIBLE on desktop: the
+// `#[cfg(target_os = "android")]` attribute is target-based, so a desktop
+// `cargo test` builds ONLY the `#[cfg(not(android))]` default branch and the
+// command_signature shims. A runtime test therefore cannot reach the Android
+// wire under desktop/jsdom, so the wire is pinned by STATIC source-grep.
+//
+// Each load-bearing string must appear EXACTLY ONCE — the unique call site —
+// proving the arm is present, not stubbed, and dispatches to the right Kotlin
+// command. A bare `#[cfg(target_os = "android")]` count is VACUOUS (it appears
+// 3x in lib.rs across unrelated arms) and is NOT used. This test lives in the
+// integration-tests crate (not src/lib.rs) so its own grep literals are NOT
+// counted by `include_str!("../src/lib.rs")` (no self-count).
+#[test]
+fn ntf16_full_screen_intent_wire_is_present_and_unique() {
+    let mobile_src = include_str!("../src/mobile.rs");
+    let lib_src = include_str!("../src/lib.rs");
+    let build_src = include_str!("../build.rs");
+
+    // (1)+(2) Rust→Kotlin wire targets in mobile.rs (exactly one call each).
+    assert_eq!(
+        mobile_src
+            .matches(r#"run_mobile_plugin("canUseFullScreenIntent""#)
+            .count(),
+        1,
+        "canUseFullScreenIntent must be wired exactly once in mobile.rs"
+    );
+    assert_eq!(
+        mobile_src
+            .matches(r#"run_mobile_plugin("openFullScreenIntentSettings""#)
+            .count(),
+        1,
+        "openFullScreenIntentSettings must be wired exactly once in mobile.rs"
+    );
+
+    // (3)+(4) lib.rs ANDROID-ARM → mobile.rs BRIDGE CALL SITES (leading-dot +
+    // empty-parens — distinct from the command_signature shim's `(app)` call;
+    // pins the arm is not stubbed/removed/calling-the-wrong-method).
+    assert_eq!(
+        lib_src.matches(".can_use_full_screen_intent()").count(),
+        1,
+        ".can_use_full_screen_intent() bridge call must appear exactly once in lib.rs"
+    );
+    assert_eq!(
+        lib_src
+            .matches(".open_full_screen_intent_settings()")
+            .count(),
+        1,
+        ".open_full_screen_intent_settings() bridge call must appear exactly once in lib.rs"
+    );
+
+    // (5) both command names registered in generate_handler! AND build.rs COMMANDS.
+    assert!(
+        lib_src.contains("can_use_full_screen_intent,")
+            && lib_src.contains("open_full_screen_intent_settings,"),
+        "both FSI commands must be registered in generate_handler!"
+    );
+    assert!(
+        build_src.contains("\"can_use_full_screen_intent\"")
+            && build_src.contains("\"open_full_screen_intent_settings\""),
+        "both FSI commands must be listed in build.rs COMMANDS"
+    );
+
+    // (6) Rust↔TS IPC SHAPE CONTRACT (mem tauri-ipc-bare-bool-vs-object-shape):
+    // `can_use_full_screen_intent` must serialize to a `{canUse: bool}` OBJECT —
+    // matching the TS `invoke<{canUse:boolean}>` wrapper + UI `result.canUse`
+    // consumer. A bare `Result<bool, String>` would arrive as a bare JSON boolean,
+    // making `result.canUse` undefined and the `=== false` re-grant gate NEVER fire
+    // (feature DEAD on Android, the only platform where it matters). The
+    // fully-mocked vitest returns `{canUse:...}` and so CANNOT reach this Rust
+    // serde shape — it is pinned here, at the layer the mock cannot exercise. Both
+    // cfg arms must wrap (android: real grant; non-android: default true), hence
+    // count == 2. A future revert to a bare bool in either arm drops the count.
+    //
+    // ROBUSTNESS — whitespace-tolerant, NON-VACUOUS contiguous strip-whitespace
+    // count (Step-13a carry-forward hardening; Option-1 MANDATED). We normalize
+    // `lib_src` by stripping ALL whitespace, then count the contiguous token
+    // `serde_json::json!({"canUse":`. This is (i) whitespace-tolerant — a
+    // rustfmt/hand-edit reflow of `({ "canUse":` to `({"canUse":` does NOT
+    // false-RED (the prior hardcoded single-space `{ "canUse":` match would have),
+    // and (ii) NON-VACUOUS on key-drift: the `serde_json::json!(` macro prefix
+    // contiguous with `"canUse"` EXCLUDES the doc-comment at lib.rs:1012
+    // (`/// ... OBJECT `{ "canUse": bool }``), which lacks the macro prefix. A
+    // separate `contains("serde_json::json!(") && contains("\"canUse\"")` check
+    // (Option-2) is FORBIDDEN — `"canUse"` appears 3x in lib.rs (doc-comment :1012
+    // + the 2 code arms :1033/:1038), so Option-2 FALSE-GREENs on a
+    // `canUse`→`can_use` key-drift in a code arm (the doc-comment still satisfies
+    // `contains("canUse")`). The contiguous strip-whitespace count correctly REDs
+    // on that key-drift (the doc-comment never matched the macro prefix ⇒
+    // normalized count drops 2→1).
+    //
+    // DEFERRAL — Option-C typed-struct (NON-BLOCKING carry-forward from 12c; mem
+    // tauri-ipc-bare-bool-vs-object-shape). A typed `FullScreenIntentStatus
+    // { can_use: bool }` with `#[serde(rename = "canUse")]` — the same
+    // typed-struct-return pattern `get_notification_permission_status` already
+    // uses (`Result<models::NotificationPermissionStatus, String>`) — would pin
+    // the VALUE TYPE at compile time. This assertion pins only the `"canUse"` KEY
+    // (count==2), so a hypothetical future `can_use.to_string()` coercion would
+    // keep count==2 GREEN yet break `=== false` at runtime (strict-equality
+    // `"false" === false` is false — type mismatch, not a bare-bool). That is
+    // forward-fragility ONLY — the current code is SAFE (both arms bind genuine
+    // bools: mobile.rs `as_bool()` + literal `true`), and re-opening CLOSED
+    // Step-12c to swap `serde_json::Value`→typed-struct is a non-defect refactor.
+    // Land as defense-in-depth at a future Step-13-lane hardening, or leave;
+    // correctness PASS.
+    let lib_norm = lib_src
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>();
+    assert_eq!(
+        lib_norm.matches(r#"serde_json::json!({"canUse":"#).count(),
+        2,
+        "can_use_full_screen_intent must wrap its bool as {{canUse: bool}} in BOTH cfg arms \
+         to match the TS object shape — a bare bool makes result.canUse undefined and kills \
+         the re-grant gate"
+    );
 }

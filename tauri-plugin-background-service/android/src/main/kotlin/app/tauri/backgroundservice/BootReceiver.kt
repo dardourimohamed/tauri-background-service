@@ -1,13 +1,11 @@
 package app.tauri.backgroundservice
 
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.os.Build
-import androidx.core.app.NotificationCompat
 
 class BootReceiver : BroadcastReceiver() {
 
@@ -32,17 +30,18 @@ class BootReceiver : BroadcastReceiver() {
         }
 
         fun postRecoveryNotification(context: Context, label: String) {
-            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-
-            val channel = NotificationChannel(
-                RECOVERY_CHANNEL_ID,
-                "Service Recovery",
+            // BGS-19 (doc-08 Step 16 T2): recovery channel name + description and
+            // the resume body are localized from the Rust-persisted locale store
+            // (default "en"). BootReceiver runs without the webview, so it reads
+            // the store directly (mirrors the Rust headless composer).
+            val locale = LocaleStore.load(context)
+            NotificationHelper.ensureChannel(
+                context, RECOVERY_CHANNEL_ID,
+                NotificationStrings.lookup("channel_recovery", locale),
                 NotificationManager.IMPORTANCE_HIGH,
-            ).apply {
-                description = "Notifications to resume background service after reboot"
-                setShowBadge(true)
-            }
-            nm.createNotificationChannel(channel)
+                description = NotificationStrings.lookup("channel_recovery_desc", locale),
+                showBadge = true,
+            )
 
             val pendingIntent = context.packageManager
                 .getLaunchIntentForPackage(context.packageName)
@@ -57,15 +56,16 @@ class BootReceiver : BroadcastReceiver() {
                     )
                 }
 
-            val notification = NotificationCompat.Builder(context, RECOVERY_CHANNEL_ID)
-                .setContentTitle(context.applicationInfo.loadLabel(context.packageManager))
-                .setContentText("Tap to resume: $label")
-                .setSmallIcon(android.R.drawable.stat_notify_sync)
-                .setOngoing(true)
-                .setPriority(NotificationCompat.PRIORITY_HIGH)
-                .apply { pendingIntent?.let { setContentIntent(it) } }
-                .build()
+            val notification = NotificationHelper.buildRecoveryNotification(
+                context = context,
+                channelId = RECOVERY_CHANNEL_ID,
+                title = context.applicationInfo.loadLabel(context.packageManager),
+                text = NotificationStrings.lookup("tap_to_resume", locale).replace("{label}", label),
+                smallIcon = NotificationIconResolver.resolve(context),
+                pendingIntent = pendingIntent,
+            )
 
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             nm.notify(RECOVERY_NOTIFICATION_ID, notification)
         }
     }
@@ -94,7 +94,12 @@ class BootReceiver : BroadcastReceiver() {
             return
         }
 
-        startRecoveryService(context, state.lastServiceLabel, state.lastServiceType)
+        startRecoveryService(
+            context,
+            state.lastServiceLabel,
+            state.lastServiceType,
+            "boot_completed",
+        )
     }
 
     private fun handleMyPackageReplaced(context: Context) {
@@ -102,19 +107,31 @@ class BootReceiver : BroadcastReceiver() {
         if (!state.desiredRunning) return
 
         // MY_PACKAGE_REPLACED is not subject to boot-time FGS type restrictions
-        startRecoveryService(context, state.lastServiceLabel, state.lastServiceType)
+        startRecoveryService(
+            context,
+            state.lastServiceLabel,
+            state.lastServiceType,
+            "package_replaced",
+        )
     }
 
-    private fun startRecoveryService(context: Context, label: String, serviceType: String) {
+    private fun startRecoveryService(
+        context: Context,
+        label: String,
+        serviceType: String,
+        reason: String,
+    ) {
         val intent = Intent(context, LifecycleService::class.java).apply {
             action = LifecycleService.ACTION_START
             putExtra(LifecycleService.EXTRA_LABEL, label)
             putExtra(LifecycleService.EXTRA_SERVICE_TYPE, serviceType)
+            putExtra(LifecycleService.EXTRA_START_REASON, reason)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            context.startForegroundService(intent)
-        } else {
-            context.startService(intent)
-        }
+        // BGS-30 (doc-08 Step 13): route the ACTION_START recovery start through the
+        // guarded helper so an OS start-restriction is logged instead of crashing the
+        // boot/package-replace path. foreground=true preserves the original branched
+        // startForegroundService/startService. The helper lives in BackgroundServicePlugin.kt
+        // (same module/package); CROSS-DOC: doc 06.
+        startServiceGuarded(context, intent, foreground = true)
     }
 }

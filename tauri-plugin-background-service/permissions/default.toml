@@ -12,6 +12,19 @@ permissions = [
     "allow-disable-auto-restart",
     "allow-get-desired-service-state",
     "allow-validate-setup",
+    "allow-get-lifecycle-status",
+    "allow-configure-recovery",
+    "allow-native-lifecycle-event",
+    "allow-get-scheduling-status",
+    "allow-get-pending-bg-task",
+    # BGS-21 (doc-08 Step 12): mobile notification-permission UI consumer.
+    "allow-get-notification-permission-status",
+    "allow-request-notification-permission",
+    # BGS-22 (doc-08 Step 14): Android battery-optimization (Doze) exemption
+    # request — Settings UI affordance.
+    "allow-request-battery-exemption",
+    "allow-can-use-full-screen-intent",
+    "allow-open-full-screen-intent-settings",
     "allow-install-service",
     "allow-uninstall-service",
     "allow-start-os-service",

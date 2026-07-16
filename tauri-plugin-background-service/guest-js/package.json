@@ -17,6 +17,7 @@
   },
   "scripts": {
     "build": "rollup -c",
+    "test": "vitest run",
     "prepublishOnly": "npm run build"
   },
   "files": [
@@ -47,9 +48,10 @@
     "@tauri-apps/api": "^2.0.0"
   },
   "devDependencies": {
-    "typescript": "^6.0.2",
-    "rollup": "^4.0.0",
     "@rollup/plugin-typescript": "^12.3.0",
-    "tslib": "^2.6.0"
+    "rollup": "^4.0.0",
+    "tslib": "^2.6.0",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.7"
   }
 }

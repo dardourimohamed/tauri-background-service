@@ -163,18 +163,19 @@ class LifecycleServiceInstrumentedTest {
         }
         Thread.sleep(1000)
 
-        // The OS restart path should set auto-start config
+        // The OS restart path should set recovery in DurableState
+        val state = DurableState.load(context)
         assertTrue(
-            "Auto-start pending flag should be set",
-            prefs.getBoolean("bg_auto_start_pending", false)
+            "Recovery pending should be set",
+            state.recoveryPending
         )
         assertEquals(
             "Previous Run",
-            prefs.getString("bg_auto_start_label", null)
+            state.lastServiceLabel
         )
         assertEquals(
             "specialUse",
-            prefs.getString("bg_auto_start_type", null)
+            state.lastServiceType
         )
 
         // Cleanup
@@ -211,17 +212,10 @@ class LifecycleServiceInstrumentedTest {
 
         assertNull("Label should be cleared", prefs.getString("bg_service_label", null))
         assertNull("Type should be cleared", prefs.getString("bg_service_type", null))
+        val state = DurableState.load(context)
         assertFalse(
-            "Auto-start pending should be cleared",
-            prefs.getBoolean("bg_auto_start_pending", false)
-        )
-        assertNull(
-            "Auto-start label should be cleared",
-            prefs.getString("bg_auto_start_label", null)
-        )
-        assertNull(
-            "Auto-start type should be cleared",
-            prefs.getString("bg_auto_start_type", null)
+            "Recovery pending should be false after stop",
+            state.recoveryPending
         )
     }
 
@@ -242,6 +236,44 @@ class LifecycleServiceInstrumentedTest {
             val text = extras.getCharSequence(android.app.Notification.EXTRA_TEXT)?.toString()
             assertEquals("Custom Label Here", text)
         }
+    }
+
+    // ── spec 08 C6 (Step 15): phoneCall FGS-type swap on answer ──────────
+
+    @Test
+    fun updateType_promotesToPhoneCallWhileRunning() {
+        // Headless call-receiving service starts as remoteMessaging.
+        startForegroundService("Ongoing service", "remoteMessaging")
+        assertEquals(
+            "precondition: started as remoteMessaging",
+            "remoteMessaging",
+            prefs.getString("bg_service_type", null),
+        )
+
+        // On call answer, swap to phoneCall without restarting the core.
+        val update = Intent(context, LifecycleService::class.java).apply {
+            action = LifecycleService.ACTION_UPDATE_TYPE
+            putExtra(LifecycleService.EXTRA_SERVICE_TYPE, "phoneCall")
+        }
+        context.startService(update)
+        Thread.sleep(500)
+
+        assertTrue("Service must remain running after type swap", LifecycleService.isRunning)
+        assertEquals(
+            "phoneCall type persisted after UPDATE_TYPE",
+            "phoneCall",
+            prefs.getString("bg_service_type", null),
+        )
+        assertEquals(
+            "phoneCall type persisted in durable state",
+            "phoneCall",
+            DurableState.load(context).lastServiceType,
+        )
+        // The live phoneCall foregroundServiceType is observable via:
+        //   adb shell dumpsys activity services <pkg> | grep phoneCall
+        // — recorded as the runbook check (plan Step 20 / verify-calls.md).
+
+        stopService()
     }
 
     private fun isWaydroid(): Boolean =

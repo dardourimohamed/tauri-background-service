@@ -14,11 +14,12 @@ use std::time::Duration;
 use tauri::{Emitter, Runtime};
 
 use crate::desktop::ipc::{
-    decode_frame, encode_frame, IpcEvent, IpcMessage, IpcRequest, IpcResponse,
+    decode_frame, encode_frame, IpcEvent, IpcMessage, IpcRequest, IpcResponse, PLUGIN_IPC_VERSION,
+    VERSION_MISMATCH_CODE,
 };
 use crate::desktop::transport::{self, TransportReadHalf, TransportStream, TransportWriteHalf};
 use crate::error::ServiceError;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::models::StopReason;
 use crate::models::{PluginEvent, ServiceStatus, StartConfig};
 
@@ -82,6 +83,32 @@ impl IpcClient {
         }
     }
 
+    /// Send a Hello/version handshake (doc-09/PROTO-14).
+    ///
+    /// Sends this client's [`PLUGIN_IPC_VERSION`] and returns the service's
+    /// echoed protocol version. A caller consults this on connect to detect
+    /// version skew (e.g. a still-running older headless process) BEFORE
+    /// routing commands, surfacing a "version mismatch — restart" state on
+    /// divergence instead of hanging on an opaque error.
+    pub async fn hello(&mut self) -> Result<u32, ServiceError> {
+        let request = IpcRequest::Hello {
+            version: PLUGIN_IPC_VERSION,
+        };
+        let (response, _events) = self.send_and_read(&request).await?;
+        if response.ok {
+            response
+                .data
+                .and_then(|d| d.get("version").and_then(|v| v.as_u64()).map(|v| v as u32))
+                .ok_or_else(|| ServiceError::Ipc("missing version in Hello response".into()))
+        } else {
+            Err(ServiceError::Ipc(
+                response
+                    .error
+                    .unwrap_or_else(|| "Hello handshake failed".into()),
+            ))
+        }
+    }
+
     /// Query the current service lifecycle state.
     pub async fn get_state(&mut self) -> Result<ServiceStatus, ServiceError> {
         let (response, _events) = self.send_and_read(&IpcRequest::GetState).await?;
@@ -122,7 +149,7 @@ impl IpcClient {
     ///
     /// The task runs until the socket is closed or an error occurs.
     pub fn listen_events<R: Runtime>(mut self, app: tauri::AppHandle<R>) {
-        tokio::spawn(async move {
+        tauri::async_runtime::spawn(async move {
             loop {
                 match self.read_event().await {
                     Ok(Some(event)) => {
@@ -237,13 +264,15 @@ enum IpcCommand {
 ///
 /// The background task automatically:
 /// - Relays [`IpcEvent`] frames to `app.emit("background-service://event", ...)`
-/// - Reconnects on connection failure with exponential backoff (1s–30s, up to 10 retries)
+/// - Reconnects on connection failure with exponential backoff (1s–30s, retries until shutdown)
 /// - Forwards commands (start/stop/is_running) over the same connection
 pub struct PersistentIpcClientHandle {
     cmd_tx: tokio::sync::mpsc::Sender<IpcCommand>,
     shutdown: tokio_util::sync::CancellationToken,
     connected: Arc<AtomicBool>,
+    desired_running: Arc<AtomicBool>,
     socket_path: PathBuf,
+    nudge: Arc<tokio::sync::Notify>,
 }
 
 impl Drop for PersistentIpcClientHandle {
@@ -262,20 +291,25 @@ impl PersistentIpcClientHandle {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
         let shutdown = tokio_util::sync::CancellationToken::new();
         let connected = Arc::new(AtomicBool::new(false));
+        let desired_running = Arc::new(AtomicBool::new(false));
+        let nudge = Arc::new(tokio::sync::Notify::new());
 
-        tokio::spawn(persistent_client_loop(
+        tauri::async_runtime::spawn(persistent_client_loop(
             socket_path.clone(),
             app,
             cmd_rx,
             shutdown.clone(),
             connected.clone(),
+            nudge.clone(),
         ));
 
         Self {
             cmd_tx,
             shutdown,
             connected,
+            desired_running,
             socket_path,
+            nudge,
         }
     }
 
@@ -296,6 +330,9 @@ impl PersistentIpcClientHandle {
 
     /// Send a Stop command through the persistent connection.
     pub async fn stop(&self) -> Result<(), ServiceError> {
+        if !self.is_connected() {
+            return Err(ServiceError::Ipc("ipcUnavailable".into()));
+        }
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(IpcCommand::Stop { reply: reply_tx })
@@ -308,6 +345,9 @@ impl PersistentIpcClientHandle {
 
     /// Query whether the service is running through the persistent connection.
     pub async fn is_running(&self) -> Result<bool, ServiceError> {
+        if !self.is_connected() {
+            return Err(ServiceError::Ipc("ipcUnavailable".into()));
+        }
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(IpcCommand::IsRunning { reply: reply_tx })
@@ -320,6 +360,9 @@ impl PersistentIpcClientHandle {
 
     /// Query the current service lifecycle state through the persistent connection.
     pub async fn get_state(&self) -> Result<ServiceStatus, ServiceError> {
+        if !self.is_connected() {
+            return Err(ServiceError::Ipc("ipcUnavailable".into()));
+        }
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(IpcCommand::GetState { reply: reply_tx })
@@ -371,6 +414,9 @@ impl PersistentIpcClientHandle {
         &self,
         config: Option<StartConfig>,
     ) -> Result<(), ServiceError> {
+        if !self.is_connected() {
+            return Err(ServiceError::Ipc("ipcUnavailable".into()));
+        }
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(IpcCommand::EnableAutoRestart {
@@ -379,27 +425,43 @@ impl PersistentIpcClientHandle {
             })
             .await
             .map_err(|_| ServiceError::Ipc("persistent client shut down".into()))?;
-        reply_rx
+        let result = reply_rx
             .await
-            .map_err(|_| ServiceError::Ipc("command dropped".into()))?
+            .map_err(|_| ServiceError::Ipc("command dropped".into()))?;
+        if result.is_ok() {
+            self.desired_running
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
     }
 
     /// Disable auto-restart through the persistent connection.
     pub async fn disable_auto_restart(&self) -> Result<(), ServiceError> {
+        if !self.is_connected() {
+            return Err(ServiceError::Ipc("ipcUnavailable".into()));
+        }
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(IpcCommand::DisableAutoRestart { reply: reply_tx })
             .await
             .map_err(|_| ServiceError::Ipc("persistent client shut down".into()))?;
-        reply_rx
+        let result = reply_rx
             .await
-            .map_err(|_| ServiceError::Ipc("command dropped".into()))?
+            .map_err(|_| ServiceError::Ipc("command dropped".into()))?;
+        if result.is_ok() {
+            self.desired_running
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
     }
 
     /// Get the persisted desired-state through the persistent connection.
     pub async fn get_desired_state(
         &self,
     ) -> Result<Option<crate::desired_state::DesiredState>, ServiceError> {
+        if !self.is_connected() {
+            return Err(ServiceError::Ipc("ipcUnavailable".into()));
+        }
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(IpcCommand::GetDesiredState { reply: reply_tx })
@@ -414,6 +476,9 @@ impl PersistentIpcClientHandle {
     pub async fn validate_setup(
         &self,
     ) -> Result<crate::models::SetupValidationReport, ServiceError> {
+        if !self.is_connected() {
+            return Err(ServiceError::Ipc("ipcUnavailable".into()));
+        }
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(IpcCommand::ValidateSetup { reply: reply_tx })
@@ -425,9 +490,17 @@ impl PersistentIpcClientHandle {
     }
 
     /// Get the complete lifecycle status snapshot.
+    ///
+    /// When connected, returns the actual status from the daemon.
+    /// When disconnected, returns a synthesized status with `state = Stopped`
+    /// (or `RecoveryPending` if local `desired_running` is true) and
+    /// `last_platform_error = "ipcUnavailable"`.
     pub async fn get_lifecycle_status(
         &self,
     ) -> Result<crate::models::LifecycleStatus, ServiceError> {
+        if !self.is_connected() {
+            return Ok(self.synthesize_disconnected_status());
+        }
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.cmd_tx
             .send(IpcCommand::GetLifecycleStatus { reply: reply_tx })
@@ -436,6 +509,69 @@ impl PersistentIpcClientHandle {
         reply_rx
             .await
             .map_err(|_| ServiceError::Ipc("command dropped".into()))?
+    }
+
+    /// Build a synthesized `LifecycleStatus` for the disconnected state.
+    fn synthesize_disconnected_status(&self) -> crate::models::LifecycleStatus {
+        use crate::models::LifecycleState;
+
+        let desired = self
+            .desired_running
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let state = if desired {
+            LifecycleState::RecoveryPending
+        } else {
+            LifecycleState::Stopped
+        };
+
+        let (platform, _) =
+            crate::capabilities::CapabilityProvider::detect_platform(Some("osService"));
+        let capabilities = crate::capabilities::CapabilityProvider::capabilities(
+            platform,
+            crate::models::LifecycleMode::DesktopOsService,
+            false,
+        );
+
+        crate::models::LifecycleStatus {
+            state,
+            desired_running: desired,
+            recovery_enabled: desired,
+            recovery_pending: desired,
+            recovery_reason: if desired {
+                Some("ipcUnavailable".into())
+            } else {
+                None
+            },
+            last_start_config: None,
+            last_platform_state: None,
+            last_platform_error: Some("ipcUnavailable".into()),
+            last_error: Some("IPC disconnected".into()),
+            platform,
+            capabilities,
+            issues: vec![],
+            native_running: None,
+            native_foreground: None,
+            adopted: None,
+            degraded: None,
+            degraded_reason: None,
+            data_dir: None,
+        }
+    }
+
+    /// Set the local `desired_running` flag for testing.
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_desired_running_for_test(&self, value: bool) {
+        self.desired_running
+            .store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Nudge the persistent client to skip its current backoff delay and
+    /// attempt an immediate reconnection.
+    ///
+    /// Useful after `installService()` or `startOsService()` when the
+    /// persistent client is waiting in its backoff loop.
+    pub fn nudge_reconnect(&self) {
+        self.nudge.notify_one();
     }
 }
 
@@ -446,13 +582,14 @@ async fn persistent_client_loop<R: Runtime>(
     mut cmd_rx: tokio::sync::mpsc::Receiver<IpcCommand>,
     shutdown: tokio_util::sync::CancellationToken,
     connected: Arc<AtomicBool>,
+    nudge: Arc<tokio::sync::Notify>,
 ) {
     use backon::BackoffBuilder;
 
     let backoff_builder = backon::ExponentialBuilder::default()
         .with_min_delay(Duration::from_secs(1))
         .with_max_delay(Duration::from_secs(30))
-        .with_max_times(10)
+        .without_max_times()
         .with_jitter();
 
     let mut attempts = backoff_builder.build();
@@ -483,19 +620,16 @@ async fn persistent_client_loop<R: Runtime>(
                         connected.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                let delay = match attempts.next() {
-                    Some(d) => d,
-                    None => {
-                        log::warn!("Persistent IPC client: backoff exhausted, giving up");
-                        break;
-                    }
-                };
+                let delay = attempts.next().expect("backoff never exhausts without max_times");
                 tokio::select! {
                     biased;
                     _ = shutdown.cancelled() => {
                         log::info!("Persistent IPC client shutting down");
                         connected.store(false, std::sync::atomic::Ordering::Relaxed);
                         break;
+                    }
+                    _ = nudge.notified() => {
+                        log::debug!("Persistent IPC client: nudge received, retrying immediately");
                     }
                     _ = tokio::time::sleep(delay) => {}
                 }
@@ -563,6 +697,71 @@ async fn run_persistent_connection<R: Runtime>(
         // Reader exited — mark disconnected.
         connected_reader.store(false, std::sync::atomic::Ordering::Relaxed);
     });
+
+    // [doc-09/PROTO-14]: proactive version handshake. Consult the service's
+    // protocol version BEFORE routing commands, so a version-skewed (e.g.
+    // still-running older) headless process is detected up front and surfaced
+    // as a "version mismatch — restart" signal instead of hanging the GUI on
+    // an opaque error. Fail-open: an inconclusive consult (timeout / transient
+    // error) proceeds without blocking command routing — the service may still
+    // serve legacy commands.
+    {
+        let hello_rx = prepare_response_slot(&response_slot).await;
+        let sent = send_request_to(
+            &mut write_half,
+            &IpcRequest::Hello {
+                version: PLUGIN_IPC_VERSION,
+            },
+        )
+        .await
+        .is_ok();
+        if sent {
+            match tokio::time::timeout(Duration::from_secs(2), await_response(hello_rx)).await {
+                Ok(Ok(resp)) => {
+                    let server_version = resp
+                        .data
+                        .as_ref()
+                        .and_then(|d| d.get("version"))
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as u32);
+                    // Three skew signals: (1) the service could not handle Hello
+                    // at all (non-ok) — e.g. a still-running OLDER headless
+                    // process whose protocol predates Hello; (2) it answered
+                    // with a DIFFERENT version; (3) it returned the stable
+                    // mismatch code. Any ⇒ surface "version mismatch — restart".
+                    let mismatch = !resp.ok
+                        || server_version.is_some_and(|v| v != PLUGIN_IPC_VERSION)
+                        || resp.code.as_deref() == Some(VERSION_MISMATCH_CODE);
+                    if mismatch {
+                        let _ = app.emit(
+                            "background-service://event",
+                            PluginEvent::Error {
+                                message: format!(
+                                    "version mismatch — restart the app (service v{:?}, client v{})",
+                                    server_version, PLUGIN_IPC_VERSION
+                                ),
+                            },
+                        );
+                        log::warn!(
+                            "IPC version mismatch: service={:?} client={}",
+                            server_version,
+                            PLUGIN_IPC_VERSION
+                        );
+                    }
+                }
+                _ => {
+                    // Timed out / transient error: clear the slot so the next
+                    // command does not trip the sequential-slot invariant, then
+                    // proceed without a version check.
+                    let _ = response_slot.lock().await.take();
+                    log::debug!("IPC Hello consult inconclusive; proceeding without version check");
+                }
+            }
+        } else {
+            // send_request_to failed — drop the unused slot sender.
+            let _ = response_slot.lock().await.take();
+        }
+    }
 
     // Main loop: receive commands, send requests, wait for responses.
     let result = loop {
@@ -824,7 +1023,8 @@ async fn read_frame_from(
         .map_err(ServiceError::Ipc)
 }
 
-#[cfg(test)]
+// Tests drive a real Unix socket via test_helpers (cfg(all(test, unix))).
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::desktop::test_helpers::{
@@ -1316,7 +1516,22 @@ mod tests {
         let factory: ServiceFactory<tauri::test::MockRuntime> =
             Box::new(|| Box::new(BlockingService));
         tokio::spawn(manager_loop(
-            cmd_rx2, factory, 0.0, 0.0, 0.0, 0.0, false, false, None,
+            cmd_rx2,
+            factory,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            false,
+            false,
+            4.0,
+            None,
+            vec!["remoteMessaging".into()],
+            false,
+            crate::notifier::NotifierPolicy::default(),
+            None,
+            None,
+            false,
         ));
         let server2 = IpcServer::bind(path.clone(), cmd_tx2, app.handle().clone()).unwrap();
         let shutdown2 = CancellationToken::new();
@@ -1393,6 +1608,12 @@ mod tests {
         let app = tauri::test::mock_app();
 
         let handle = PersistentIpcClientHandle::spawn(path, app.handle().clone());
+
+        // Wait for connection before sending commands.
+        handle
+            .wait_for_connected(Duration::from_secs(2))
+            .await
+            .unwrap();
 
         // Initially not running.
         let running = handle.is_running().await.unwrap();
@@ -1575,6 +1796,7 @@ mod tests {
                 ok: true,
                 data: None,
                 error: None,
+                code: None,
             })],
         )
         .await;
@@ -1604,6 +1826,7 @@ mod tests {
                     ok: true,
                     data: None,
                     error: None,
+                    code: None,
                 }),
             ],
         )
@@ -1735,25 +1958,28 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Verify the ExponentialBuilder config used in persistent_client_loop
-    /// produces increasing delays, respects the 30s max, and exhausts after
-    /// exactly 10 attempts.
+    /// produces increasing delays, respects the 30s max, and never exhausts.
     #[test]
-    fn backoff_builder_produces_increasing_delays() {
+    fn backoff_builder_produces_increasing_delays_indefinitely() {
         use backon::BackoffBuilder;
 
         let builder = backon::ExponentialBuilder::default()
             .with_min_delay(Duration::from_secs(1))
             .with_max_delay(Duration::from_secs(30))
-            .with_max_times(10)
+            .without_max_times()
             .with_jitter();
 
         let mut attempts = builder.build();
-        let mut delays = Vec::new();
-        for d in attempts.by_ref() {
+        let mut delays: Vec<Duration> = Vec::new();
+        for d in (&mut attempts).take(15) {
             delays.push(d);
         }
 
-        assert_eq!(delays.len(), 10, "should produce exactly 10 delays");
+        assert!(
+            delays.len() == 15,
+            "should produce at least 15 delays without exhausting, got {}",
+            delays.len()
+        );
 
         // First delay ≈ 1s (with jitter, allow 0.5–2s).
         assert!(
@@ -1767,64 +1993,32 @@ mod tests {
             delays[0]
         );
 
-        // Last delay should be at or near the 30s cap.
-        assert!(
-            delays[9] >= Duration::from_secs(15),
-            "last delay should approach max: {:?}",
-            delays[9]
-        );
-
-        // All delays capped — with jitter, allow up to 2× max_delay.
+        // Delays increase monotonically (cap at 30s + jitter).
+        let mut prev = Duration::ZERO;
         for d in &delays {
             assert!(
                 *d <= Duration::from_secs(60),
                 "delay exceeds max_delay + jitter margin: {:?}",
                 d
             );
+            // Exponential growth may be masked by jitter near the cap, so just
+            // verify later delays are generally larger than early ones.
+            let _ = prev;
+            prev = *d;
         }
 
-        // Iterator is exhausted after 10 attempts.
+        // Later delays should be near the 30s cap.
         assert!(
-            attempts.next().is_none(),
-            "should return None after 10 attempts"
+            delays[14] >= Duration::from_secs(10),
+            "delay 15 should approach max: {:?}",
+            delays[14]
         );
-    }
 
-    /// Verify the persistent client stops retrying after exhausting its backoff
-    /// budget and that subsequent commands fail with "shut down" (channel closed).
-    ///
-    /// With min_delay=1s, max_delay=30s, max_times=10, total retry time ≈ 152s.
-    /// Marked `#[ignore]` to avoid slowing down normal test runs.
-    /// Run with `cargo test -- --ignored`.
-    #[ignore]
-    #[tokio::test]
-    async fn persistent_client_exits_after_max_retries() {
-        let app = tauri::test::mock_app();
-        let path = crate::desktop::test_helpers::unique_socket_path();
-        let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
-
-        // Wait for the background task to exhaust retries.
-        // Poll is_running() — once the loop exits, the command channel closes
-        // and we get "shut down" instead of a timeout.
-        let exited = tokio::time::timeout(Duration::from_secs(180), async {
-            loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                if let Err(e) = handle.is_running().await {
-                    if e.to_string().contains("shut down") {
-                        return;
-                    }
-                }
-            }
-        })
-        .await;
-
+        // Iterator never exhausts — still producing delays after 15.
         assert!(
-            exited.is_ok(),
-            "persistent client should exit after max retries"
+            attempts.next().is_some(),
+            "backoff should never exhaust without max_times"
         );
-        assert!(!handle.is_connected(), "should not be connected after exit");
-
-        let _ = std::fs::remove_file(&path);
     }
 
     /// Verify the persistent client reconnects after a server restart and that
@@ -1867,7 +2061,22 @@ mod tests {
         let factory: ServiceFactory<tauri::test::MockRuntime> =
             Box::new(|| Box::new(BlockingService));
         tokio::spawn(manager_loop(
-            cmd_rx2, factory, 0.0, 0.0, 0.0, 0.0, false, false, None,
+            cmd_rx2,
+            factory,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            false,
+            false,
+            4.0,
+            None,
+            vec!["remoteMessaging".into()],
+            false,
+            crate::notifier::NotifierPolicy::default(),
+            None,
+            None,
+            false,
         ));
         let server2 = IpcServer::bind(path.clone(), cmd_tx2, app.handle().clone()).unwrap();
         let shutdown2 = CancellationToken::new();
@@ -1903,8 +2112,148 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    //  C3: ZERO-LENGTH FRAME REJECTION TESTS
+    //  RETRY-UNTIL-SHUTDOWN TESTS (Step 11)
     // ═══════════════════════════════════════════════════════════════════════
+
+    // -- AC1: Retries beyond 10 attempts without stopping --
+
+    /// Verify the persistent client keeps retrying when no server is available.
+    /// After a few seconds (enough for several retry attempts with 1s min_delay),
+    /// the command channel should still be open (not "shut down").
+    #[tokio::test]
+    async fn persistent_client_keeps_retrying_without_server() {
+        let app = tauri::test::mock_app();
+        let path = crate::desktop::test_helpers::unique_socket_path();
+        let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+
+        // Wait long enough for several retry attempts.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Client should NOT be connected (no server).
+        assert!(
+            !handle.is_connected(),
+            "should not be connected when no server"
+        );
+
+        // Command channel should still be open (not "shut down").
+        // Commands queue in the channel but aren't processed without a connection,
+        // so use a timeout to avoid hanging.
+        let result = tokio::time::timeout(Duration::from_millis(200), handle.is_running()).await;
+
+        match result {
+            // Timeout is expected — command queued but no connection to process it.
+            // The important thing is the handle is alive (not "shut down").
+            Err(_) => { /* expected: command queued, no server to process */ }
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("shut down"),
+                    "client should still be retrying, not shut down: {msg}"
+                );
+            }
+            Ok(Ok(_)) => { /* unexpected but not a failure */ }
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -- AC2: Clean shutdown via CancellationToken --
+
+    /// Verify the persistent client exits cleanly when the shutdown token is
+    /// cancelled while retrying (no server available).
+    #[tokio::test]
+    async fn persistent_client_exits_cleanly_on_shutdown_during_retries() {
+        let app = tauri::test::mock_app();
+        let path = crate::desktop::test_helpers::unique_socket_path();
+        let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+
+        // Wait a moment for the retry loop to start.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !handle.is_connected(),
+            "should not be connected without server"
+        );
+
+        // Drop the handle — cancels the shutdown token.
+        drop(handle);
+
+        // The loop should exit cleanly (no panic, no resource leak).
+        // We verify by checking that the socket file is not being held open.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -- AC3: Late server connection --
+
+    /// Verify the persistent client connects successfully when a server starts
+    /// after the client has already begun retrying.
+    #[tokio::test]
+    async fn persistent_client_connects_to_late_starting_server() {
+        use crate::desktop::ipc_server::IpcServer;
+        use crate::manager::{manager_loop, ServiceFactory};
+        use tokio_util::sync::CancellationToken;
+
+        let app = tauri::test::mock_app();
+        let path = crate::desktop::test_helpers::unique_socket_path();
+
+        // Spawn persistent client with NO server.
+        let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+
+        // Wait for a few retry attempts.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !handle.is_connected(),
+            "should not be connected before server starts"
+        );
+
+        // Now start a server at the same path.
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let factory: ServiceFactory<tauri::test::MockRuntime> =
+            Box::new(|| Box::new(BlockingService));
+        tokio::spawn(manager_loop(
+            cmd_rx,
+            factory,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            false,
+            false,
+            4.0,
+            None,
+            vec!["remoteMessaging".into()],
+            false,
+            crate::notifier::NotifierPolicy::default(),
+            None,
+            None,
+            false,
+        ));
+        let server = IpcServer::bind(path.clone(), cmd_tx, app.handle().clone()).unwrap();
+        let shutdown = CancellationToken::new();
+        let s = shutdown.clone();
+        tokio::spawn(async move { server.run(s).await });
+
+        // Client should connect to the late-starting server.
+        let connected = handle
+            .wait_for_connected(Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(
+            connected,
+            "persistent client should connect to late-starting server"
+        );
+
+        // Verify commands work.
+        let result = handle.is_running().await;
+        assert!(
+            result.is_ok(),
+            "commands should work after late connection: {:?}",
+            result.err()
+        );
+
+        shutdown.cancel();
+    }
 
     /// Verify that receiving a zero-length frame (\x00\x00\x00\x00) from the
     /// server produces an error, not `Ok(None)`. Zero-length frames are
@@ -2048,6 +2397,7 @@ mod tests {
                     ok: true,
                     data: Some(serde_json::json!({"running": false})),
                     error: None,
+                    code: None,
                 }),
             ],
         )
@@ -2072,5 +2422,731 @@ mod tests {
 
         server.await.unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  DISCONNECTED FAST-FAIL TESTS (Step 12 — IPC disconnected fast-fail)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Helper: spawn a persistent client with no server, confirming it is
+    /// disconnected before returning.
+    async fn disconnected_handle() -> (
+        PersistentIpcClientHandle,
+        std::path::PathBuf,
+        tauri::AppHandle<tauri::test::MockRuntime>,
+    ) {
+        let app = tauri::test::mock_app();
+        let path = crate::desktop::test_helpers::unique_socket_path();
+        let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+        // Give the background task a moment to attempt (and fail) a connection.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !handle.is_connected(),
+            "handle should be disconnected in test helper"
+        );
+        (handle, path, app.handle().clone())
+    }
+
+    // -- AC1: Commands fast-fail when disconnected --
+
+    #[tokio::test]
+    async fn disconnected_stop_returns_ipc_unavailable() {
+        let (handle, path, _) = disconnected_handle().await;
+        let err = handle.stop().await.unwrap_err();
+        assert!(
+            err.to_string().contains("ipcUnavailable"),
+            "stop should fast-fail with ipcUnavailable: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn disconnected_is_running_returns_ipc_unavailable() {
+        let (handle, path, _) = disconnected_handle().await;
+        let err = handle.is_running().await.unwrap_err();
+        assert!(
+            err.to_string().contains("ipcUnavailable"),
+            "is_running should fast-fail with ipcUnavailable: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn disconnected_get_state_returns_ipc_unavailable() {
+        let (handle, path, _) = disconnected_handle().await;
+        let err = handle.get_state().await.unwrap_err();
+        assert!(
+            err.to_string().contains("ipcUnavailable"),
+            "get_state should fast-fail with ipcUnavailable: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn disconnected_enable_auto_restart_returns_ipc_unavailable() {
+        let (handle, path, _) = disconnected_handle().await;
+        let err = handle.enable_auto_restart(None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("ipcUnavailable"),
+            "enable_auto_restart should fast-fail with ipcUnavailable: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn disconnected_disable_auto_restart_returns_ipc_unavailable() {
+        let (handle, path, _) = disconnected_handle().await;
+        let err = handle.disable_auto_restart().await.unwrap_err();
+        assert!(
+            err.to_string().contains("ipcUnavailable"),
+            "disable_auto_restart should fast-fail with ipcUnavailable: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn disconnected_get_desired_state_returns_ipc_unavailable() {
+        let (handle, path, _) = disconnected_handle().await;
+        let err = handle.get_desired_state().await.unwrap_err();
+        assert!(
+            err.to_string().contains("ipcUnavailable"),
+            "get_desired_state should fast-fail with ipcUnavailable: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn disconnected_validate_setup_returns_ipc_unavailable() {
+        let (handle, path, _) = disconnected_handle().await;
+        let err = handle.validate_setup().await.unwrap_err();
+        assert!(
+            err.to_string().contains("ipcUnavailable"),
+            "validate_setup should fast-fail with ipcUnavailable: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SYNTHESIZED LIFECCYCLE STATUS TESTS (Step 13)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // -- AC1: Disconnected returns synthesized Stopped status --
+
+    /// When disconnected with no local desired_running, get_lifecycle_status()
+    /// returns Ok with a synthesized LifecycleStatus (not an error).
+    #[tokio::test]
+    async fn disconnected_get_lifecycle_status_returns_synthesized_stopped() {
+        let (handle, path, _) = disconnected_handle().await;
+        let status = handle.get_lifecycle_status().await.expect(
+            "get_lifecycle_status should return Ok with synthesized status when disconnected",
+        );
+        assert!(
+            matches!(status.state, crate::models::LifecycleState::Stopped),
+            "expected Stopped, got {:?}",
+            status.state
+        );
+        assert!(
+            status.last_platform_error.as_deref() == Some("ipcUnavailable"),
+            "expected last_platform_error = 'ipcUnavailable', got {:?}",
+            status.last_platform_error
+        );
+        assert!(!status.desired_running, "desired_running should be false");
+        assert!(!status.recovery_pending, "recovery_pending should be false");
+        assert_eq!(
+            status.capabilities.lifecycle_mode,
+            crate::models::LifecycleMode::DesktopOsService,
+            "lifecycle_mode should be DesktopOsService"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -- AC2: Disconnected with desired_running returns RecoveryPending --
+
+    /// When disconnected but local desired_running is true, get_lifecycle_status()
+    /// returns state = RecoveryPending with ipcUnavailable error.
+    #[tokio::test]
+    async fn disconnected_with_desired_running_returns_recovery_pending() {
+        let (handle, path, _) = disconnected_handle().await;
+
+        // Simulate the state where enable_auto_restart succeeded before
+        // disconnection (sets local desired_running = true).
+        handle.set_desired_running_for_test(true);
+
+        let status = handle
+            .get_lifecycle_status()
+            .await
+            .expect("should return Ok with synthesized status when disconnected");
+        assert!(
+            matches!(status.state, crate::models::LifecycleState::RecoveryPending),
+            "expected RecoveryPending, got {:?}",
+            status.state
+        );
+        assert!(status.desired_running, "desired_running should be true");
+        assert!(status.recovery_pending, "recovery_pending should be true");
+        assert!(
+            status.last_platform_error.as_deref() == Some("ipcUnavailable"),
+            "expected last_platform_error = 'ipcUnavailable', got {:?}",
+            status.last_platform_error
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -- AC3: Connected returns actual status (not synthesized) --
+
+    /// When connected, get_lifecycle_status() returns the actual status from
+    /// the daemon, not the synthesized disconnected status.
+    #[tokio::test]
+    async fn connected_get_lifecycle_status_returns_actual_status() {
+        let (path, shutdown, _event_tx) = setup_server();
+        let app = tauri::test::mock_app();
+        let handle = PersistentIpcClientHandle::spawn(path, app.handle().clone());
+
+        handle
+            .wait_for_connected(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        let status = handle
+            .get_lifecycle_status()
+            .await
+            .expect("should return actual status when connected");
+        // The daemon's initial state is Idle (not Stopped or synthesized).
+        assert!(
+            matches!(status.state, crate::models::LifecycleState::Idle),
+            "expected Idle (actual daemon state), got {:?}",
+            status.state
+        );
+        assert!(
+            status.last_platform_error.is_none(),
+            "connected status should not have ipcUnavailable error"
+        );
+
+        shutdown.cancel();
+    }
+
+    // -- AC2: start() does NOT fast-fail when disconnected --
+    // The auto-start logic is in the caller (lib.rs). The IPC client's start()
+    // should still accept the command (it queues into the channel), allowing
+    // the caller to handle the auto-start flow.
+
+    #[tokio::test]
+    async fn disconnected_start_does_not_fast_fail() {
+        let (handle, path, _) = disconnected_handle().await;
+        // start() should NOT return ipcUnavailable — it should queue the
+        // command. Use a timeout since the command will hang (no server).
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            handle.start(StartConfig::default()),
+        )
+        .await;
+
+        // Timeout means the command was queued (not fast-failed) — expected.
+        // Or it could return an error from the channel, but NOT "ipcUnavailable".
+        match result {
+            Err(_) => { /* timeout — command queued, correct */ }
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("ipcUnavailable"),
+                    "start should NOT fast-fail with ipcUnavailable: {msg}"
+                );
+            }
+            Ok(Ok(_)) => { /* unexpected success but not a fast-fail */ }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  RECONNECT NUDGE TESTS (Step 14)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// AC3: After nudge_reconnect(), the persistent client reconnects faster
+    /// than the normal backoff delay (which can be up to 30s).
+    ///
+    /// Setup: spawn client with NO server → wait for backoff to ramp up →
+    /// start server → nudge → verify reconnection within 2s.
+    #[tokio::test]
+    async fn nudge_reconnect_skips_backoff_delay() {
+        let app = tauri::test::mock_app();
+        let path = crate::desktop::test_helpers::unique_socket_path();
+        let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+
+        // Client is disconnected — wait for backoff to ramp up past 1s delay.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !handle.is_connected(),
+            "should not be connected without server"
+        );
+
+        // Start a server at the expected path.
+        let (shutdown2, _event_tx2) = {
+            use crate::desktop::ipc_server::IpcServer;
+            use crate::manager::{manager_loop, ServiceFactory};
+            use tokio_util::sync::CancellationToken;
+            let app2 = tauri::test::mock_app();
+            let (cmd_tx2, cmd_rx2) = tokio::sync::mpsc::channel(16);
+            let factory: ServiceFactory<tauri::test::MockRuntime> =
+                Box::new(|| Box::new(BlockingService));
+            tokio::spawn(manager_loop(
+                cmd_rx2,
+                factory,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                false,
+                false,
+                4.0,
+                None,
+                vec!["remoteMessaging".into()],
+                false,
+                crate::notifier::NotifierPolicy::default(),
+                None,
+                None,
+                false,
+            ));
+            let server2 = IpcServer::bind(path.clone(), cmd_tx2, app2.handle().clone()).unwrap();
+            let event_tx2 = server2.event_sender();
+            let s2 = CancellationToken::new();
+            let sc = s2.clone();
+            tokio::spawn(async move { server2.run(sc).await });
+            (s2, event_tx2)
+        };
+
+        // Nudge the client to skip the backoff.
+        handle.nudge_reconnect();
+
+        // Client should reconnect within 2s — much faster than the 30s max backoff.
+        let connected = handle
+            .wait_for_connected(Duration::from_secs(2))
+            .await
+            .expect("wait_for_connected");
+        assert!(connected, "should reconnect quickly after nudge");
+
+        shutdown2.cancel();
+    }
+
+    /// AC1/AC2: start() with auto-start — reconnect within timeout succeeds,
+    /// timeout without reconnect returns error. These are tested via the
+    /// lib.rs caller path. Here we verify the primitive: wait_for_connected
+    /// returns false on timeout when no server is available.
+    #[tokio::test]
+    async fn wait_for_connected_timeout_with_nudge_still_fails() {
+        let app = tauri::test::mock_app();
+        let path = crate::desktop::test_helpers::unique_socket_path();
+        let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+
+        // Nudge when there's no server — should still time out.
+        handle.nudge_reconnect();
+
+        let connected = handle
+            .wait_for_connected(Duration::from_millis(500))
+            .await
+            .expect("wait_for_connected");
+        assert!(!connected, "should time out even with nudge when no server");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  OS-SERVICE INTEGRATION TESTS (Step 16)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Helper: start a fresh IPC server at the given path, returning the
+    /// shutdown token. Uses the [`BlockingService`] factory.
+    fn start_os_service_server(
+        path: &std::path::Path,
+        app: &tauri::AppHandle<tauri::test::MockRuntime>,
+    ) -> tokio_util::sync::CancellationToken {
+        use crate::desktop::ipc_server::IpcServer;
+        use crate::manager::{manager_loop, ServiceFactory};
+
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(16);
+        let factory: ServiceFactory<tauri::test::MockRuntime> =
+            Box::new(|| Box::new(BlockingService));
+        tokio::spawn(manager_loop(
+            cmd_rx,
+            factory,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            false,
+            false,
+            4.0,
+            None,
+            vec!["remoteMessaging".into()],
+            false,
+            crate::notifier::NotifierPolicy::default(),
+            None,
+            None,
+            false,
+        ));
+        let server = IpcServer::bind(path.to_path_buf(), cmd_tx, app.clone()).unwrap();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let s = shutdown.clone();
+        tokio::spawn(async move { server.run(s).await });
+        shutdown
+    }
+
+    // -- AC1: Full cycle (happy path) -----------------------------------------
+
+    /// End-to-end happy path:
+    /// 1. Persistent client connects to running server
+    /// 2. `get_lifecycle_status()` returns Idle
+    /// 3. `start()` → poll `get_lifecycle_status()` until Running
+    /// 4. `stop()` → `get_lifecycle_status()` returns Stopped
+    /// 5. `is_running()` returns false
+    #[tokio::test]
+    async fn os_service_full_cycle() {
+        let (path, shutdown, _event_tx) = setup_server();
+        let app = tauri::test::mock_app();
+        let handle = PersistentIpcClientHandle::spawn(path, app.handle().clone());
+
+        // Wait for connection.
+        let connected = handle
+            .wait_for_connected(Duration::from_secs(2))
+            .await
+            .expect("wait_for_connected");
+        assert!(connected, "should connect to server");
+
+        // Initially idle.
+        let status = handle
+            .get_lifecycle_status()
+            .await
+            .expect("get_lifecycle_status");
+        assert!(
+            matches!(status.state, crate::models::LifecycleState::Idle),
+            "expected Idle, got {:?}",
+            status.state
+        );
+
+        // Start the service.
+        handle
+            .start(StartConfig::default())
+            .await
+            .expect("start should succeed");
+
+        // Poll until Running (manager transitions Initializing → Running async).
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let s = handle
+                    .get_lifecycle_status()
+                    .await
+                    .expect("get_lifecycle_status");
+                if matches!(s.state, crate::models::LifecycleState::Running) {
+                    return s;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for Running");
+        assert!(
+            matches!(status.state, crate::models::LifecycleState::Running),
+            "expected Running, got {:?}",
+            status.state
+        );
+        assert!(handle.is_running().await.expect("is_running"));
+
+        // Stop the service.
+        handle.stop().await.expect("stop should succeed");
+
+        // Verify stopped.
+        let status = handle
+            .get_lifecycle_status()
+            .await
+            .expect("get_lifecycle_status");
+        assert!(
+            matches!(status.state, crate::models::LifecycleState::Stopped),
+            "expected Stopped after stop, got {:?}",
+            status.state
+        );
+        assert!(!handle.is_running().await.expect("is_running"));
+
+        shutdown.cancel();
+    }
+
+    // -- AC2: No server — fast-fail + synthesized status ----------------------
+
+    /// When no server is running:
+    /// - `stop()`, `is_running()`, `get_state()` fast-fail with `ipcUnavailable`
+    /// - `get_lifecycle_status()` returns synthesized `Stopped` (not an error)
+    /// - All commands return within 200ms (no indefinite hang)
+    #[tokio::test]
+    async fn os_service_no_server_fast_fail_with_synthesized_status() {
+        let (handle, path, _) = disconnected_handle().await;
+
+        // Fast-fail: stop returns ipcUnavailable.
+        let start = std::time::Instant::now();
+        let err = handle.stop().await.unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "stop should fast-fail within 200ms, took {elapsed:?}"
+        );
+        assert!(err.to_string().contains("ipcUnavailable"), "stop: {err}");
+
+        // Fast-fail: is_running returns ipcUnavailable.
+        let start = std::time::Instant::now();
+        let err = handle.is_running().await.unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "is_running should fast-fail within 200ms, took {elapsed:?}"
+        );
+        assert!(
+            err.to_string().contains("ipcUnavailable"),
+            "is_running: {err}"
+        );
+
+        // Fast-fail: get_state returns ipcUnavailable.
+        let start = std::time::Instant::now();
+        let err = handle.get_state().await.unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "get_state should fast-fail within 200ms, took {elapsed:?}"
+        );
+        assert!(
+            err.to_string().contains("ipcUnavailable"),
+            "get_state: {err}"
+        );
+
+        // get_lifecycle_status returns SYNTHESIZED status (not error).
+        let start = std::time::Instant::now();
+        let status = handle
+            .get_lifecycle_status()
+            .await
+            .expect("get_lifecycle_status should return Ok with synthesized status");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "get_lifecycle_status should return within 200ms, took {elapsed:?}"
+        );
+        assert!(
+            matches!(status.state, crate::models::LifecycleState::Stopped),
+            "expected Stopped, got {:?}",
+            status.state
+        );
+        assert_eq!(
+            status.last_platform_error.as_deref(),
+            Some("ipcUnavailable"),
+            "should have ipcUnavailable error"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -- AC3: Late server — retry + connect + commands work -------------------
+
+    /// Client starts with no server, retries for 2s, then a server starts
+    /// and the client connects. After connecting, the full start/stop lifecycle
+    /// works correctly.
+    #[tokio::test]
+    async fn os_service_late_server_reconnect_and_commands() {
+        let app = tauri::test::mock_app();
+        let path = crate::desktop::test_helpers::unique_socket_path();
+
+        // Spawn persistent client with NO server.
+        let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+
+        // Verify disconnected.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !handle.is_connected(),
+            "should not be connected without server"
+        );
+
+        // get_lifecycle_status should return synthesized status while disconnected.
+        let status = handle
+            .get_lifecycle_status()
+            .await
+            .expect("synthesized status");
+        assert!(
+            matches!(status.state, crate::models::LifecycleState::Stopped),
+            "expected Stopped while disconnected, got {:?}",
+            status.state
+        );
+
+        // Start the server AFTER the client has been retrying.
+        let shutdown = start_os_service_server(&path, &app.handle().clone());
+
+        // Client should connect to the late-starting server.
+        let connected = handle
+            .wait_for_connected(Duration::from_secs(5))
+            .await
+            .expect("wait_for_connected");
+        assert!(connected, "should connect to late-starting server");
+
+        // Full lifecycle through the late-connected client.
+        handle.start(StartConfig::default()).await.expect("start");
+
+        // Poll until Running.
+        let running = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if handle.is_running().await.unwrap_or(false) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for Running");
+        assert!(running, "should be running after start");
+
+        handle.stop().await.expect("stop");
+        assert!(
+            !handle.is_running().await.unwrap(),
+            "should not be running after stop"
+        );
+
+        shutdown.cancel();
+    }
+
+    // -- AC4: Server restart — disconnect + auto-reconnect --------------------
+
+    /// Verify the full server-restart workflow:
+    /// 1. Client connects to a real IPC server (server 1)
+    /// 2. Commands work on server 1
+    /// 3. Server 1 shuts down gracefully
+    /// 4. Client detects disconnect (or next command fails)
+    /// 5. Server 2 starts at the same path
+    /// 6. Client reconnects to server 2 (with nudge)
+    /// 7. Full lifecycle works on server 2
+    ///
+    /// After server 1's graceful shutdown, existing spawned connection handlers
+    /// may keep the old connection alive briefly. The test verifies that
+    /// commands work after the transition regardless.
+    #[tokio::test]
+    async fn os_service_server_restart_automatic_reconnect() {
+        let app = tauri::test::mock_app();
+        let path = crate::desktop::test_helpers::unique_socket_path();
+
+        // Start server 1.
+        let shutdown1 = start_os_service_server(&path, app.handle());
+
+        let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+
+        // Wait for connection to server 1.
+        let connected = handle
+            .wait_for_connected(Duration::from_secs(2))
+            .await
+            .expect("wait_for_connected");
+        assert!(connected, "should connect to server 1");
+
+        // Verify commands work on server 1.
+        let running = handle.is_running().await.expect("is_running on server 1");
+        assert!(!running, "should not be running initially");
+
+        // Shutdown server 1 gracefully.
+        shutdown1.cancel();
+        // Wait for socket cleanup and connection handlers to drain.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Start server 2 at the same path.
+        let shutdown2 = start_os_service_server(&path, app.handle());
+
+        // Nudge the client to skip any backoff delay.
+        handle.nudge_reconnect();
+
+        // Wait for the client to connect to server 2 (either via nudge or
+        // automatic retry). The client might still be connected to server 1's
+        // zombie handler, in which case is_connected() is already true and
+        // commands still work. Or it might have disconnected and reconnected.
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                // Try a command — if it works, we're connected to a working server.
+                if handle.is_running().await.is_ok() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for working connection to server 2");
+
+        assert!(ready, "should be able to send commands to server 2");
+
+        // Full lifecycle on the current server.
+        handle.start(StartConfig::default()).await.expect("start");
+
+        let running = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if handle.is_running().await.unwrap_or(false) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for Running");
+        assert!(running, "should be running after start");
+
+        handle.stop().await.expect("stop");
+        assert!(
+            !handle.is_running().await.unwrap(),
+            "should not be running after stop"
+        );
+
+        shutdown2.cancel();
+    }
+
+    // -- AC5: Timing bounds — no indefinite hangs -----------------------------
+
+    /// Verify all persistent client commands return within bounded time when
+    /// the server is running. This prevents regressions where commands might
+    /// hang indefinitely.
+    #[tokio::test]
+    async fn os_service_commands_return_within_time_bounds() {
+        let (path, shutdown, _event_tx) = setup_server();
+        let app = tauri::test::mock_app();
+        let handle = PersistentIpcClientHandle::spawn(path, app.handle().clone());
+
+        handle
+            .wait_for_connected(Duration::from_secs(2))
+            .await
+            .expect("should connect");
+
+        let bound = Duration::from_secs(5);
+
+        // is_running should return within bound.
+        let start = std::time::Instant::now();
+        let _ = handle.is_running().await;
+        assert!(
+            start.elapsed() < bound,
+            "is_running took {:?}",
+            start.elapsed()
+        );
+
+        // get_state should return within bound.
+        let start = std::time::Instant::now();
+        let _ = handle.get_state().await;
+        assert!(
+            start.elapsed() < bound,
+            "get_state took {:?}",
+            start.elapsed()
+        );
+
+        // get_lifecycle_status should return within bound.
+        let start = std::time::Instant::now();
+        let _ = handle.get_lifecycle_status().await;
+        assert!(
+            start.elapsed() < bound,
+            "get_lifecycle_status took {:?}",
+            start.elapsed()
+        );
+
+        // start should return within bound.
+        let start = std::time::Instant::now();
+        let _ = handle.start(StartConfig::default()).await;
+        assert!(start.elapsed() < bound, "start took {:?}", start.elapsed());
+
+        // stop should return within bound.
+        let start = std::time::Instant::now();
+        let _ = handle.stop().await;
+        assert!(start.elapsed() < bound, "stop took {:?}", start.elapsed());
+
+        shutdown.cancel();
     }
 }

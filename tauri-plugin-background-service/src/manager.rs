@@ -18,11 +18,11 @@ use tokio_util::sync::CancellationToken;
 use crate::desired_state::DesiredStateBackend;
 use crate::error::ServiceError;
 use crate::models::{
-    validate_foreground_service_type, LifecycleMode, LifecycleState, LifecycleStatus, PluginEvent,
-    ServiceContext, ServiceState as ServiceLifecycle, ServiceStatus, StartConfig, StopReason,
-    ValidationIssue,
+    validate_fg_type_against_allowlist, validate_foreground_service_type, LifecycleMode,
+    LifecycleState, LifecycleStatus, PluginEvent, ServiceContext, ServiceState as ServiceLifecycle,
+    ServiceStatus, StartConfig, StopReason, ValidationIssue,
 };
-use crate::notifier::Notifier;
+use crate::notifier::{Notifier, NotifierPolicy, NotifySink};
 use crate::service_trait::BackgroundService;
 
 /// Callback fired when the service task completes. Receives `true` on success.
@@ -47,9 +47,149 @@ pub(crate) trait MobileKeepalive: Send + Sync {
         ios_earliest_processing_begin_minutes: Option<f64>,
         ios_requires_external_power: Option<bool>,
         ios_requires_network_connectivity: Option<bool>,
+        ios_processing_ceiling_multiplier: Option<f64>,
     ) -> Result<(), ServiceError>;
     /// Stop the OS-specific keepalive.
     fn stop_keepalive(&self) -> Result<(), ServiceError>;
+    /// Whether a `start_keepalive` failure should be treated as a non-fatal
+    /// degraded warning rather than a fatal start rollback (H9).
+    ///
+    /// `true` on iOS: BGTask scheduling can be unavailable (Simulator /
+    /// degraded device) while the in-process Core still runs in the
+    /// foreground — so a scheduling failure leaves the service running and
+    /// surfaces a "scheduling degraded / foreground-only" status. `false`
+    /// (default) on Android/desktop, where a foreground-service denial is a
+    /// genuine start failure that must roll back.
+    fn scheduling_is_advisory(&self) -> bool {
+        false
+    }
+    /// Query the Android native service state from the Kotlin bridge.
+    ///
+    /// Returns `None` on non-Android platforms (iOS, desktop). On Android,
+    /// returns `Some(AndroidServiceState)` with the native service status or
+    /// an error if the bridge call fails.
+    fn get_android_service_state(
+        &self,
+    ) -> Result<Option<crate::models::AndroidServiceState>, ServiceError> {
+        Ok(None)
+    }
+    /// Whether the OS enforces foreground-service *types* (Android only, M5/M6).
+    ///
+    /// Android returns `true`: the 14 valid types are validated
+    /// ([`validate_foreground_service_type`]) and the running service's type can
+    /// be swapped (`remoteMessaging` ↔ `phoneCall`) via the native
+    /// `updateForegroundServiceType` handler. iOS and desktop return `false` —
+    /// neither has an OS foreground-service-type concept, so the type validation
+    /// (M6) and the native type-swap (M5) must NOT run there (calling them on iOS
+    /// only produced missing-native-method error noise). The real
+    /// [`MobileLifecycle`](crate::mobile::MobileLifecycle) override returns
+    /// `cfg!(target_os = "android")`; the host mock lets tests simulate each
+    /// platform. Default `false` (desktop / no bridge attached).
+    fn enforces_foreground_service_type(&self) -> bool {
+        false
+    }
+    /// Swap the foreground service type of the already-running service
+    /// (Android only, spec 08 C6 Step 15): `remoteMessaging` → `phoneCall`
+    /// on answer and back on end, without restarting the headless core.
+    /// Default no-op on non-Android / desktop. The caller additionally gates
+    /// this behind [`enforces_foreground_service_type`](Self::enforces_foreground_service_type)
+    /// so iOS never reaches the native handler (M5).
+    fn update_keepalive_type(&self, _foreground_service_type: &str) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    /// Fire the native incoming-call notification (Android only, spec 08 C6):
+    /// `CallStyle` + full-screen intent when granted, ringtone fallback (F4)
+    /// otherwise. Default no-op on non-Android / desktop.
+    fn show_incoming_call(
+        &self,
+        _call_id: &str,
+        _caller_name: &str,
+        _is_video: bool,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    /// Fire an actionable native message notification. Android implements
+    /// content tap, inline reply, and mark-as-read without requiring the
+    /// webview. Other platforms no-op unless they add a real native handler.
+    #[allow(clippy::too_many_arguments)]
+    fn show_message_notification(
+        &self,
+        _notification_id: i32,
+        _chat_id: &str,
+        _message_id: &str,
+        _title: &str,
+        _body: &str,
+        _route_uri: &str,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    /// Cancel the native incoming-call notification (Android only, spec 08 C6).
+    fn cancel_incoming_call(&self, _call_id: &str) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    /// Set the active call's device audio route (M-NATIVE-3 / CCF-11, Step 11):
+    /// `speaker`/`earpiece`/`bluetooth`/`system`. Android applies it to the live
+    /// self-managed `SilaCallConnection` via `Connection.setAudioRoute`; iOS via
+    /// `AVAudioSession.overrideOutputAudioPort`. Default no-op on non-mobile / desktop.
+    fn set_call_audio_route(&self, _call_id: &str, _route: &str) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    /// Open the OS app-settings screen (M-DIAG-2 / CCF-12, Step 17): Android
+    /// opens the app-details / permission settings; iOS opens
+    /// `UIApplication.openSettingsURLString`. Default no-op on non-mobile / desktop.
+    fn open_app_settings(&self) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    /// Mirror the Rust-authoritative desired state into native persistence
+    /// (H4 / D1). On iOS this writes `desiredRunning` (+ optional
+    /// `last_start_config`) into `UserDefaults` and (re)schedules or cancels
+    /// BGTasks so the intent-only recovery commands have a real, observable
+    /// effect — never a silent `Ok`. Default no-op on non-iOS / desktop, where
+    /// the start/stop keepalive paths (or Kotlin `DurableState`) already own
+    /// native desired-state persistence.
+    fn mirror_desired_state(
+        &self,
+        _desired_running: bool,
+        _last_start_config: Option<&serde_json::Value>,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    /// Query the platform-tagged native authority for reconcile + status (H6).
+    ///
+    /// Default: Android authority via the Kotlin bridge — preserves the
+    /// existing behavior for the Android (and desktop/host-mock) path. iOS
+    /// overrides this to return an [`NativeAuthority::Ios`] snapshot assembled
+    /// from the typed iOS queries, so the status path never round-trips to
+    /// `get_android_service_state` on iOS (L4).
+    fn query_native_state(&self) -> Result<Option<NativeAuthority>, ServiceError> {
+        Ok(self
+            .get_android_service_state()?
+            .map(NativeAuthority::Android))
+    }
+    /// Query the iOS native background-task snapshot (H6).
+    ///
+    /// Returns `None` on non-iOS / desktop. On iOS, assembled from
+    /// `getSchedulingStatus` / `getDesiredStateStatus` / `getPendingBgTask`.
+    /// Consumed by the real iOS `MobileLifecycle::query_native_state` override
+    /// and the host iOS-mock tests; the desktop/Android path uses the
+    /// `query_native_state` default instead.
+    #[allow(dead_code)]
+    fn get_ios_native_state(&self) -> Result<Option<crate::models::IosNativeState>, ServiceError> {
+        Ok(None)
+    }
+}
+
+/// Platform-tagged native authority returned by
+/// [`MobileKeepalive::query_native_state`].
+///
+/// Lets `build_lifecycle_status` / `reconcile_running_with_native` consume the
+/// correct native source per platform without the status path calling
+/// `get_android_service_state` on iOS (L4): `Android` carries the long-lived
+/// foreground-service state; `Ios` carries the BGTask/scheduling snapshot (H6).
+#[allow(dead_code)] // `Ios` is constructed only on iOS / in tests.
+pub(crate) enum NativeAuthority {
+    Android(crate::models::AndroidServiceState),
+    Ios(crate::models::IosNativeState),
 }
 
 /// Type-erased factory: produces a fresh `Box<dyn BackgroundService<R>>` on demand.
@@ -76,6 +216,45 @@ pub enum ManagerCommand<R: Runtime> {
     },
     StopWithReason {
         reason: StopReason,
+        reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
+    /// spec 08 C6 (Step 15): swap the running FGS type (remoteMessaging ↔
+    /// phoneCall) without restarting the headless core.
+    UpdateForegroundServiceType {
+        foreground_service_type: String,
+        reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
+    /// spec 08 C6 (Step 15): fire the native incoming-call notification.
+    NotifyIncomingCall {
+        call_id: String,
+        caller_name: String,
+        is_video: bool,
+        reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
+    /// Fire an actionable native message notification.
+    NotifyMessage {
+        notification_id: i32,
+        chat_id: String,
+        message_id: String,
+        title: String,
+        body: String,
+        route_uri: String,
+        reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
+    /// spec 08 C6 (Step 15): cancel the native incoming-call notification.
+    CancelIncomingCall {
+        call_id: String,
+        reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
+    /// M-NATIVE-3 (Step 11): set the active call's device audio route.
+    SetCallAudioRoute {
+        call_id: String,
+        route: String,
+        reply: oneshot::Sender<Result<(), ServiceError>>,
+    },
+    /// M-DIAG-2 (Step 17): open the OS app-settings screen so the user can grant
+    /// a denied camera/mic permission.
+    OpenAppSettings {
         reply: oneshot::Sender<Result<(), ServiceError>>,
     },
     IsRunning {
@@ -113,6 +292,14 @@ pub enum ManagerCommand<R: Runtime> {
     GetLifecycleStatus {
         desktop_mode: Option<String>,
         reply: oneshot::Sender<LifecycleStatus>,
+    },
+    /// Gracefully drain service-owned state before the host process exits
+    /// (BGS-31, doc-08 Step 9). Sent by the headless SIGTERM/SIGINT handler
+    /// AFTER `Stop`, so a service override can perform a bounded Core-level
+    /// drain instead of the abrupt process-exit `Drop` abort. Appended at the
+    /// END of this `#[non_exhaustive]` enum (contract-compliant, non-breaking).
+    ShutdownGracefully {
+        reply: oneshot::Sender<Result<(), ServiceError>>,
     },
 }
 
@@ -161,6 +348,121 @@ impl<R: Runtime> ServiceManagerHandle<R> {
             .map_err(|_| ServiceError::Runtime("manager actor dropped reply".into()))?
     }
 
+    /// Swap the foreground service type of the running service (spec 08 C6,
+    /// Step 15) — e.g. `remoteMessaging` → `phoneCall` on call answer.
+    ///
+    /// Validates the type against the Android valid-types list and the plugin
+    /// config allowlist, then forwards to the mobile bridge. Returns
+    /// `NotRunning` if no service is active. No-op (Ok) on desktop.
+    pub async fn update_foreground_service_type(
+        &self,
+        foreground_service_type: String,
+    ) -> Result<(), ServiceError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ManagerCommand::UpdateForegroundServiceType {
+                foreground_service_type,
+                reply,
+            })
+            .await
+            .map_err(|_| ServiceError::Runtime("manager actor shut down".into()))?;
+        rx.await
+            .map_err(|_| ServiceError::Runtime("manager actor dropped reply".into()))?
+    }
+
+    /// Fire the native incoming-call notification (spec 08 C6, Step 15).
+    pub async fn notify_incoming_call(
+        &self,
+        call_id: String,
+        caller_name: String,
+        is_video: bool,
+    ) -> Result<(), ServiceError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ManagerCommand::NotifyIncomingCall {
+                call_id,
+                caller_name,
+                is_video,
+                reply,
+            })
+            .await
+            .map_err(|_| ServiceError::Runtime("manager actor shut down".into()))?;
+        rx.await
+            .map_err(|_| ServiceError::Runtime("manager actor dropped reply".into()))?
+    }
+
+    /// Fire an actionable native message notification.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn notify_message(
+        &self,
+        notification_id: i32,
+        chat_id: String,
+        message_id: String,
+        title: String,
+        body: String,
+        route_uri: String,
+    ) -> Result<(), ServiceError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ManagerCommand::NotifyMessage {
+                notification_id,
+                chat_id,
+                message_id,
+                title,
+                body,
+                route_uri,
+                reply,
+            })
+            .await
+            .map_err(|_| ServiceError::Runtime("manager actor shut down".into()))?;
+        rx.await
+            .map_err(|_| ServiceError::Runtime("manager actor dropped reply".into()))?
+    }
+
+    /// Cancel the native incoming-call notification (spec 08 C6, Step 15).
+    pub async fn cancel_incoming_call(&self, call_id: String) -> Result<(), ServiceError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ManagerCommand::CancelIncomingCall { call_id, reply })
+            .await
+            .map_err(|_| ServiceError::Runtime("manager actor shut down".into()))?;
+        rx.await
+            .map_err(|_| ServiceError::Runtime("manager actor dropped reply".into()))?
+    }
+
+    /// Set the active call's device audio route (M-NATIVE-3 / CCF-11, Step 11).
+    pub async fn set_call_audio_route(
+        &self,
+        call_id: String,
+        route: String,
+    ) -> Result<(), ServiceError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ManagerCommand::SetCallAudioRoute {
+                call_id,
+                route,
+                reply,
+            })
+            .await
+            .map_err(|_| ServiceError::Runtime("manager actor shut down".into()))?;
+        rx.await
+            .map_err(|_| ServiceError::Runtime("manager actor dropped reply".into()))?
+    }
+
+    /// Open the OS app-settings screen (M-DIAG-2 / CCF-12, Step 17) so the user
+    /// can grant a denied camera/mic permission. Forwards to the native plugin
+    /// (Android settings intent / iOS `openSettingsURLString`); a no-op when no
+    /// mobile bridge is attached.
+    pub async fn open_app_settings(&self) -> Result<(), ServiceError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ManagerCommand::OpenAppSettings { reply })
+            .await
+            .map_err(|_| ServiceError::Runtime("manager actor shut down".into()))?;
+        rx.await
+            .map_err(|_| ServiceError::Runtime("manager actor dropped reply".into()))?
+    }
+
     /// Stop the running background service synchronously.
     ///
     /// Uses `blocking_send` so this can be called from synchronous contexts
@@ -184,6 +486,23 @@ impl<R: Runtime> ServiceManagerHandle<R> {
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
             .send(ManagerCommand::StopWithReason { reason, reply })
+            .await
+            .map_err(|_| ServiceError::Runtime("manager actor shut down".into()))?;
+        rx.await
+            .map_err(|_| ServiceError::Runtime("manager actor dropped reply".into()))?
+    }
+
+    /// Gracefully drain service-owned state before exit (BGS-31, doc-08 Step 9).
+    ///
+    /// Sends a `ShutdownGracefully` command that drives the registered
+    /// service's [`BackgroundService::shutdown_gracefully`] hook (a bounded
+    /// Core-level drain). Intended to be sent AFTER [`stop`](Self::stop) from
+    /// the headless SIGTERM/SIGINT handler, so the bookkeeping `Stop` and the
+    /// bounded drain both complete before the IPC token is cancelled.
+    pub async fn shutdown_gracefully(&self) -> Result<(), ServiceError> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ManagerCommand::ShutdownGracefully { reply })
             .await
             .map_err(|_| ServiceError::Runtime("manager actor shut down".into()))?;
         rx.await
@@ -290,6 +609,9 @@ struct ServiceState<R: Runtime> {
     factory: ServiceFactory<R>,
     /// Mobile keepalive handle. Set via `SetMobile` command on mobile platforms.
     mobile: Option<Arc<dyn MobileKeepalive>>,
+    /// Last `AppHandle` provided by a `Start` command.
+    /// Used for event emission during merge (degraded-state detection).
+    app: Option<AppHandle<R>>,
     /// iOS safety timeout in seconds (from PluginConfig, default 28.0).
     /// Passed to mobile via `start_keepalive`. Android ignores this field.
     ios_safety_timeout_secs: f64,
@@ -305,17 +627,38 @@ struct ServiceState<R: Runtime> {
     ios_requires_external_power: bool,
     /// iOS BGProcessingTask requires network connectivity (default false).
     ios_requires_network_connectivity: bool,
+    /// iOS adaptive processing ceiling multiplier (default 4.0).
+    /// Bounds the Swift adaptive scheduler's back-off for the processing task.
+    ios_processing_ceiling_multiplier: f64,
     /// Current lifecycle state of the service.
     /// Shared with spawned task for transitions (Initializing→Running→Stopped).
     lifecycle_state: Arc<Mutex<ServiceLifecycle>>,
     /// Last error message from init/run failure.
     /// Shared with spawned task for error capture.
     last_error: Arc<Mutex<Option<String>>>,
+    /// Set by `handle_start` when an *advisory* (iOS BGTask) `start_keepalive`
+    /// fails: the Core keeps running in the foreground but background scheduling
+    /// is unavailable. Surfaced by `build_lifecycle_status` as a distinct
+    /// "scheduling degraded / foreground-only" status (H9). Cleared on the next
+    /// start attempt and on stop.
+    scheduling_degraded: Arc<Mutex<Option<String>>>,
     /// Desired-state persistence backend.
     /// `None` on platforms that haven't set one up yet.
     desired_state: Option<Arc<dyn DesiredStateBackend>>,
     /// Current platform's lifecycle mode (FGS, BGTask, in-process, OS-service).
     lifecycle_mode: LifecycleMode,
+    /// Android foreground service types allowed by plugin config.
+    /// Used by `handle_start` to validate before calling mobile start.
+    android_fg_service_types: Vec<String>,
+    /// Whether to validate the requested foreground service type against
+    /// `android_fg_service_types` before starting the native service.
+    android_validate_fg_type: bool,
+    /// Which lifecycle notifications are enabled, derived from PluginConfig
+    /// per DEC-002 (Android suppression). Default: everything off.
+    notifier_policy: NotifierPolicy,
+    /// Notification dispatch seam. `None` when no notification-capable
+    /// app handle is available (headless daemon, tests without a sink).
+    notify_sink: Option<Arc<dyn NotifySink>>,
 }
 
 // ─── Actor Loop ────────────────────────────────────────────────────────
@@ -344,8 +687,40 @@ pub async fn manager_loop<R: Runtime>(
     ios_requires_external_power: bool,
     // iOS BGProcessingTask requires network connectivity. From PluginConfig.
     ios_requires_network_connectivity: bool,
+    // iOS adaptive processing ceiling multiplier. From PluginConfig.
+    // Default: 4.0. Bounds the Swift adaptive scheduler's back-off.
+    ios_processing_ceiling_multiplier: f64,
     // Desired-state persistence backend. None if not configured.
     desired_state_backend: Option<Arc<dyn DesiredStateBackend>>,
+    // Android foreground service type allowlist from PluginConfig.
+    android_fg_service_types: Vec<String>,
+    // Whether to validate foreground service type against the allowlist.
+    android_validate_fg_type: bool,
+    // Lifecycle-notification policy derived from PluginConfig (D1, DEC-002).
+    // Default: everything off.
+    notifier_policy: NotifierPolicy,
+    // Notification dispatch seam. None if no notification-capable app
+    // handle exists at spawn (headless daemon, tests without a sink).
+    notify_sink: Option<Arc<dyn NotifySink>>,
+    // BGS-05 Leg B: an optional AppHandle for boot Start-replay. When `Some`
+    // AND desktop lifecycle mode AND the persisted desired-state says
+    // `desired_running`, the loop replays a `Start` on entry via `handle_start`
+    // (the SAME path a runtime `ManagerCommand::Start` takes — minus the IPC
+    // reply). `None` for GUI in-process + IPC-client callers (no boot-replay).
+    boot_app: Option<AppHandle<R>>,
+    // BGS-05 re-fix (Critic Blocker 2 — Leg A/Leg B coordination): the boot
+    // Start-replay fires ONLY when the Sila app's consent policy allows
+    // auto-unlock (`consent.enabled && consent.auto_unlock`, computed LIVE in
+    // `run_headless` and threaded through `headless_main_with_desired_state`).
+    // Before this, the replay guard was `desired_running`-ONLY — consent-blind —
+    // so consent OFF + credential on disk + `desired_running=true` replayed a
+    // Start that reached the (then consent-UN-aware) `start_headless_core` and
+    // unlocked unattended. This is belt-and-suspenders alongside F3 (the
+    // load-bearing builder gate in `start_headless_core`): `false` here simply
+    // suppresses the spurious replay; F3 LIVE-reads consent regardless. GUI
+    // in-process + IPC-client callers pass `false` (they set `boot_app = None`
+    // so the replay short-circuits anyway).
+    consent_allows_auto_unlock: bool,
 ) {
     let lifecycle_mode = {
         #[cfg(target_os = "android")]
@@ -369,17 +744,70 @@ pub async fn manager_loop<R: Runtime>(
         on_complete: None,
         factory,
         mobile: None,
+        app: None,
         ios_safety_timeout_secs,
         ios_processing_safety_timeout_secs,
         ios_earliest_refresh_begin_minutes,
         ios_earliest_processing_begin_minutes,
         ios_requires_external_power,
         ios_requires_network_connectivity,
+        ios_processing_ceiling_multiplier,
         lifecycle_state: Arc::new(Mutex::new(ServiceLifecycle::Idle)),
         last_error: Arc::new(Mutex::new(None)),
+        scheduling_degraded: Arc::new(Mutex::new(None)),
         desired_state: desired_state_backend,
         lifecycle_mode,
+        android_fg_service_types,
+        android_validate_fg_type,
+        notifier_policy,
+        notify_sink,
     };
+
+    // BGS-05 Leg B: replay a Start on boot if the user last left the service
+    // desired-running (desktop only; Android/iOS use their own native resubmit
+    // at the platform layer). The dispatch IS `handle_start`, the same path a
+    // runtime `ManagerCommand::Start` takes.
+    //
+    // BGS-05 re-fix (Critic Blocker 2): the replay is ALSO gated on
+    // `consent_allows_auto_unlock` (threaded LIVE from `run_headless`'s consent
+    // read) — consent OFF ⇒ no replay ⇒ no boot-reachable Start. The original
+    // guard was `desired_running`-only (consent-blind), which combined with the
+    // then-ungated `start_headless_core` unlocked the daemon unattended with
+    // consent OFF. F3 (`start_headless_core`'s LIVE consent gate) is the
+    // load-bearing backstop; this coordination suppresses the spurious replay
+    // and keeps Leg A (boot_restore_core) + Leg B (this replay) acting on the
+    // SAME consent decision.
+    if matches!(
+        state.lifecycle_mode,
+        LifecycleMode::DesktopInProcess | LifecycleMode::DesktopOsService
+    ) && boot_app.is_some()
+        && consent_allows_auto_unlock
+    {
+        if let Some(ref backend) = state.desired_state {
+            if let Ok(ds) = backend.load() {
+                if should_replay_on_boot(&ds) {
+                    if let Some(app) = boot_app.as_ref() {
+                        let config = ds
+                            .last_start_config
+                            .as_ref()
+                            .and_then(|v| serde_json::from_value::<StartConfig>(v.clone()).ok());
+                        if let Some(config) = config {
+                            match handle_start(&mut state, app.clone(), config) {
+                                Ok(()) => {
+                                    log::info!(
+                                        "BGS-05: replayed Start on boot (desired_running=true)"
+                                    );
+                                }
+                                Err(e) => {
+                                    log::warn!("BGS-05: boot Start-replay failed: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
@@ -392,8 +820,77 @@ pub async fn manager_loop<R: Runtime>(
             ManagerCommand::StopWithReason { reason, reply } => {
                 let _ = reply.send(handle_stop_with_reason(&mut state, reason));
             }
+            ManagerCommand::ShutdownGracefully { reply } => {
+                // BGS-31 (doc-08 Step 9): bounded Core-level drain driven from
+                // the SIGTERM/SIGINT handler. The service override reaches
+                // process-wide state (the Sila Core) through `ctx.app`; the
+                // running service task is owned by a spawned task and is not
+                // reachable here, so `handle_shutdown_gracefully` constructs a
+                // fresh service via the factory + a context from the last
+                // `AppHandle` and invokes the hook on it.
+                let result = handle_shutdown_gracefully(&mut state).await;
+                let _ = reply.send(result);
+            }
+            ManagerCommand::UpdateForegroundServiceType {
+                foreground_service_type,
+                reply,
+            } => {
+                let _ = reply.send(handle_update_foreground_service_type(
+                    &mut state,
+                    foreground_service_type,
+                ));
+            }
+            ManagerCommand::NotifyIncomingCall {
+                call_id,
+                caller_name,
+                is_video,
+                reply,
+            } => {
+                let _ = reply.send(handle_notify_incoming_call(
+                    &state,
+                    call_id,
+                    caller_name,
+                    is_video,
+                ));
+            }
+            ManagerCommand::NotifyMessage {
+                notification_id,
+                chat_id,
+                message_id,
+                title,
+                body,
+                route_uri,
+                reply,
+            } => {
+                let _ = reply.send(handle_notify_message(
+                    &state,
+                    notification_id,
+                    chat_id,
+                    message_id,
+                    title,
+                    body,
+                    route_uri,
+                ));
+            }
+            ManagerCommand::CancelIncomingCall { call_id, reply } => {
+                let _ = reply.send(handle_cancel_incoming_call(&state, call_id));
+            }
+            ManagerCommand::SetCallAudioRoute {
+                call_id,
+                route,
+                reply,
+            } => {
+                let _ = reply.send(handle_set_call_audio_route(&state, call_id, route));
+            }
+            ManagerCommand::OpenAppSettings { reply } => {
+                let _ = reply.send(handle_open_app_settings(&state));
+            }
             ManagerCommand::IsRunning { reply } => {
-                let _ = reply.send(state.is_running.load(Ordering::SeqCst));
+                // Native `LifecycleService.isRunning` is the single source of
+                // truth (R-W1.4): reconcile the actor's belief before reporting
+                // so a stop/timeout with the UI closed can never surface a stale
+                // "running" (closes the split-brain window — harness Scenario 8).
+                let _ = reply.send(reconcile_running_with_native(&state));
             }
             ManagerCommand::SetOnComplete { callback } => {
                 state.on_complete = Some(callback);
@@ -449,8 +946,7 @@ pub async fn manager_loop<R: Runtime>(
                 let _ = reply.send(handle_get_desired_state(&state));
             }
             ManagerCommand::NativeLifecycleEvent { event, reply } => {
-                let reason = event.to_stop_reason();
-                let _ = reply.send(handle_stop_with_reason(&mut state, reason));
+                let _ = reply.send(handle_native_lifecycle_event(&mut state, event));
             }
             ManagerCommand::GetLifecycleStatus {
                 desktop_mode,
@@ -477,18 +973,39 @@ fn handle_start<R: Runtime>(
     app: AppHandle<R>,
     config: StartConfig,
 ) -> Result<(), ServiceError> {
+    log::info!("handle_start: entry (label={})", config.service_label);
+
+    // Store the app handle for event emission during merge.
+    state.app = Some(app.clone());
+
     let mut guard = state.token.lock().unwrap();
 
     if guard.is_some() {
         return Err(ServiceError::AlreadyRunning);
     }
 
-    // Validate foreground service type against the allowlist.
-    // Only relevant on mobile (Android foreground service types).
-    // On desktop the type is ignored — no OS enforcement mechanism.
-    if cfg!(mobile) {
+    // Validate foreground service type against the 14 valid Android types.
+    // Only relevant where the OS enforces foreground-service types — i.e.
+    // Android (M6). iOS has no FGS-type concept, and on desktop the type is
+    // ignored (no OS enforcement mechanism), so both skip this. Gated through
+    // the bridge so the decision is platform-accurate and host-testable.
+    if state
+        .mobile
+        .as_ref()
+        .is_some_and(|m| m.enforces_foreground_service_type())
+    {
         validate_foreground_service_type(&config.foreground_service_type)?;
     }
+
+    // Validate against plugin config allowlist (all platforms).
+    // This is the user-configured restriction: even if a type is valid
+    // (one of the 14 Android types), it must also be in the plugin's
+    // android_foreground_service_types list.
+    validate_fg_type_against_allowlist(
+        &config.foreground_service_type,
+        &state.android_fg_service_types,
+        state.android_validate_fg_type,
+    )?;
 
     let token = CancellationToken::new();
     let shutdown = token.clone();
@@ -497,6 +1014,8 @@ fn handle_start<R: Runtime>(
     state.is_running.store(true, Ordering::SeqCst);
     *state.lifecycle_state.lock().unwrap() = ServiceLifecycle::Initializing;
     *state.last_error.lock().unwrap() = None;
+    // Clear any prior advisory scheduling-degraded marker for this fresh start.
+    *state.scheduling_degraded.lock().unwrap() = None;
 
     drop(guard);
 
@@ -505,7 +1024,16 @@ fn handle_start<R: Runtime>(
     let captured_callback = state.on_complete.take();
 
     // Start mobile keepalive AFTER AlreadyRunning check.
-    // On failure: rollback (clear token, restore callback).
+    //
+    // On Android/desktop a keepalive failure is fatal: rollback (clear token,
+    // restore callback) and propagate the error.
+    //
+    // On iOS (H9), BGTask scheduling is *advisory* — it can be unavailable on
+    // the Simulator / a degraded device while the in-process Core still runs in
+    // the foreground. There a failure must NOT roll back the service: record a
+    // distinct "scheduling degraded / foreground-only" marker, emit a non-fatal
+    // warning, and fall through to spawn the Core anyway.
+
     if let Some(ref mobile) = state.mobile {
         let processing_timeout = if state.ios_processing_safety_timeout_secs > 0.0 {
             Some(state.ios_processing_safety_timeout_secs)
@@ -521,14 +1049,34 @@ fn handle_start<R: Runtime>(
             Some(state.ios_earliest_processing_begin_minutes),
             Some(state.ios_requires_external_power),
             Some(state.ios_requires_network_connectivity),
+            Some(state.ios_processing_ceiling_multiplier),
         ) {
-            // Rollback: clear the token we just set.
-            state.token.lock().unwrap().take();
-            state.is_running.store(false, Ordering::SeqCst);
-            *state.lifecycle_state.lock().unwrap() = ServiceLifecycle::Idle;
-            // Rollback: restore the callback we took.
-            state.on_complete = captured_callback;
-            return Err(e);
+            if mobile.scheduling_is_advisory() {
+                // Non-fatal: the Core still starts in the foreground; only
+                // background scheduling is degraded.
+                log::warn!(
+                    "start_keepalive: advisory scheduling unavailable ({e}); \
+                     starting Core foreground-only (degraded)"
+                );
+                *state.scheduling_degraded.lock().unwrap() = Some(e.to_string());
+                let _ = app.emit(
+                    "background-service:state-degraded",
+                    serde_json::json!({
+                        "degraded": true,
+                        "reason": "scheduling_degraded_foreground_only",
+                        "error": e.to_string(),
+                    }),
+                );
+                // Fall through: do NOT roll back.
+            } else {
+                // Rollback: clear the token we just set.
+                state.token.lock().unwrap().take();
+                state.is_running.store(false, Ordering::SeqCst);
+                *state.lifecycle_state.lock().unwrap() = ServiceLifecycle::Idle;
+                // Rollback: restore the callback we took.
+                state.on_complete = captured_callback;
+                return Err(e);
+            }
         }
     }
 
@@ -563,18 +1111,24 @@ fn handle_start<R: Runtime>(
                     message: e.to_string(),
                 },
             );
-            // Clear token only if generation hasn't advanced.
-            if gen_ref.load(Ordering::Acquire) == my_gen {
-                token_ref.lock().unwrap().take();
-                is_running_ref.store(false, Ordering::SeqCst);
-                // Initializing → Stopped on init failure.
-                {
-                    let mut lc = lifecycle_ref.lock().unwrap();
-                    if *lc == ServiceLifecycle::Initializing {
-                        *lc = ServiceLifecycle::Stopped;
+            // Clear token only if generation hasn't advanced. Hold the token
+            // lock across the generation check so a concurrent handle_start —
+            // which bumps the generation while holding this same lock — cannot
+            // have its freshly installed token taken by this stale task.
+            {
+                let mut tok = token_ref.lock().unwrap();
+                if gen_ref.load(Ordering::Acquire) == my_gen {
+                    tok.take();
+                    is_running_ref.store(false, Ordering::SeqCst);
+                    // Initializing → Stopped on init failure.
+                    {
+                        let mut lc = lifecycle_ref.lock().unwrap();
+                        if *lc == ServiceLifecycle::Initializing {
+                            *lc = ServiceLifecycle::Stopped;
+                        }
                     }
+                    *last_error_ref.lock().unwrap() = Some(e.to_string());
                 }
-                *last_error_ref.lock().unwrap() = Some(e.to_string());
             }
             // Fire callback with false on init failure.
             if let Some(cb) = captured_callback {
@@ -624,22 +1178,29 @@ fn handle_start<R: Runtime>(
             cb(result.is_ok());
         }
 
-        // Clear token only if generation hasn't advanced.
-        if gen_ref.load(Ordering::Acquire) == my_gen {
-            token_ref.lock().unwrap().take();
-            is_running_ref.store(false, Ordering::SeqCst);
-            // → Stopped on run completion (generation guarded).
-            {
-                let mut lc = lifecycle_ref.lock().unwrap();
-                if matches!(
-                    *lc,
-                    ServiceLifecycle::Initializing | ServiceLifecycle::Running
-                ) {
-                    *lc = ServiceLifecycle::Stopped;
+        // Clear token only if generation hasn't advanced. Hold the token lock
+        // across the generation check so a concurrent handle_start — which bumps
+        // the generation while holding this same lock — cannot have its freshly
+        // installed token taken by this stale task. Without this, a restart that
+        // races this cleanup loses its token and the next stop sees NotRunning.
+        {
+            let mut tok = token_ref.lock().unwrap();
+            if gen_ref.load(Ordering::Acquire) == my_gen {
+                tok.take();
+                is_running_ref.store(false, Ordering::SeqCst);
+                // → Stopped on run completion (generation guarded).
+                {
+                    let mut lc = lifecycle_ref.lock().unwrap();
+                    if matches!(
+                        *lc,
+                        ServiceLifecycle::Initializing | ServiceLifecycle::Running
+                    ) {
+                        *lc = ServiceLifecycle::Stopped;
+                    }
                 }
-            }
-            if let Err(ref e) = result {
-                *last_error_ref.lock().unwrap() = Some(e.to_string());
+                if let Err(ref e) = result {
+                    *last_error_ref.lock().unwrap() = Some(e.to_string());
+                }
             }
         }
     });
@@ -658,13 +1219,50 @@ fn handle_stop<R: Runtime>(state: &mut ServiceState<R>) -> Result<(), ServiceErr
     handle_stop_with_reason(state, StopReason::UserStop)
 }
 
+/// Handle a `ShutdownGracefully` command (BGS-31, doc-08 Step 9).
+///
+/// Builds a fresh service instance via the factory + a [`ServiceContext`] from
+/// the last `AppHandle` provided to `Start`, and invokes the service's
+/// [`BackgroundService::shutdown_gracefully`] hook. The running service task is
+/// owned by a spawned task and is not reachable from the actor loop; the hook
+/// is intentionally STATELESS w.r.t. the instance — an override reaches
+/// process-wide state (the Sila `Core`) through `ctx.app.state::<AppState>()`,
+/// so invoking it on a fresh factory instance is equivalent to invoking it on
+/// the running one.
+///
+/// Tolerates Core-absent / no-app: `state.app` is `None` until a `Start`
+/// supplies an `AppHandle`, and the headless daemon's `AppState` is locked at
+/// boot. If no `AppHandle` is available there is nothing to drain, so this
+/// returns `Ok(())` (never panics). This is the bounded-drain path; it does
+/// NOT reshape `Core::drop`.
+async fn handle_shutdown_gracefully<R: Runtime>(
+    state: &mut ServiceState<R>,
+) -> Result<(), ServiceError> {
+    let Some(app) = state.app.clone() else {
+        // No AppHandle ever provided (no Start happened): nothing to drain.
+        return Ok(());
+    };
+    let mut service = (state.factory)();
+    let ctx = ServiceContext {
+        notifier: Notifier { app: app.clone() },
+        app,
+        shutdown: CancellationToken::new(),
+        #[cfg(mobile)]
+        service_label: String::new(),
+        #[cfg(mobile)]
+        foreground_service_type: String::new(),
+    };
+    service.shutdown_gracefully(&ctx).await
+}
+
 /// Handle a `StopWithReason` command.
 ///
 /// Like `handle_stop` but applies a reason-based desired-state policy:
 /// - Clears desired state for intentional stops: `UserStop`, `AppStop`,
 ///   `NativeNotificationStop`, `TaskCompleted`.
-/// - Preserves desired state for platform/error reasons: `PlatformTimeout`,
-///   `PlatformExpiration`, `OsRestart`, `BootRecovery`, `Error`.
+/// - Preserves desired state for platform/error/exit reasons: `PlatformTimeout`,
+///   `PlatformExpiration`, `OsRestart`, `BootRecovery`, `Error`, `ProcessExit`.
+///   A `PlatformTimeout` additionally re-submits native scheduling (M13).
 fn handle_stop_with_reason<R: Runtime>(
     state: &mut ServiceState<R>,
     reason: StopReason,
@@ -676,6 +1274,9 @@ fn handle_stop_with_reason<R: Runtime>(
             state.is_running.store(false, Ordering::SeqCst);
             *state.lifecycle_state.lock().unwrap() = ServiceLifecycle::Stopped;
             *state.last_error.lock().unwrap() = None;
+            // Clear any advisory scheduling-degraded marker (H9): once stopped,
+            // foreground-only degradation no longer applies.
+            *state.scheduling_degraded.lock().unwrap() = None;
             drop(guard);
             if should_stop_keepalive(reason) {
                 if let Some(ref mobile) = state.mobile {
@@ -686,11 +1287,189 @@ fn handle_stop_with_reason<R: Runtime>(
             }
             if should_clear_desired_state(reason) {
                 save_desired_running(state, false, None);
+            } else if should_reconcile_resubmit(reason) {
+                // M13 reconcile: a cancel-listener PlatformTimeout paused the
+                // service but `desired_running` survives. Surface the degraded
+                // state and re-submit native scheduling (on iOS this reschedules
+                // the BGTask) so background delivery resumes instead of silently
+                // dying. No-op on desktop / when desired_running is false.
+                if let Some(ds) = state.desired_state.as_ref().and_then(|b| b.load().ok()) {
+                    if ds.desired_running {
+                        log::warn!(
+                            "background service degraded after platform timeout; \
+                             desired_running=true — re-submitting native scheduling"
+                        );
+                        let config: Option<StartConfig> = ds
+                            .last_start_config
+                            .as_ref()
+                            .and_then(|v| serde_json::from_value(v.clone()).ok());
+                        mirror_desired_to_native(state, true, config.as_ref());
+                    }
+                }
+            }
+            // D1 timeout fire point: policy gate first, then the sink.
+            if state.notifier_policy.on_timeout && should_notify_timeout(reason) {
+                if let Some(ref sink) = state.notify_sink {
+                    sink.notify(
+                        "bg-timeout",
+                        "Sila background service paused",
+                        "The OS paused background delivery; it will resume automatically.",
+                    );
+                }
             }
             Ok(())
         }
         None => Err(ServiceError::NotRunning),
     }
+}
+
+/// Handle `UpdateForegroundServiceType` (spec 08 C6, Step 15).
+///
+/// Validates the type against the Android valid-types list (mobile) and the
+/// plugin config allowlist (all platforms), then forwards to the mobile bridge
+/// to swap the running FGS type (e.g. `remoteMessaging` → `phoneCall`) without
+/// restarting the headless core. Returns `NotRunning` if no service is active.
+fn handle_update_foreground_service_type<R: Runtime>(
+    state: &mut ServiceState<R>,
+    foreground_service_type: String,
+) -> Result<(), ServiceError> {
+    let running = state.token.lock().unwrap().is_some();
+    if !running {
+        return Err(ServiceError::NotRunning);
+    }
+    // Mirror handle_start's validation ordering. The 14-type validation and the
+    // native type-swap are Android-only (M5/M6): iOS has no FGS-type concept, so
+    // neither runs there. The plugin-config allowlist check stays all-platform.
+    let enforces = state
+        .mobile
+        .as_ref()
+        .is_some_and(|m| m.enforces_foreground_service_type());
+    if enforces {
+        validate_foreground_service_type(&foreground_service_type)?;
+    }
+    validate_fg_type_against_allowlist(
+        &foreground_service_type,
+        &state.android_fg_service_types,
+        state.android_validate_fg_type,
+    )?;
+    if enforces {
+        if let Some(ref mobile) = state.mobile {
+            // The token stays; only the FGS *type* swaps.
+            mobile.update_keepalive_type(&foreground_service_type)?;
+        }
+    }
+    Ok(())
+}
+
+/// Handle `NotifyIncomingCall` (spec 08 C6, Step 15): fire the native
+/// incoming-call notification. No-op (Ok) when no mobile bridge is attached.
+fn handle_notify_incoming_call<R: Runtime>(
+    state: &ServiceState<R>,
+    call_id: String,
+    caller_name: String,
+    is_video: bool,
+) -> Result<(), ServiceError> {
+    if let Some(ref mobile) = state.mobile {
+        mobile.show_incoming_call(&call_id, &caller_name, is_video)?;
+    }
+    Ok(())
+}
+
+/// Handle `NotifyMessage`: fire an actionable native message notification. No-op
+/// when no mobile bridge is attached.
+#[allow(clippy::too_many_arguments)]
+fn handle_notify_message<R: Runtime>(
+    state: &ServiceState<R>,
+    notification_id: i32,
+    chat_id: String,
+    message_id: String,
+    title: String,
+    body: String,
+    route_uri: String,
+) -> Result<(), ServiceError> {
+    if let Some(ref mobile) = state.mobile {
+        mobile.show_message_notification(
+            notification_id,
+            &chat_id,
+            &message_id,
+            &title,
+            &body,
+            &route_uri,
+        )?;
+    }
+    Ok(())
+}
+
+/// Handle `CancelIncomingCall` (spec 08 C6, Step 15).
+fn handle_cancel_incoming_call<R: Runtime>(
+    state: &ServiceState<R>,
+    call_id: String,
+) -> Result<(), ServiceError> {
+    if let Some(ref mobile) = state.mobile {
+        mobile.cancel_incoming_call(&call_id)?;
+    }
+    Ok(())
+}
+
+/// Handle `SetCallAudioRoute` (M-NATIVE-3 / CCF-11, Step 11): set the active
+/// call's device audio route. No-op (Ok) when no mobile bridge is attached.
+fn handle_set_call_audio_route<R: Runtime>(
+    state: &ServiceState<R>,
+    call_id: String,
+    route: String,
+) -> Result<(), ServiceError> {
+    if let Some(ref mobile) = state.mobile {
+        mobile.set_call_audio_route(&call_id, &route)?;
+    }
+    Ok(())
+}
+
+/// Handle `OpenAppSettings` (M-DIAG-2 / CCF-12, Step 17): open the OS
+/// app-settings screen. No-op (Ok) when no mobile bridge is attached.
+fn handle_open_app_settings<R: Runtime>(state: &ServiceState<R>) -> Result<(), ServiceError> {
+    if let Some(ref mobile) = state.mobile {
+        mobile.open_app_settings()?;
+    }
+    Ok(())
+}
+
+/// Handle a `NativeLifecycleEvent` command.
+///
+/// Recovery-acceptance events (an OsRestart/BootRecovery start the native
+/// layer ACCEPTED) are not stops: they fire the policy-gated `bg-recovery`
+/// notification and leave the actor's run state alone — the native layer
+/// owns that restart. Every other event maps to a stop reason and delegates
+/// to [`handle_stop_with_reason`].
+fn handle_native_lifecycle_event<R: Runtime>(
+    state: &mut ServiceState<R>,
+    event: crate::models::NativeLifecycleEvent,
+) -> Result<(), ServiceError> {
+    if event.is_recovery_acceptance() {
+        // D1 recovery fire point: policy gate first, then the sink.
+        if state.notifier_policy.on_recovery {
+            if let Some(ref sink) = state.notify_sink {
+                sink.notify(
+                    "bg-recovery",
+                    "Sila background service restored",
+                    "Background delivery restored.",
+                );
+            }
+        }
+        return Ok(());
+    }
+    handle_stop_with_reason(state, event.to_stop_reason())
+}
+
+/// BGS-05 Leg B: whether the manager should replay a `Start` on boot from the
+/// persisted desired-state.
+///
+/// Pure (host-testable). The desktop lifecycle gate + the `handle_start`
+/// dispatch live in `manager_loop`'s pre-loop block; mobile uses its own native
+/// resubmit at the platform layer. Consent is the Sila app's concern (Leg A) —
+/// this fn is `desired_running`-only. NV-MUT (force `false`) REDs only the
+/// replay test; NV-MUT (force `true`) REDs the no-replay guards.
+fn should_replay_on_boot(ds: &crate::desired_state::DesiredState) -> bool {
+    ds.desired_running
 }
 
 /// Returns `true` if the given stop reason should clear the desired-state
@@ -707,11 +1486,43 @@ fn should_clear_desired_state(reason: StopReason) -> bool {
     )
 }
 
+/// Returns `true` if the "paused, will resume" timeout notification should
+/// fire for the given stop reason: a platform pause (timeout/expiration)
+/// whose desired state survives so recovery will restart the service.
+/// Reuses [`should_clear_desired_state`] for the recoverable classification
+/// rather than re-mapping reasons.
+fn should_notify_timeout(reason: StopReason) -> bool {
+    !should_clear_desired_state(reason)
+        && matches!(
+            reason,
+            StopReason::PlatformTimeout | StopReason::PlatformExpiration
+        )
+}
+
 /// Returns `true` if `stop_keepalive` should be called for the given reason.
-/// `PlatformExpiration` is skipped because the OS has already killed the
-/// background task — calling stop_keepalive would be redundant.
+///
+/// Platform pauses and OS-driven exits are skipped because the OS has already
+/// paused/killed the background window — tearing down the keepalive would be
+/// redundant and, on iOS, would cancel the BGTask schedule recovery still needs:
+/// - `PlatformExpiration`: the BGTask expiration handler already fired.
+/// - `PlatformTimeout` (M13): the cancel-listener safety timeout / Android FGS
+///   timeout — the OS owns the pause; keep the schedule so delivery resumes.
+/// - `ProcessExit` (H2): the host process is exiting; the BGTask schedule must
+///   survive so a future launch resumes background delivery.
 fn should_stop_keepalive(reason: StopReason) -> bool {
-    !matches!(reason, StopReason::PlatformExpiration)
+    !matches!(
+        reason,
+        StopReason::PlatformExpiration | StopReason::PlatformTimeout | StopReason::ProcessExit
+    )
+}
+
+/// Returns `true` if a stop should trigger a reconcile re-submit of native
+/// scheduling (M13). A cancel-listener `PlatformTimeout` pauses the service while
+/// `desired_running` survives; without re-submitting the BGTask schedule the
+/// background delivery would silently end. Other preserve-desired reasons keep
+/// their existing schedule (nothing was torn down), so they need no re-submit.
+fn should_reconcile_resubmit(reason: StopReason) -> bool {
+    matches!(reason, StopReason::PlatformTimeout)
 }
 
 // ─── Desired-State Helpers ──────────────────────────────────────────────
@@ -751,6 +1562,28 @@ fn save_desired_running<R: Runtime>(
     }
 }
 
+/// Mirror the Rust-authoritative desired state into native persistence (H4/D1).
+///
+/// Called by the intent-only recovery commands (`SetDesiredRunning`,
+/// `EnableAutoRestart`, `DisableAutoRestart`) so that on iOS they update
+/// `UserDefaults` + BGTask scheduling instead of silently no-op'ing. The actual
+/// start/stop paths are NOT mirrored here — they already reach native via
+/// `start_keepalive`/`stop_keepalive`, so mirroring there would re-schedule
+/// redundantly. No-op when no mobile bridge is present (desktop).
+fn mirror_desired_to_native<R: Runtime>(
+    state: &ServiceState<R>,
+    desired: bool,
+    config: Option<&StartConfig>,
+) {
+    let Some(ref mobile) = state.mobile else {
+        return;
+    };
+    let config_value = config.map(|c| serde_json::to_value(c).unwrap_or_default());
+    if let Err(e) = mobile.mirror_desired_state(desired, config_value.as_ref()) {
+        log::warn!("failed to mirror desired state to native: {e}");
+    }
+}
+
 /// Handle a `SetDesiredRunning` command.
 ///
 /// Persists the desired running state WITHOUT affecting the actual running state.
@@ -762,6 +1595,7 @@ fn handle_set_desired_running<R: Runtime>(
     config: Option<StartConfig>,
 ) -> Result<(), ServiceError> {
     save_desired_running(state, desired, config.as_ref());
+    mirror_desired_to_native(state, desired, config.as_ref());
     Ok(())
 }
 
@@ -774,6 +1608,7 @@ fn handle_enable_auto_restart<R: Runtime>(
     config: Option<StartConfig>,
 ) -> Result<(), ServiceError> {
     save_desired_running(state, true, config.as_ref());
+    mirror_desired_to_native(state, true, config.as_ref());
     Ok(())
 }
 
@@ -785,6 +1620,7 @@ fn handle_disable_auto_restart<R: Runtime>(
     state: &mut ServiceState<R>,
 ) -> Result<(), ServiceError> {
     save_desired_running(state, false, None);
+    mirror_desired_to_native(state, false, None);
     Ok(())
 }
 
@@ -800,15 +1636,73 @@ fn handle_get_desired_state<R: Runtime>(
         .and_then(|backend| backend.load().ok())
 }
 
+/// Reconcile the actor's running-state belief against the native authority.
+///
+/// Native `LifecycleService.isRunning` is the single source of truth for
+/// service running-state (R-W1.4). When the actor's in-memory belief diverges
+/// from the native report, the actor **converges to native** and **logs** the
+/// divergence — never silently (NFR-1 / NFR-5). This closes the split-brain
+/// window where a stop/timeout with the UI closed could otherwise leave the
+/// actor stuck believing the service still runs (harness Scenario 8).
+///
+/// Returns the reconciled running-state. No-op — returns the actor's current
+/// belief unchanged — when no native authority is reachable (desktop, iOS, or a
+/// bridge query failure): there is nothing more authoritative to defer to.
+fn reconcile_running_with_native<R: Runtime>(state: &ServiceState<R>) -> bool {
+    let rust_running = state.is_running.load(Ordering::Acquire);
+
+    // Query the native authority. On desktop / bridge failure there is no
+    // authority to reconcile against, so keep the actor's belief unchanged.
+    let Some(authority) = state
+        .mobile
+        .as_ref()
+        .and_then(|m| m.query_native_state().ok().flatten())
+    else {
+        return rust_running;
+    };
+
+    // iOS has no long-lived native service whose running bit can override the
+    // actor: during a BGTask the Rust actor *is* the runtime authority and the
+    // cancel-listener owns the stop. Keep the actor's belief unchanged (L4: no
+    // Android round-trip on iOS).
+    let native = match authority {
+        NativeAuthority::Android(ns) => ns,
+        NativeAuthority::Ios(_) => return rust_running,
+    };
+
+    if native.native_running == rust_running {
+        return rust_running;
+    }
+
+    // Divergence: native wins. Converge + log, never swallow (NFR-1 / NFR-5).
+    log::warn!(
+        "running-state diverged from native authority \
+         (rust_running={rust_running}, native_running={}, durable_state={}); \
+         converging to native",
+        native.native_running,
+        native.durable_state,
+    );
+    state
+        .is_running
+        .store(native.native_running, Ordering::Release);
+    *state.lifecycle_state.lock().unwrap() = if native.native_running {
+        crate::models::ServiceState::Running
+    } else {
+        crate::models::ServiceState::Stopped
+    };
+    native.native_running
+}
+
 /// Compose a [`LifecycleStatus`] snapshot from the actor's current state.
 ///
 /// Gathers: service lifecycle state → `LifecycleState`, desired-state fields
-/// from the persistence backend, platform capabilities, and validation issues.
+/// from the persistence backend, native Android state via the mobile bridge,
+/// merge logic (adopt / auto-heal / normal), platform capabilities, and
+/// validation issues.
 fn build_lifecycle_status<R: Runtime>(
     state: &ServiceState<R>,
     desktop_mode: Option<&str>,
 ) -> LifecycleStatus {
-    let lifecycle_state: LifecycleState = (*state.lifecycle_state.lock().unwrap()).into();
     let last_error = state.last_error.lock().unwrap().clone();
 
     // Load desired-state fields.
@@ -816,14 +1710,211 @@ fn build_lifecycle_status<R: Runtime>(
 
     let desired_running = desired.as_ref().is_some_and(|d| d.desired_running);
     let recovery_enabled = desired_running;
-    let recovery_pending = desired.as_ref().is_some_and(|d| d.recovery_pending);
     let recovery_reason = desired.as_ref().and_then(|d| d.recovery_reason.clone());
     let last_start_config = desired
         .as_ref()
         .and_then(|d| d.last_start_config.clone())
         .and_then(|v| serde_json::from_value(v).ok());
-    let last_platform_state = desired.as_ref().and_then(|d| d.last_native_state.clone());
-    let last_platform_error = desired.as_ref().and_then(|d| d.last_platform_error.clone());
+    let mut last_platform_state = desired.as_ref().and_then(|d| d.last_native_state.clone());
+    let mut last_platform_error = desired.as_ref().and_then(|d| d.last_platform_error.clone());
+
+    // Query the platform-tagged native authority when the mobile bridge is
+    // available. On failure, fall back to Rust-only state (no native fields
+    // populated). The Android merge logic below operates on `native_state`
+    // (Android only); the iOS snapshot is handled by a dedicated branch so the
+    // status path never round-trips to `get_android_service_state` on iOS (L4).
+    let authority = state
+        .mobile
+        .as_ref()
+        .and_then(|m| m.query_native_state().ok().flatten());
+    let native_state = match &authority {
+        Some(NativeAuthority::Android(ns)) => Some(ns.clone()),
+        _ => None,
+    };
+    let ios_native = match &authority {
+        Some(NativeAuthority::Ios(s)) => Some(s.clone()),
+        _ => None,
+    };
+
+    let (mut native_running, mut native_foreground) = match &native_state {
+        Some(ns) => (Some(ns.native_running), Some(ns.native_foreground)),
+        None => (None, None),
+    };
+
+    // ── Merge rules ─────────────────────────────────────────────────────
+    // Compare native Android state with Rust actor state.
+    // Authority: native for service state, Rust for Core state.
+    let rust_running = state.is_running.load(Ordering::Acquire);
+
+    let (adopted, degraded, degraded_reason, should_emit) = match &native_state {
+        Some(ns) if ns.native_running && !rust_running => {
+            // Rule 1: Native running, Rust idle → adopt (bookkeeping only).
+            state.is_running.store(true, Ordering::Release);
+            *state.lifecycle_state.lock().unwrap() = crate::models::ServiceState::Running;
+            (Some(true), Some(false), None, false)
+        }
+        Some(ns) if !ns.native_running && rust_running => {
+            // Rule 2: Native stopped, Rust running → auto-heal to idle.
+            // Native is the authority (R-W1.4): converge + log, never silently
+            // swallow the divergence (NFR-1 / NFR-5).
+            log::warn!(
+                "running-state diverged from native authority \
+                 (rust_running=true, native_running=false, durable_state={}); \
+                 converging to native (auto-heal)",
+                ns.durable_state,
+            );
+            state.is_running.store(false, Ordering::Release);
+            *state.lifecycle_state.lock().unwrap() = crate::models::ServiceState::Stopped;
+            (
+                None,
+                Some(true),
+                Some("native_stopped_rust_running".into()),
+                true,
+            )
+        }
+        Some(ns) if ns.native_running && rust_running => {
+            // Rule 3: Both running → normal.
+            (Some(false), Some(false), None, false)
+        }
+        Some(_ns) => {
+            // Rule 4: Both idle → normal.
+            (Some(false), Some(false), None, false)
+        }
+        None => {
+            // No native state (non-Android or bridge failure).
+            (None, None, None, false)
+        }
+    };
+
+    // Rule 5: Timeout detection — native DurableState says timeout.
+    // Detects timeout regardless of Rust actor state so that stale DurableState
+    // from a previous session (app relaunch after JS-less timeout) surfaces.
+    let (mut degraded, mut degraded_reason) = if degraded == Some(true) {
+        (degraded, degraded_reason)
+    } else if let Some(ns) = &native_state {
+        if ns.durable_state == "timeout" {
+            let reason = if rust_running {
+                "native_timeout"
+            } else {
+                "stale_timeout"
+            };
+            (Some(true), Some(reason.into()))
+        } else {
+            (degraded, degraded_reason)
+        }
+    } else {
+        (degraded, degraded_reason)
+    };
+
+    // Rule 6: Surface recovery_pending from native state.
+    let recovery_pending = desired.as_ref().is_some_and(|d| d.recovery_pending)
+        || native_state.as_ref().is_some_and(|ns| ns.recovery_pending);
+
+    // ── iOS native authority (H6) ─────────────────────────────────────────
+    // iOS has no persistent foreground service: surface the *real* BGTask /
+    // scheduling situation from the native snapshot so the status reflects
+    // native facts (a task executing, a pending task waiting, a scheduling
+    // error, an exhausted budget) rather than the actor's possibly-stale
+    // in-memory lifecycle state. A scheduling error / out-of-budget is degraded
+    // and is never swallowed silently (NFR-1 / NFR-5).
+    if let Some(ios) = &ios_native {
+        // A BGTask is not a foreground service; report whether one is currently
+        // executing as the "native running" bit (honest `false` when waiting).
+        native_running = Some(ios.active_task_kind.is_some());
+        native_foreground = Some(false);
+
+        let phase = if ios.active_task_kind.is_some() {
+            "running"
+        } else if ios.pending_task.is_some() {
+            "pendingBgTask"
+        } else if ios.desired_running {
+            "waitingForBgTask"
+        } else {
+            "stopped"
+        };
+        last_platform_state = Some(phase.to_string());
+
+        // "last-failed?" is split per task type (M7); surface whichever failed
+        // (refresh preferred) as the degraded scheduling error.
+        let schedule_error = ios
+            .last_refresh_error
+            .as_ref()
+            .or(ios.last_processing_error.as_ref());
+        if let Some(err) = schedule_error {
+            last_platform_error = Some(err.clone());
+            degraded = Some(true);
+            degraded_reason = Some("ios_scheduling_error".to_string());
+        } else if ios.desired_running && !ios.in_budget {
+            degraded = Some(true);
+            degraded_reason = Some("ios_out_of_budget".to_string());
+        } else {
+            degraded = Some(false);
+            degraded_reason = None;
+        }
+    }
+
+    // H9: an advisory scheduling failure recorded at start time surfaces as a
+    // distinct "scheduling degraded / foreground-only" status — the Core runs in
+    // the foreground but background scheduling is unavailable. A more specific
+    // native iOS health problem (already `degraded == Some(true)` above) wins.
+    if degraded != Some(true) {
+        if let Some(reason) = state.scheduling_degraded.lock().unwrap().as_ref() {
+            last_platform_error = Some(reason.clone());
+            degraded = Some(true);
+            degraded_reason = Some("scheduling_degraded_foreground_only".to_string());
+        }
+    }
+
+    // Emit degraded event on mismatch, stale timeout, or an iOS health problem.
+    if should_emit
+        || (degraded == Some(true)
+            && matches!(
+                degraded_reason.as_deref(),
+                Some("native_timeout")
+                    | Some("stale_timeout")
+                    | Some("ios_scheduling_error")
+                    | Some("ios_out_of_budget")
+                    | Some("scheduling_degraded_foreground_only")
+            ))
+    {
+        if let Some(ref app) = state.app {
+            let _ = app.emit(
+                "background-service:state-degraded",
+                serde_json::json!({
+                    "degraded": true,
+                    "reason": degraded_reason,
+                    "native_running": native_running,
+                    "rust_running": rust_running,
+                }),
+            );
+        }
+    }
+
+    // Read lifecycle state AFTER merge (merge may have updated it).
+    let mut lifecycle_state: LifecycleState = (*state.lifecycle_state.lock().unwrap()).into();
+
+    // Override lifecycle state for native setup_idle/locked_idle durable states.
+    // These are healthy states where the service is running but waiting for
+    // user action (account setup or unlock). They are NOT errors.
+    if let Some(ns) = &native_state {
+        match ns.durable_state.as_str() {
+            "setup_idle" => lifecycle_state = LifecycleState::SetupIdle,
+            "locked_idle" => lifecycle_state = LifecycleState::LockedIdle,
+            _ => {}
+        }
+    }
+
+    // iOS (H6): don't report a stale "Running" lifecycle when the native
+    // snapshot shows no BGTask executing and the service is not desired — the
+    // actor's in-memory state may be stale after a JS-less expiration.
+    if let Some(ios) = &ios_native {
+        if ios.active_task_kind.is_none() && !ios.desired_running {
+            lifecycle_state = LifecycleState::Stopped;
+        }
+    }
+
+    // Surface data_dir from native state for path validation.
+    let data_dir = native_state.as_ref().map(|ns| ns.data_dir.clone());
 
     let (platform, _) = crate::capabilities::CapabilityProvider::detect_platform(desktop_mode);
     let capabilities = crate::capabilities::CapabilityProvider::capabilities(
@@ -864,6 +1955,12 @@ fn build_lifecycle_status<R: Runtime>(
         platform,
         capabilities,
         issues,
+        native_running,
+        native_foreground,
+        adopted,
+        degraded,
+        degraded_reason,
+        data_dir,
     }
 }
 
@@ -874,6 +1971,7 @@ mod tests {
     use crate::models::{NativeLifecycleEvent, NativeState};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicI8, AtomicU8, AtomicUsize};
+    use tauri::Listener;
 
     // ── Mock mobile for keepalive testing ─────────────────────────────
 
@@ -890,6 +1988,20 @@ mod tests {
         last_earliest_processing_begin_minutes: std::sync::Mutex<Option<f64>>,
         last_requires_external_power: std::sync::Mutex<Option<bool>>,
         last_requires_network_connectivity: std::sync::Mutex<Option<bool>>,
+        last_processing_ceiling_multiplier: std::sync::Mutex<Option<f64>>,
+        /// Records every `mirror_desired_state` call as `(desired, config)`
+        /// — the H4 desired-state mirror seam.
+        mirror_calls: std::sync::Mutex<Vec<(bool, Option<serde_json::Value>)>>,
+        /// When true, `scheduling_is_advisory()` returns true — models the iOS
+        /// BGTask scheduler whose failure is a non-fatal degraded warning (H9).
+        advisory_scheduling: bool,
+        /// When true, `enforces_foreground_service_type()` returns true — models
+        /// Android (FGS types are OS-enforced). When false, models iOS/desktop
+        /// (no FGS-type concept) — the M5/M6 gate seam.
+        enforces_fst: bool,
+        /// Records every `update_keepalive_type` (native `updateForegroundServiceType`)
+        /// call — proves zero native swaps fire on the iOS-like path (M5).
+        update_type_calls: std::sync::Mutex<Vec<String>>,
     }
 
     impl MockMobile {
@@ -906,6 +2018,11 @@ mod tests {
                 last_earliest_processing_begin_minutes: std::sync::Mutex::new(None),
                 last_requires_external_power: std::sync::Mutex::new(None),
                 last_requires_network_connectivity: std::sync::Mutex::new(None),
+                last_processing_ceiling_multiplier: std::sync::Mutex::new(None),
+                mirror_calls: std::sync::Mutex::new(Vec::new()),
+                advisory_scheduling: false,
+                enforces_fst: false,
+                update_type_calls: std::sync::Mutex::new(Vec::new()),
             })
         }
 
@@ -922,7 +2039,66 @@ mod tests {
                 last_earliest_processing_begin_minutes: std::sync::Mutex::new(None),
                 last_requires_external_power: std::sync::Mutex::new(None),
                 last_requires_network_connectivity: std::sync::Mutex::new(None),
+                last_processing_ceiling_multiplier: std::sync::Mutex::new(None),
+                mirror_calls: std::sync::Mutex::new(Vec::new()),
+                advisory_scheduling: false,
+                enforces_fst: false,
+                update_type_calls: std::sync::Mutex::new(Vec::new()),
             })
+        }
+
+        /// Failing mock whose scheduling is *advisory* (iOS BGTask): the failure
+        /// must be treated as a non-fatal degraded warning, not a rollback (H9).
+        fn new_failing_advisory() -> Arc<Self> {
+            Arc::new(Self {
+                start_called: AtomicUsize::new(0),
+                stop_called: AtomicUsize::new(0),
+                start_fail: true,
+                last_label: std::sync::Mutex::new(None),
+                last_fst: std::sync::Mutex::new(None),
+                last_timeout_secs: std::sync::Mutex::new(None),
+                last_processing_timeout_secs: std::sync::Mutex::new(None),
+                last_earliest_refresh_begin_minutes: std::sync::Mutex::new(None),
+                last_earliest_processing_begin_minutes: std::sync::Mutex::new(None),
+                last_requires_external_power: std::sync::Mutex::new(None),
+                last_requires_network_connectivity: std::sync::Mutex::new(None),
+                last_processing_ceiling_multiplier: std::sync::Mutex::new(None),
+                mirror_calls: std::sync::Mutex::new(Vec::new()),
+                advisory_scheduling: true,
+                enforces_fst: false,
+                update_type_calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Mock whose platform enforces foreground-service types — models
+        /// Android (`enforces_foreground_service_type()` → true). Used by the
+        /// M5/M6 gating tests to prove validation + the native type-swap run on
+        /// the Android path. The default [`new`](Self::new) mock models
+        /// iOS/desktop (enforces → false).
+        fn new_enforcing() -> Arc<Self> {
+            Arc::new(Self {
+                start_called: AtomicUsize::new(0),
+                stop_called: AtomicUsize::new(0),
+                start_fail: false,
+                last_label: std::sync::Mutex::new(None),
+                last_fst: std::sync::Mutex::new(None),
+                last_timeout_secs: std::sync::Mutex::new(None),
+                last_processing_timeout_secs: std::sync::Mutex::new(None),
+                last_earliest_refresh_begin_minutes: std::sync::Mutex::new(None),
+                last_earliest_processing_begin_minutes: std::sync::Mutex::new(None),
+                last_requires_external_power: std::sync::Mutex::new(None),
+                last_requires_network_connectivity: std::sync::Mutex::new(None),
+                last_processing_ceiling_multiplier: std::sync::Mutex::new(None),
+                mirror_calls: std::sync::Mutex::new(Vec::new()),
+                advisory_scheduling: false,
+                enforces_fst: true,
+                update_type_calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Snapshot of every `update_keepalive_type` argument recorded so far.
+        fn update_type_calls(&self) -> Vec<String> {
+            self.update_type_calls.lock().unwrap().clone()
         }
     }
 
@@ -937,6 +2113,7 @@ mod tests {
         ios_earliest_processing_begin_minutes: Option<f64>,
         ios_requires_external_power: Option<bool>,
         ios_requires_network_connectivity: Option<bool>,
+        ios_processing_ceiling_multiplier: Option<f64>,
     ) -> Result<(), ServiceError> {
         mock.start_called.fetch_add(1, Ordering::Release);
         *mock.last_label.lock().unwrap() = Some(label.to_string());
@@ -950,6 +2127,8 @@ mod tests {
         *mock.last_requires_external_power.lock().unwrap() = ios_requires_external_power;
         *mock.last_requires_network_connectivity.lock().unwrap() =
             ios_requires_network_connectivity;
+        *mock.last_processing_ceiling_multiplier.lock().unwrap() =
+            ios_processing_ceiling_multiplier;
         if mock.start_fail {
             return Err(ServiceError::Platform("mock keepalive failure".into()));
         }
@@ -968,6 +2147,7 @@ mod tests {
             ios_earliest_processing_begin_minutes: Option<f64>,
             ios_requires_external_power: Option<bool>,
             ios_requires_network_connectivity: Option<bool>,
+            ios_processing_ceiling_multiplier: Option<f64>,
         ) -> Result<(), ServiceError> {
             mock_start_keepalive(
                 self,
@@ -979,12 +2159,71 @@ mod tests {
                 ios_earliest_processing_begin_minutes,
                 ios_requires_external_power,
                 ios_requires_network_connectivity,
+                ios_processing_ceiling_multiplier,
             )
         }
 
         fn stop_keepalive(&self) -> Result<(), ServiceError> {
             self.stop_called.fetch_add(1, Ordering::Release);
             Ok(())
+        }
+
+        fn scheduling_is_advisory(&self) -> bool {
+            self.advisory_scheduling
+        }
+
+        fn enforces_foreground_service_type(&self) -> bool {
+            self.enforces_fst
+        }
+
+        fn update_keepalive_type(&self, foreground_service_type: &str) -> Result<(), ServiceError> {
+            self.update_type_calls
+                .lock()
+                .unwrap()
+                .push(foreground_service_type.to_string());
+            Ok(())
+        }
+
+        fn mirror_desired_state(
+            &self,
+            desired_running: bool,
+            last_start_config: Option<&serde_json::Value>,
+        ) -> Result<(), ServiceError> {
+            self.mirror_calls
+                .lock()
+                .unwrap()
+                .push((desired_running, last_start_config.cloned()));
+            Ok(())
+        }
+    }
+
+    // ── Recording sink for D1 notification testing ────────────────────
+
+    /// Test double for [`NotifySink`] that records every `notify()` call.
+    /// Step 3's fire-point tests assert on the recorded calls; in this step
+    /// it proves wiring a sink into the actor changes no behavior.
+    struct RecordingSink {
+        calls: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl RecordingSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> Vec<(String, String, String)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl NotifySink for RecordingSink {
+        fn notify(&self, id: &str, title: &str, body: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((id.into(), title.into(), body.into()));
         }
     }
 
@@ -1019,12 +2258,75 @@ mod tests {
     fn setup_manager_with_backend(
         backend: Option<Arc<dyn DesiredStateBackend>>,
     ) -> ServiceManagerHandle<tauri::test::MockRuntime> {
+        setup_manager_with_backend_and_allowlist(backend, vec!["remoteMessaging".into()], true)
+    }
+
+    /// Create a manager actor with a desired-state backend and custom allowlist.
+    fn setup_manager_with_backend_and_allowlist(
+        backend: Option<Arc<dyn DesiredStateBackend>>,
+        android_fg_service_types: Vec<String>,
+        android_validate_fg_type: bool,
+    ) -> ServiceManagerHandle<tauri::test::MockRuntime> {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let handle = ServiceManagerHandle::new(cmd_tx);
         let factory: ServiceFactory<tauri::test::MockRuntime> =
             Box::new(|| Box::new(BlockingService));
         tokio::spawn(manager_loop(
-            cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false, backend,
+            cmd_rx,
+            factory,
+            28.0,
+            0.0,
+            15.0,
+            15.0,
+            false,
+            false,
+            4.0,
+            backend,
+            android_fg_service_types,
+            android_validate_fg_type,
+            NotifierPolicy::default(),
+            None,
+            None,
+            false,
+        ));
+        handle
+    }
+
+    /// Create a manager actor with a notifier policy and notify sink (D1).
+    fn setup_manager_with_sink(
+        policy: NotifierPolicy,
+        sink: Arc<dyn NotifySink>,
+    ) -> ServiceManagerHandle<tauri::test::MockRuntime> {
+        setup_manager_with_policy_and_sink(policy, Some(sink))
+    }
+
+    /// Create a manager actor with a notifier policy and an optional sink
+    /// (D1; `None` models the headless daemon with no notification handle).
+    fn setup_manager_with_policy_and_sink(
+        policy: NotifierPolicy,
+        sink: Option<Arc<dyn NotifySink>>,
+    ) -> ServiceManagerHandle<tauri::test::MockRuntime> {
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let handle = ServiceManagerHandle::new(cmd_tx);
+        let factory: ServiceFactory<tauri::test::MockRuntime> =
+            Box::new(|| Box::new(BlockingService));
+        tokio::spawn(manager_loop(
+            cmd_rx,
+            factory,
+            28.0,
+            0.0,
+            15.0,
+            15.0,
+            false,
+            false,
+            4.0,
+            None,
+            vec!["remoteMessaging".into()],
+            true,
+            policy,
+            sink,
+            None,
+            false,
         ));
         handle
     }
@@ -1235,10 +2537,37 @@ mod tests {
         factory: ServiceFactory<tauri::test::MockRuntime>,
         backend: Option<Arc<dyn DesiredStateBackend>>,
     ) -> ServiceManagerHandle<tauri::test::MockRuntime> {
+        setup_manager_with_factory_backend_and_boot_app(factory, backend, None, false)
+    }
+
+    /// Create a manager actor with a custom factory, desired-state backend, and
+    /// an optional boot-replay AppHandle (BGS-05 Leg B), plus the consent flag
+    /// that gates the boot Start-replay (BGS-05 re-fix Leg A/Leg B coordination).
+    fn setup_manager_with_factory_backend_and_boot_app(
+        factory: ServiceFactory<tauri::test::MockRuntime>,
+        backend: Option<Arc<dyn DesiredStateBackend>>,
+        boot_app: Option<AppHandle<tauri::test::MockRuntime>>,
+        consent_allows_auto_unlock: bool,
+    ) -> ServiceManagerHandle<tauri::test::MockRuntime> {
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let handle = ServiceManagerHandle::new(cmd_tx);
         tokio::spawn(manager_loop(
-            cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false, backend,
+            cmd_rx,
+            factory,
+            28.0,
+            0.0,
+            15.0,
+            15.0,
+            false,
+            false,
+            4.0,
+            backend,
+            vec!["remoteMessaging".into()],
+            true,
+            NotifierPolicy::default(),
+            None,
+            boot_app,
+            consent_allows_auto_unlock,
         ));
         handle
     }
@@ -1424,26 +2753,36 @@ mod tests {
     #[tokio::test]
     async fn generation_guard_prevents_stale_cleanup() {
         // First start with FailingInit (generation 1) — clears its own token.
-        // Second start with ImmediateSuccess (generation 2) — should succeed
-        // because the old task's cleanup shouldn't corrupt the new state.
+        // Second start with a long-running BlockingService (generation 2) —
+        // should reach AND stay Running because generation 1's stale cleanup
+        // must not steal generation 2's freshly installed token.
+        //
+        // A long-running service (not ImmediateSuccess) is what makes this
+        // assertion both meaningful and deterministic: it distinguishes
+        // "gen-1 stole gen-2's token" (is_running would be false) from a
+        // service that simply self-completed, and it prevents is_running from
+        // flickering true→false out from under the assertion under load.
         let call_count = Arc::new(AtomicU8::new(0));
         let call_count_clone = call_count.clone();
 
         let handle = setup_manager_with_factory(Box::new(move || {
             let cc = call_count_clone.clone();
-            // First call: FailingInit. Second call: ImmediateSuccess.
+            // First call: FailingInit. Second call: BlockingService.
             // Use AtomicU8 to track which invocation this is.
             if cc.fetch_add(1, Ordering::AcqRel) == 0 {
                 Box::new(FailingInitService) as Box<dyn BackgroundService<tauri::test::MockRuntime>>
             } else {
-                Box::new(ImmediateSuccessService)
+                Box::new(BlockingService)
             }
         }));
         let app = tauri::test::mock_app();
 
-        // First start: init fails, token cleared by spawned task.
+        // First start: init fails, token cleared by spawned task. Poll until
+        // the generation-1 init failure has been recorded (last_error set)
+        // instead of sleeping a fixed interval — this deterministically
+        // establishes the stale-cleanup scenario before the second start.
         send_start(&handle, app.handle().clone()).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wait_until_error_recorded(&handle).await;
 
         // Second start: should succeed — generation guard prevented stale cleanup.
         let result = send_start(&handle, app.handle().clone()).await;
@@ -1451,6 +2790,9 @@ mod tests {
             result.is_ok(),
             "second start should succeed after init failure: {result:?}"
         );
+        // BlockingService blocks in run(), so is_running is deterministically
+        // true once Running is reached — no flicker race with self-completion.
+        wait_until_running(&handle).await;
         assert!(
             send_is_running(&handle).await,
             "should be running after second start"
@@ -1600,6 +2942,66 @@ mod tests {
         );
     }
 
+    // ── AC1/AC2 (Step 11, H9): advisory scheduling failure is non-fatal ──
+    //
+    // On iOS the BGTask scheduler can be unavailable (Simulator / degraded
+    // device). A `start_keepalive` failure there must NOT roll back the
+    // in-process Core: the service still starts (`is_running` true) and the
+    // status reports a distinct "scheduling degraded / foreground-only"
+    // condition — distinguishable from a total start failure (which leaves the
+    // service stopped, like the Android path in `start_keepalive_failure_rollback`).
+    #[tokio::test]
+    async fn advisory_scheduling_failure_starts_core_degraded() {
+        let mock = MockMobile::new_failing_advisory();
+        let handle = setup_manager();
+        let app = tauri::test::mock_app();
+
+        // Listen for the non-fatal degraded warning event.
+        let event_received = Arc::new(AtomicBool::new(false));
+        let event_received_clone = event_received.clone();
+        let _listener = app
+            .handle()
+            .listen("background-service:state-degraded", move |_event| {
+                event_received_clone.store(true, Ordering::Release);
+            });
+
+        send_set_mobile(&handle, mock.clone()).await;
+
+        // Start must SUCCEED despite the scheduling failure (no rollback).
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        wait_until_running(&handle).await;
+
+        assert_eq!(
+            mock.start_called.load(Ordering::Acquire),
+            1,
+            "start_keepalive should still be attempted once",
+        );
+        assert!(
+            send_is_running(&handle).await,
+            "Core must start despite advisory scheduling failure (no rollback)",
+        );
+
+        // Status reports the distinct degraded / foreground-only condition.
+        let status = send_get_lifecycle_status(&handle).await;
+        assert_eq!(
+            status.degraded,
+            Some(true),
+            "advisory scheduling failure must report degraded",
+        );
+        assert_eq!(
+            status.degraded_reason,
+            Some("scheduling_degraded_foreground_only".into()),
+            "degraded reason must name the foreground-only fallback",
+        );
+
+        // A non-fatal scheduling-degraded warning was emitted (not a fatal error).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            event_received.load(Ordering::Acquire),
+            "a non-fatal scheduling-degraded warning must be emitted",
+        );
+    }
+
     // ── AC3 (Step 5): stop_keepalive called on stop ──────────────────
 
     #[tokio::test]
@@ -1643,6 +3045,7 @@ mod tests {
             _ios_earliest_processing_begin_minutes: Option<f64>,
             _ios_requires_external_power: Option<bool>,
             _ios_requires_network_connectivity: Option<bool>,
+            _ios_processing_ceiling_multiplier: Option<f64>,
         ) -> Result<(), ServiceError> {
             Ok(())
         }
@@ -1683,7 +3086,22 @@ mod tests {
             Box::new(|| Box::new(BlockingService));
         // Use a custom timeout value (not default 28.0)
         tokio::spawn(manager_loop(
-            cmd_rx, factory, 15.0, 0.0, 15.0, 15.0, false, false, None,
+            cmd_rx,
+            factory,
+            15.0,
+            0.0,
+            15.0,
+            15.0,
+            false,
+            false,
+            4.0,
+            None,
+            vec!["remoteMessaging".into()],
+            true,
+            NotifierPolicy::default(),
+            None,
+            None,
+            false,
         ));
 
         let app = tauri::test::mock_app();
@@ -1711,7 +3129,22 @@ mod tests {
             Box::new(|| Box::new(BlockingService));
         // Use a custom processing timeout value
         tokio::spawn(manager_loop(
-            cmd_rx, factory, 28.0, 60.0, 15.0, 15.0, false, false, None,
+            cmd_rx,
+            factory,
+            28.0,
+            60.0,
+            15.0,
+            15.0,
+            false,
+            false,
+            4.0,
+            None,
+            vec!["remoteMessaging".into()],
+            true,
+            NotifierPolicy::default(),
+            None,
+            None,
+            false,
         ));
 
         let app = tauri::test::mock_app();
@@ -1725,6 +3158,88 @@ mod tests {
             timeout,
             Some(60.0),
             "ios_processing_safety_timeout_secs should be passed to mobile"
+        );
+    }
+
+    // ── iOS processing ceiling multiplier passed to mobile (D2) ─────────
+
+    #[tokio::test]
+    async fn ios_processing_ceiling_multiplier_default_passed_to_mobile() {
+        let mock = MockMobile::new();
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let handle = ServiceManagerHandle::new(cmd_tx);
+        let factory: ServiceFactory<tauri::test::MockRuntime> =
+            Box::new(|| Box::new(BlockingService));
+        // Default multiplier (4.0, as the named default fn returns)
+        tokio::spawn(manager_loop(
+            cmd_rx,
+            factory,
+            28.0,
+            0.0,
+            15.0,
+            15.0,
+            false,
+            false,
+            4.0,
+            None,
+            vec!["remoteMessaging".into()],
+            true,
+            NotifierPolicy::default(),
+            None,
+            None,
+            false,
+        ));
+
+        let app = tauri::test::mock_app();
+
+        send_set_mobile(&handle, mock.clone()).await;
+        send_start(&handle, app.handle().clone()).await.unwrap();
+
+        let multiplier = *mock.last_processing_ceiling_multiplier.lock().unwrap();
+        assert_eq!(
+            multiplier,
+            Some(4.0),
+            "default ios_processing_ceiling_multiplier should be passed to mobile"
+        );
+    }
+
+    #[tokio::test]
+    async fn ios_processing_ceiling_multiplier_override_passed_to_mobile() {
+        let mock = MockMobile::new();
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let handle = ServiceManagerHandle::new(cmd_tx);
+        let factory: ServiceFactory<tauri::test::MockRuntime> =
+            Box::new(|| Box::new(BlockingService));
+        // Override multiplier (not default 4.0)
+        tokio::spawn(manager_loop(
+            cmd_rx,
+            factory,
+            28.0,
+            0.0,
+            15.0,
+            15.0,
+            false,
+            false,
+            6.0,
+            None,
+            vec!["remoteMessaging".into()],
+            true,
+            NotifierPolicy::default(),
+            None,
+            None,
+            false,
+        ));
+
+        let app = tauri::test::mock_app();
+
+        send_set_mobile(&handle, mock.clone()).await;
+        send_start(&handle, app.handle().clone()).await.unwrap();
+
+        let multiplier = *mock.last_processing_ceiling_multiplier.lock().unwrap();
+        assert_eq!(
+            multiplier,
+            Some(6.0),
+            "overridden ios_processing_ceiling_multiplier should be passed to mobile"
         );
     }
 
@@ -1814,8 +3329,8 @@ mod tests {
     #[tokio::test]
     async fn handle_start_accepts_invalid_foreground_service_type_on_desktop() {
         // On desktop (cfg!(mobile) == false), the foreground_service_type
-        // validation is skipped. An arbitrary string should succeed.
-        let handle = setup_manager();
+        // validation is skipped. Use validation disabled to bypass allowlist too.
+        let handle = setup_manager_with_backend_and_allowlist(None, vec![], false);
         let app = tauri::test::mock_app();
 
         let config = StartConfig {
@@ -1840,8 +3355,12 @@ mod tests {
 
     #[tokio::test]
     async fn handle_start_accepts_all_valid_foreground_service_types() {
+        let all_types: Vec<String> = crate::models::VALID_FOREGROUND_SERVICE_TYPES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         for &valid_type in crate::models::VALID_FOREGROUND_SERVICE_TYPES {
-            let handle = setup_manager();
+            let handle = setup_manager_with_backend_and_allowlist(None, all_types.clone(), true);
             let app = tauri::test::mock_app();
 
             let config = StartConfig {
@@ -1860,6 +3379,318 @@ mod tests {
         }
     }
 
+    // ── Allowlist enforcement tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn allowlist_rejected_type_returns_platform_error() {
+        let handle =
+            setup_manager_with_backend_and_allowlist(None, vec!["remoteMessaging".into()], true);
+        let app = tauri::test::mock_app();
+
+        let config = StartConfig {
+            service_label: "test".into(),
+            foreground_service_type: "specialUse".into(),
+        };
+        let result = send_start_with_config(&handle, config, app.handle().clone()).await;
+        assert!(
+            matches!(result, Err(ServiceError::Platform(ref msg)) if msg.contains("not allowed")),
+            "disallowed type should return Platform error: {result:?}"
+        );
+        assert!(
+            !send_is_running(&handle).await,
+            "should not be running after allowlist rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowlist_allowed_type_succeeds() {
+        let handle =
+            setup_manager_with_backend_and_allowlist(None, vec!["remoteMessaging".into()], true);
+        let app = tauri::test::mock_app();
+
+        let config = StartConfig {
+            service_label: "test".into(),
+            foreground_service_type: "remoteMessaging".into(),
+        };
+        let result = send_start_with_config(&handle, config, app.handle().clone()).await;
+        assert!(result.is_ok(), "allowed type should succeed: {result:?}");
+        assert!(send_is_running(&handle).await);
+        send_stop(&handle).await.unwrap();
+    }
+
+    // ── UpdateForegroundServiceType (spec 08 C6, Step 15) ────────────────
+    //
+    // The phoneCall FGS-type swap is gated by the same plugin-config allowlist
+    // as start(). These pin the gate so a call answer cannot promote to a type
+    // the app did not declare (tauri.conf.json.androidForegroundServiceTypes).
+
+    #[tokio::test]
+    async fn update_foreground_service_type_not_running_returns_not_running() {
+        let handle = setup_manager_with_backend_and_allowlist(
+            None,
+            vec!["remoteMessaging".into(), "phoneCall".into()],
+            true,
+        );
+        // No start → nothing to swap.
+        let result = handle
+            .update_foreground_service_type("phoneCall".into())
+            .await;
+        assert!(
+            matches!(result, Err(ServiceError::NotRunning)),
+            "update with no running service should be NotRunning: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_foreground_service_type_allowlisted_phonecall_succeeds() {
+        let handle = setup_manager_with_backend_and_allowlist(
+            None,
+            vec!["remoteMessaging".into(), "phoneCall".into()],
+            true,
+        );
+        let app = tauri::test::mock_app();
+        send_start_with_config(
+            &handle,
+            StartConfig {
+                service_label: "call".into(),
+                foreground_service_type: "remoteMessaging".into(),
+            },
+            app.handle().clone(),
+        )
+        .await
+        .unwrap();
+
+        let result = handle
+            .update_foreground_service_type("phoneCall".into())
+            .await;
+        assert!(
+            result.is_ok(),
+            "allowlisted phoneCall update should succeed: {result:?}"
+        );
+        send_stop(&handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_foreground_service_type_rejected_by_allowlist() {
+        // App allowlist does NOT include phoneCall → update rejected even while
+        // running. This is exactly why tauri.conf.json must add phoneCall.
+        let handle =
+            setup_manager_with_backend_and_allowlist(None, vec!["remoteMessaging".into()], true);
+        let app = tauri::test::mock_app();
+        send_start_with_config(
+            &handle,
+            StartConfig {
+                service_label: "call".into(),
+                foreground_service_type: "remoteMessaging".into(),
+            },
+            app.handle().clone(),
+        )
+        .await
+        .unwrap();
+
+        let result = handle
+            .update_foreground_service_type("phoneCall".into())
+            .await;
+        assert!(
+            matches!(result, Err(ServiceError::Platform(ref msg)) if msg.contains("not allowed")),
+            "non-allowlisted phoneCall update should be rejected: {result:?}"
+        );
+        // A rejected update is a no-op on the token: the service keeps running.
+        assert!(send_is_running(&handle).await);
+        send_stop(&handle).await.unwrap();
+    }
+
+    // ── M5/M6: Android-only FGS-type gating (Step 14) ────────────────────
+    //
+    // The 14-type validation (M6) and the native `updateForegroundServiceType`
+    // swap (M5) run only where the OS enforces foreground-service types — i.e.
+    // Android (`enforces_foreground_service_type()` → true). iOS has no FGS-type
+    // concept, so both are skipped there: calling them only produced
+    // missing-native-method error noise. The mock simulates each platform.
+
+    #[tokio::test]
+    async fn ios_like_bridge_validates_no_fgs_type_on_start() {
+        // iOS-like bridge (enforces → false) + allowlist disabled: a type that
+        // is NOT one of the 14 valid Android types still starts cleanly — iOS
+        // never runs the Android 14-type validation (M6).
+        let handle = setup_manager_with_backend_and_allowlist(None, vec![], false);
+        let mock = MockMobile::new(); // enforces_foreground_service_type() → false
+        send_set_mobile(&handle, mock).await;
+        let app = tauri::test::mock_app();
+
+        let result = send_start_with_config(
+            &handle,
+            StartConfig {
+                service_label: "call".into(),
+                foreground_service_type: "iosBackgroundDelivery".into(),
+            },
+            app.handle().clone(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "iOS start with a non-Android FGS type should succeed (M6): {result:?}"
+        );
+        send_stop(&handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn android_like_bridge_validates_fgs_type_on_start() {
+        // Android-like bridge (enforces → true): an invalid 14-type is rejected
+        // on start, exactly as before — the Android path is unchanged (M6).
+        let handle = setup_manager_with_backend_and_allowlist(None, vec![], false);
+        let mock = MockMobile::new_enforcing(); // enforces → true
+        send_set_mobile(&handle, mock).await;
+        let app = tauri::test::mock_app();
+
+        let result = send_start_with_config(
+            &handle,
+            StartConfig {
+                service_label: "call".into(),
+                foreground_service_type: "notAValidType".into(),
+            },
+            app.handle().clone(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ServiceError::Platform(ref m)) if m.contains("invalid foreground_service_type")),
+            "Android start with an invalid FGS type should be rejected (M6): {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ios_like_bridge_emits_zero_update_foreground_service_type() {
+        // iOS-like bridge (enforces → false): swapping the call FGS type is a
+        // success no-op that fires ZERO native `updateForegroundServiceType`
+        // calls — the missing-native-method noise (M5) is gone.
+        let handle = setup_manager_with_backend_and_allowlist(None, vec![], false);
+        let mock = MockMobile::new(); // enforces → false
+        send_set_mobile(&handle, mock.clone()).await;
+        let app = tauri::test::mock_app();
+        send_start_with_config(
+            &handle,
+            StartConfig {
+                service_label: "call".into(),
+                foreground_service_type: "remoteMessaging".into(),
+            },
+            app.handle().clone(),
+        )
+        .await
+        .unwrap();
+
+        // Call start (→ phoneCall) and call end (→ remoteMessaging).
+        let answer = handle
+            .update_foreground_service_type("phoneCall".into())
+            .await;
+        let end = handle
+            .update_foreground_service_type("remoteMessaging".into())
+            .await;
+        assert!(
+            answer.is_ok(),
+            "iOS FGS swap should be a no-op Ok: {answer:?}"
+        );
+        assert!(end.is_ok(), "iOS FGS revert should be a no-op Ok: {end:?}");
+        assert!(
+            mock.update_type_calls().is_empty(),
+            "iOS must fire zero updateForegroundServiceType calls (M5), got: {:?}",
+            mock.update_type_calls()
+        );
+        send_stop(&handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn android_like_bridge_swaps_fgs_type() {
+        // Android-like bridge (enforces → true): the running service's type
+        // swaps remoteMessaging → phoneCall → remoteMessaging via the native
+        // handler — the Android swap behaviour is unchanged (M5).
+        let handle = setup_manager_with_backend_and_allowlist(
+            None,
+            vec!["remoteMessaging".into(), "phoneCall".into()],
+            true,
+        );
+        let mock = MockMobile::new_enforcing(); // enforces → true
+        send_set_mobile(&handle, mock.clone()).await;
+        let app = tauri::test::mock_app();
+        send_start_with_config(
+            &handle,
+            StartConfig {
+                service_label: "call".into(),
+                foreground_service_type: "remoteMessaging".into(),
+            },
+            app.handle().clone(),
+        )
+        .await
+        .unwrap();
+
+        handle
+            .update_foreground_service_type("phoneCall".into())
+            .await
+            .unwrap();
+        handle
+            .update_foreground_service_type("remoteMessaging".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            mock.update_type_calls(),
+            vec!["phoneCall".to_string(), "remoteMessaging".to_string()],
+            "Android must swap the FGS type via the native handler (M5)"
+        );
+        send_stop(&handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn allowlist_empty_type_rejected() {
+        let handle = setup_manager_with_backend_and_allowlist(None, vec!["dataSync".into()], true);
+        let app = tauri::test::mock_app();
+
+        let config = StartConfig {
+            service_label: "test".into(),
+            foreground_service_type: "".into(),
+        };
+        let result = send_start_with_config(&handle, config, app.handle().clone()).await;
+        assert!(
+            matches!(result, Err(ServiceError::Platform(ref msg)) if msg.contains("must not be empty")),
+            "empty type should be rejected: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowlist_case_insensitive_match() {
+        let handle =
+            setup_manager_with_backend_and_allowlist(None, vec!["remoteMessaging".into()], true);
+        let app = tauri::test::mock_app();
+
+        let config = StartConfig {
+            service_label: "test".into(),
+            foreground_service_type: "RemoteMessaging".into(),
+        };
+        let result = send_start_with_config(&handle, config, app.handle().clone()).await;
+        assert!(
+            result.is_ok(),
+            "case-insensitive match should succeed: {result:?}"
+        );
+        assert!(send_is_running(&handle).await);
+        send_stop(&handle).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn allowlist_validation_disabled_accepts_any_type() {
+        let handle = setup_manager_with_backend_and_allowlist(None, vec!["dataSync".into()], false);
+        let app = tauri::test::mock_app();
+
+        let config = StartConfig {
+            service_label: "test".into(),
+            foreground_service_type: "specialUse".into(),
+        };
+        let result = send_start_with_config(&handle, config, app.handle().clone()).await;
+        assert!(
+            result.is_ok(),
+            "validation disabled should accept any type: {result:?}"
+        );
+        assert!(send_is_running(&handle).await);
+        send_stop(&handle).await.unwrap();
+    }
+
     // ── State transition helpers ────────────────────────────────────────
 
     async fn send_get_state(
@@ -1872,6 +3703,34 @@ mod tests {
             .await
             .unwrap();
         rx.await.unwrap()
+    }
+
+    /// Poll the actor until it reports `Running` instead of sleeping a fixed
+    /// duration. The service task transitions Initializing→Running on a
+    /// separate runtime (`tauri::async_runtime::spawn`), so a fixed sleep
+    /// races that transition under load; polling observes the real state and
+    /// removes the flaky timing seam.
+    async fn wait_until_running(handle: &ServiceManagerHandle<tauri::test::MockRuntime>) {
+        for _ in 0..200 {
+            if send_get_state(handle).await.state == ServiceLifecycle::Running {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("service did not reach Running within ~1s");
+    }
+
+    /// Poll until a service's init/run failure has been recorded (last_error
+    /// set). Used to deterministically observe a generation's failure cleanup
+    /// without relying on a fixed sleep.
+    async fn wait_until_error_recorded(handle: &ServiceManagerHandle<tauri::test::MockRuntime>) {
+        for _ in 0..200 {
+            if send_get_state(handle).await.last_error.is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("service error was not recorded within ~1s");
     }
 
     // ── State transition: initial state is Idle ───────────────────────
@@ -1899,8 +3758,10 @@ mod tests {
         // Start — transitions to Initializing, then Running after init()
         send_start(&handle, app.handle().clone()).await.unwrap();
 
-        // Small delay for spawned task to complete init() → Running
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Poll for Running (BlockingService stays Running) instead of a fixed
+        // sleep, which races the actor's Initializing→Running transition under
+        // parallel-suite load (mem-1781352466-ae2a).
+        wait_until_running(&handle).await;
         let status = send_get_state(&handle).await;
         assert_eq!(status.state, ServiceLifecycle::Running);
 
@@ -1920,8 +3781,10 @@ mod tests {
 
         send_start(&handle, app.handle().clone()).await.unwrap();
 
-        // Wait for init failure to propagate
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Poll until the init failure is recorded instead of a fixed sleep,
+        // which races the FailingInit cleanup under parallel-suite load
+        // (mem-1781352466-ae2a). last_error set ⇒ the actor has reached Stopped.
+        wait_until_error_recorded(&handle).await;
 
         let status = send_get_state(&handle).await;
         assert_eq!(status.state, ServiceLifecycle::Stopped);
@@ -1943,7 +3806,10 @@ mod tests {
         let app = tauri::test::mock_app();
 
         send_start(&handle, app.handle().clone()).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Poll for Running instead of a fixed sleep, which races the
+        // Initializing→Running transition under parallel-suite load
+        // (mem-1781352466-ae2a).
+        wait_until_running(&handle).await;
 
         let status = send_get_state(&handle).await;
         assert_eq!(status.state, ServiceLifecycle::Running);
@@ -1967,7 +3833,7 @@ mod tests {
         let app = tauri::test::mock_app();
 
         send_start(&handle, app.handle().clone()).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wait_until_error_recorded(&handle).await;
 
         let status = send_get_state(&handle).await;
         assert_eq!(status.state, ServiceLifecycle::Stopped);
@@ -1995,7 +3861,7 @@ mod tests {
 
         // First start: init fails
         send_start(&handle2, app2.handle().clone()).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wait_until_error_recorded(&handle2).await;
 
         let status = send_get_state(&handle2).await;
         assert_eq!(status.state, ServiceLifecycle::Stopped);
@@ -2004,9 +3870,12 @@ mod tests {
             "first run should set last_error"
         );
 
-        // Second start: succeeds — last_error must be None
+        // Second start: succeeds — last_error must be None.
+        // handle_start clears last_error synchronously before send_start
+        // returns; wait for the ImmediateSuccessService to reach its natural
+        // Stopped completion so we observe the final state deterministically.
         send_start(&handle2, app2.handle().clone()).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wait_until_stopped(&handle2, 1000).await;
 
         let status = send_get_state(&handle2).await;
         // After successful init + run completion, state is Stopped (natural completion)
@@ -2077,7 +3946,22 @@ mod tests {
             Box::new(|| Box::new(BlockingService));
         // Processing timeout = 0.0 (default, no cap)
         tokio::spawn(manager_loop(
-            cmd_rx, factory, 28.0, 0.0, 15.0, 15.0, false, false, None,
+            cmd_rx,
+            factory,
+            28.0,
+            0.0,
+            15.0,
+            15.0,
+            false,
+            false,
+            4.0,
+            None,
+            vec!["remoteMessaging".into()],
+            true,
+            NotifierPolicy::default(),
+            None,
+            None,
+            false,
         ));
 
         let app = tauri::test::mock_app();
@@ -2142,6 +4026,172 @@ mod tests {
             self.saves.lock().unwrap().clear();
             Ok(())
         }
+    }
+
+    // ── BGS-05 Leg B: boot Start-replay from persisted desired-state ──────
+
+    /// Poll `IsRunning` until true or `timeout_ms` elapses (boot replay fires
+    /// when the manager_loop task is first scheduled).
+    async fn poll_is_running(
+        handle: &ServiceManagerHandle<tauri::test::MockRuntime>,
+        timeout_ms: u64,
+    ) -> bool {
+        let start = std::time::Instant::now();
+        loop {
+            if send_is_running(handle).await {
+                return true;
+            }
+            if start.elapsed().as_millis() >= timeout_ms as u128 {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[test]
+    fn bgs05_should_replay_on_boot_decision() {
+        // Pure decision fn (host-testable, no actor). `desired_running` is the
+        // sole gate; the desktop lifecycle check + `handle_start` dispatch live
+        // in `manager_loop`'s pre-loop block. NV-MUT (force false) REDs the
+        // replay test; (force true) REDs the no-replay guards.
+        let on = DesiredState {
+            desired_running: true,
+            ..Default::default()
+        };
+        let off = DesiredState {
+            desired_running: false,
+            ..Default::default()
+        };
+        assert!(should_replay_on_boot(&on), "desired_running=true ⇒ replay");
+        assert!(
+            !should_replay_on_boot(&off),
+            "desired_running=false ⇒ no replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn bgs05_replay_starts_on_boot_when_desired() {
+        // Seed desired_running=true + a valid last_start_config. With boot_app
+        // threaded, manager_loop replays a Start on entry (desktop lifecycle)
+        // via handle_start — the SAME path a runtime Start takes. BlockingService
+        // keeps is_running true. NV-MUT (should_replay_on_boot ⇒ false) REDs
+        // ONLY this leg.
+        let backend = MockDesiredStateBackend::new();
+        backend
+            .save(&DesiredState {
+                desired_running: true,
+                last_start_config: Some(
+                    serde_json::to_value(StartConfig {
+                        service_label: "Sila".into(),
+                        foreground_service_type: "remoteMessaging".into(),
+                    })
+                    .unwrap(),
+                ),
+                ..Default::default()
+            })
+            .unwrap();
+        let app = tauri::test::mock_app();
+        let handle = setup_manager_with_factory_backend_and_boot_app(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend),
+            Some(app.handle().clone()),
+            true,
+        );
+        assert!(
+            poll_is_running(&handle, 1000).await,
+            "boot replay should start the service when desired_running=true"
+        );
+        let _ = send_stop(&handle).await;
+    }
+
+    #[tokio::test]
+    async fn bgs05_no_replay_when_desired_false() {
+        // desired_running=false ⇒ should_replay_on_boot is false ⇒ no Start on
+        // boot even with boot_app + backend configured.
+        let backend = MockDesiredStateBackend::new();
+        backend
+            .save(&DesiredState {
+                desired_running: false,
+                ..Default::default()
+            })
+            .unwrap();
+        let app = tauri::test::mock_app();
+        let handle = setup_manager_with_factory_backend_and_boot_app(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend),
+            Some(app.handle().clone()),
+            true,
+        );
+        // Give the loop a moment to (not) replay.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            !send_is_running(&handle).await,
+            "no boot replay when desired_running=false"
+        );
+    }
+
+    #[tokio::test]
+    async fn bgs05_no_replay_without_backend() {
+        // Regression guard: callers that pass backend=None see NO boot replay
+        // (preserves the pre-Step-6 behavior; mirrors Step-5 unchanged-default
+        // discipline). boot_app is Some here to prove the backend gate binds.
+        let app = tauri::test::mock_app();
+        let handle = setup_manager_with_factory_backend_and_boot_app(
+            Box::new(|| Box::new(BlockingService)),
+            None,
+            Some(app.handle().clone()),
+            true,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            !send_is_running(&handle).await,
+            "no boot replay without a desired-state backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn bgs05_no_replay_when_consent_allows_auto_unlock_false() {
+        // BGS-05 re-fix HEADLINE LEG-B PIN (Critic Blocker 2 — F2 load-bearing
+        // wiring pin). The persisted desired-state says `desired_running=true`
+        // with a valid `last_start_config`, AND `boot_app` is `Some` — every
+        // OTHER replay gate is satisfied — but `consent_allows_auto_unlock=false`
+        // ⇒ the replay guard must SHORT-CIRCUIT ⇒ no `handle_start` ⇒ the
+        // service never reaches `is_running`. This is the consent half of the
+        // Leg A/Leg B coordination: consent OFF suppresses the boot Start-replay
+        // regardless of desired-state. NV-MUT (drop the `&&
+        // consent_allows_auto_unlock` conjunct from the replay guard, OR pass
+        // `true` here) ⇒ the replay fires ⇒ `BlockingService` sets is_running ⇒
+        // the `!send_is_running` assert flips ⇒ RED. Pairs with the F3 builder
+        // pin (`bgs05_start_headless_core_consent_off_stays_locked_despite_credential`
+        // in the Sila crate): F2 gates the replay dispatch, F3 gates the builder
+        // itself — together they close every boot-reachable auto-unlock path.
+        let backend = MockDesiredStateBackend::new();
+        backend
+            .save(&DesiredState {
+                desired_running: true,
+                last_start_config: Some(
+                    serde_json::to_value(StartConfig {
+                        service_label: "Sila".into(),
+                        foreground_service_type: "remoteMessaging".into(),
+                    })
+                    .unwrap(),
+                ),
+                ..Default::default()
+            })
+            .unwrap();
+        let app = tauri::test::mock_app();
+        let handle = setup_manager_with_factory_backend_and_boot_app(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend),
+            Some(app.handle().clone()),
+            false,
+        );
+        // Give the loop a moment to (not) replay.
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            !send_is_running(&handle).await,
+            "consent_allows_auto_unlock=false ⇒ no boot replay even with desired_running=true"
+        );
     }
 
     // ── Desired-state actor integration tests ─────────────────────────────
@@ -2299,9 +4349,10 @@ mod tests {
     #[tokio::test]
     async fn start_config_serialized_in_desired_state() {
         let backend = MockDesiredStateBackend::new();
-        let handle = setup_manager_with_factory_and_backend(
-            Box::new(|| Box::new(BlockingService)),
+        let handle = setup_manager_with_backend_and_allowlist(
             Some(backend.clone()),
+            vec!["specialUse".into()],
+            true,
         );
         let app = tauri::test::mock_app();
 
@@ -2384,9 +4435,10 @@ mod tests {
     #[tokio::test]
     async fn get_state_returns_last_start_config_from_backend() {
         let backend = MockDesiredStateBackend::new();
-        let handle = setup_manager_with_factory_and_backend(
-            Box::new(|| Box::new(BlockingService)),
+        let handle = setup_manager_with_backend_and_allowlist(
             Some(backend.clone()),
+            vec!["specialUse".into()],
+            true,
         );
         let app = tauri::test::mock_app();
 
@@ -2588,6 +4640,89 @@ mod tests {
             "recovery_reason should be cleared"
         );
         assert_eq!(ds.restart_attempt, 0, "restart_attempt should be cleared");
+    }
+
+    // ── Step 5 (H4): recovery commands mirror desired state to native ──────
+
+    #[tokio::test]
+    async fn enable_auto_restart_mirrors_desired_state_to_native() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_backend(Some(backend.clone()));
+        let mock = MockMobile::new();
+        send_set_mobile(&handle, mock.clone()).await;
+
+        let config = StartConfig {
+            service_label: "Mirror".into(),
+            foreground_service_type: "specialUse".into(),
+        };
+        send_enable_auto_restart(&handle, Some(config.clone()))
+            .await
+            .unwrap();
+
+        let mirrors = mock.mirror_calls.lock().unwrap();
+        assert_eq!(
+            mirrors.len(),
+            1,
+            "enableAutoRestart must mirror exactly once to native (H4), got {mirrors:?}"
+        );
+        let (desired, cfg) = &mirrors[0];
+        assert!(*desired, "mirror should request desired_running=true");
+        let cfg = cfg.as_ref().expect("config should be mirrored to native");
+        assert_eq!(cfg["serviceLabel"], "Mirror");
+        assert_eq!(cfg["foregroundServiceType"], "specialUse");
+    }
+
+    #[tokio::test]
+    async fn disable_auto_restart_mirrors_false_to_native() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_backend(Some(backend.clone()));
+        let mock = MockMobile::new();
+        send_set_mobile(&handle, mock.clone()).await;
+
+        send_disable_auto_restart(&handle).await.unwrap();
+
+        let mirrors = mock.mirror_calls.lock().unwrap();
+        assert_eq!(
+            mirrors.len(),
+            1,
+            "disableAutoRestart must mirror exactly once to native (H4)"
+        );
+        let (desired, cfg) = &mirrors[0];
+        assert!(!*desired, "mirror should request desired_running=false");
+        assert!(cfg.is_none(), "disable must not mirror a start config");
+    }
+
+    #[tokio::test]
+    async fn set_desired_running_mirrors_to_native() {
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_backend(Some(backend.clone()));
+        let mock = MockMobile::new();
+        send_set_mobile(&handle, mock.clone()).await;
+
+        send_set_desired_running(&handle, true, None).await.unwrap();
+
+        let mirrors = mock.mirror_calls.lock().unwrap();
+        assert_eq!(
+            mirrors.len(),
+            1,
+            "setDesiredRunning must mirror exactly once to native (H4)"
+        );
+        assert!(mirrors[0].0, "mirror should request desired_running=true");
+    }
+
+    #[tokio::test]
+    async fn enable_auto_restart_without_mobile_does_not_panic() {
+        // Desktop path: no mobile bridge — mirror is a no-op, command still
+        // saves desired state (regression guard for the H4 mirror seam).
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_backend(Some(backend.clone()));
+
+        send_enable_auto_restart(&handle, None).await.unwrap();
+
+        let ds = backend
+            .last_save()
+            .expect("should still save without mobile");
+        assert!(ds.desired_running);
     }
 
     #[tokio::test]
@@ -2853,6 +4988,192 @@ mod tests {
         assert!(
             !saves.last().unwrap().desired_running,
             "AppStop should clear desired_running"
+        );
+    }
+
+    // ── D1 NotifySink seam tests (Step 2: wiring only, no fire points) ──
+
+    #[tokio::test]
+    async fn recording_sink_records_notify_calls() {
+        let sink = RecordingSink::new();
+        sink.notify("bg-timeout", "title", "body");
+        assert_eq!(
+            sink.calls(),
+            vec![("bg-timeout".into(), "title".into(), "body".into())]
+        );
+    }
+
+    // ── D1 fire-point tests (Step 3) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn timeout_stop_with_default_policy_fires_nothing() {
+        // Default policy (everything off) must keep stops silent even with
+        // a live sink installed.
+        let sink = RecordingSink::new();
+        let handle = setup_manager_with_sink(NotifierPolicy::default(), sink.clone());
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        wait_until_running(&handle).await;
+        send_stop_with_reason(&handle, StopReason::PlatformTimeout)
+            .await
+            .unwrap();
+
+        assert!(
+            sink.calls().is_empty(),
+            "default policy must not notify on PlatformTimeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_stop_fires_bg_timeout_when_policy_on() {
+        let sink = RecordingSink::new();
+        let policy = NotifierPolicy {
+            on_timeout: true,
+            on_recovery: false,
+        };
+        let handle = setup_manager_with_sink(policy, sink.clone());
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        wait_until_running(&handle).await;
+        send_stop_with_reason(&handle, StopReason::PlatformTimeout)
+            .await
+            .unwrap();
+
+        let calls = sink.calls();
+        assert_eq!(
+            calls.len(),
+            1,
+            "exactly one notification on PlatformTimeout"
+        );
+        assert_eq!(calls[0].0, "bg-timeout", "stable id so repeats replace");
+
+        // PlatformExpiration is the other platform-pause reason and must use
+        // the SAME stable id so notices replace rather than stack.
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        wait_until_running(&handle).await;
+        send_stop_with_reason(&handle, StopReason::PlatformExpiration)
+            .await
+            .unwrap();
+
+        let calls = sink.calls();
+        assert_eq!(calls.len(), 2, "PlatformExpiration also notifies");
+        assert_eq!(calls[1].0, "bg-timeout");
+    }
+
+    #[tokio::test]
+    async fn user_stop_fires_nothing_even_with_timeout_policy_on() {
+        let sink = RecordingSink::new();
+        let policy = NotifierPolicy {
+            on_timeout: true,
+            on_recovery: true,
+        };
+        let handle = setup_manager_with_sink(policy, sink.clone());
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        wait_until_running(&handle).await;
+        send_stop_with_reason(&handle, StopReason::UserStop)
+            .await
+            .unwrap();
+
+        assert!(
+            sink.calls().is_empty(),
+            "intentional user stop must never notify"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_acceptance_fires_bg_recovery_not_the_stop_path() {
+        let sink = RecordingSink::new();
+        let policy = NotifierPolicy {
+            on_timeout: false,
+            on_recovery: true,
+        };
+        let handle = setup_manager_with_sink(policy, sink.clone());
+        let app = tauri::test::mock_app();
+
+        // A STOP with reason OsRestart is not recovery acceptance and must
+        // not notify (Design Critic concern #1).
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        wait_until_running(&handle).await;
+        send_stop_with_reason(&handle, StopReason::OsRestart)
+            .await
+            .unwrap();
+        assert!(
+            sink.calls().is_empty(),
+            "stop with reason OsRestart is not recovery acceptance"
+        );
+
+        // The ACCEPTANCE event fires exactly one bg-recovery, without any
+        // service-running precondition (the native layer owns the restart).
+        send_native_event(&handle, NativeLifecycleEvent::AndroidOsRestartAccepted)
+            .await
+            .unwrap();
+        let calls = sink.calls();
+        assert_eq!(calls.len(), 1, "exactly one notification on acceptance");
+        assert_eq!(calls[0].0, "bg-recovery", "stable id so repeats replace");
+
+        // Boot-recovery acceptance uses the SAME stable id.
+        send_native_event(&handle, NativeLifecycleEvent::AndroidBootRecoveryAccepted)
+            .await
+            .unwrap();
+        let calls = sink.calls();
+        assert_eq!(calls.len(), 2, "boot-recovery acceptance also notifies");
+        assert_eq!(calls[1].0, "bg-recovery");
+    }
+
+    #[tokio::test]
+    async fn fire_points_with_no_sink_installed_do_not_panic() {
+        // All-on policy but no sink (headless daemon): both fire points must
+        // be safe no-ops.
+        let policy = NotifierPolicy {
+            on_timeout: true,
+            on_recovery: true,
+        };
+        let handle = setup_manager_with_policy_and_sink(policy, None);
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        wait_until_running(&handle).await;
+        send_stop_with_reason(&handle, StopReason::PlatformTimeout)
+            .await
+            .unwrap();
+        send_native_event(&handle, NativeLifecycleEvent::AndroidOsRestartAccepted)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn android_derived_policy_suppresses_both_fire_points() {
+        // DEC-002: on Android with androidOnTimeout=notifyUser the Kotlin
+        // layer already posts native notifications — the derived policy must
+        // suppress both plugin-side fire points even with both keys true.
+        let config = crate::models::PluginConfig {
+            notify_on_timeout: true,
+            notify_on_recovery: true,
+            android_on_timeout: "notifyUser".into(),
+            ..Default::default()
+        };
+        let policy = NotifierPolicy::derive(&config, true);
+
+        let sink = RecordingSink::new();
+        let handle = setup_manager_with_sink(policy, sink.clone());
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        wait_until_running(&handle).await;
+        send_stop_with_reason(&handle, StopReason::PlatformTimeout)
+            .await
+            .unwrap();
+        send_native_event(&handle, NativeLifecycleEvent::AndroidOsRestartAccepted)
+            .await
+            .unwrap();
+
+        assert!(
+            sink.calls().is_empty(),
+            "android-derived policy must suppress both fire points (DEC-002)"
         );
     }
 
@@ -3263,15 +5584,50 @@ mod tests {
         );
     }
 
-    // ── Cancel-listener actor-level integration tests ────────────────────────
-    //
-    // These tests exercise the full cmd_tx → manager_loop path that
-    // run_cancel_listener (in lib.rs) uses to send StopWithReason commands.
-    // They verify desired-state and keepalive behaviour with both
-    // MockDesiredStateBackend and MockMobile wired into the actor.
+    // ── Step 8 (H2/M13): stop-reason matrix per design §5.4 ─────────────────
 
+    /// Every `StopReason` maps to the expected `should_stop_keepalive` /
+    /// `should_clear_desired_state` policy per design §5.4. `clear_desired`
+    /// gates the Swift `UserDefaults` `desired=false` write, so it doubles as
+    /// the "write UD desired=false?" column. `PlatformTimeout` and `ProcessExit`
+    /// preserve desired state and skip keepalive teardown (M13/H2).
+    #[test]
+    fn stop_reason_matrix_matches_design_5_4() {
+        // (reason, should_stop_keepalive, should_clear_desired_state)
+        let matrix = [
+            (StopReason::UserStop, true, true),
+            (StopReason::AppStop, true, true),
+            (StopReason::NativeNotificationStop, true, true),
+            (StopReason::TaskCompleted, true, true),
+            (StopReason::OsRestart, true, false),
+            (StopReason::BootRecovery, true, false),
+            (StopReason::Error, true, false),
+            (StopReason::PlatformExpiration, false, false),
+            // M13: cancel-listener timeout preserves desired + skips keepalive.
+            (StopReason::PlatformTimeout, false, false),
+            // H2: OS-driven exit preserves desired + skips keepalive.
+            (StopReason::ProcessExit, false, false),
+        ];
+        for (reason, expect_stop_keepalive, expect_clear_desired) in matrix {
+            assert_eq!(
+                should_stop_keepalive(reason),
+                expect_stop_keepalive,
+                "should_stop_keepalive mismatch for {reason:?}"
+            );
+            assert_eq!(
+                should_clear_desired_state(reason),
+                expect_clear_desired,
+                "should_clear_desired_state mismatch for {reason:?}"
+            );
+        }
+    }
+
+    /// H2: an OS-driven `ProcessExit` (the iOS `RunEvent::Exit` path) stops the
+    /// service but preserves desired state and leaves the keepalive / BGTask
+    /// schedule intact — it must not masquerade as a `UserStop` that erases
+    /// recovery intent. A genuine user stop is covered by the UserStop tests.
     #[tokio::test]
-    async fn cancel_listener_platform_timeout_preserves_desired_and_stops_keepalive() {
+    async fn process_exit_preserves_desired_and_keepalive() {
         let mock = MockMobile::new();
         let backend = MockDesiredStateBackend::new();
         let handle = setup_manager_with_factory_and_backend(
@@ -3286,6 +5642,56 @@ mod tests {
 
         let saves_before = backend.saves.lock().unwrap().len();
 
+        send_stop_with_reason(&handle, StopReason::ProcessExit)
+            .await
+            .unwrap();
+
+        assert!(!send_is_running(&handle).await, "service should be stopped");
+
+        // H2: keepalive (BGTask schedule) must survive an OS-driven exit.
+        assert_eq!(
+            mock.stop_called.load(Ordering::Acquire),
+            0,
+            "ProcessExit should NOT call stop_keepalive (H2)"
+        );
+
+        // Desired state must be preserved so recovery can resume delivery.
+        let saves = backend.saves.lock().unwrap();
+        assert_eq!(
+            saves.len(),
+            saves_before,
+            "ProcessExit should not save new desired state"
+        );
+        assert!(
+            saves.last().unwrap().desired_running,
+            "ProcessExit must preserve desired_running=true"
+        );
+    }
+
+    // ── Cancel-listener actor-level integration tests ────────────────────────
+    //
+    // These tests exercise the full cmd_tx → manager_loop path that
+    // run_cancel_listener (in lib.rs) uses to send StopWithReason commands.
+    // They verify desired-state and keepalive behaviour with both
+    // MockDesiredStateBackend and MockMobile wired into the actor.
+
+    #[tokio::test]
+    async fn cancel_listener_platform_timeout_preserves_desired_and_resubmits() {
+        let mock = MockMobile::new();
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        send_set_mobile(&handle, mock.clone()).await;
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let saves_before = backend.saves.lock().unwrap().len();
+        let mirror_before = mock.mirror_calls.lock().unwrap().len();
+
         // Simulate what run_cancel_listener sends on timeout
         send_stop_with_reason(&handle, StopReason::PlatformTimeout)
             .await
@@ -3293,14 +5699,15 @@ mod tests {
 
         assert!(!send_is_running(&handle).await, "service should be stopped");
 
-        // PlatformTimeout should call stop_keepalive (unlike PlatformExpiration)
+        // M13: PlatformTimeout must NOT tear down keepalive — treat it like
+        // PlatformExpiration (the OS already paused the background window).
         assert_eq!(
             mock.stop_called.load(Ordering::Acquire),
-            1,
-            "PlatformTimeout should call stop_keepalive"
+            0,
+            "PlatformTimeout should NOT call stop_keepalive (M13)"
         );
 
-        // Desired state should be preserved
+        // Desired state should be preserved (no desired=false write).
         let saves = backend.saves.lock().unwrap();
         assert_eq!(
             saves.len(),
@@ -3310,6 +5717,19 @@ mod tests {
         assert!(
             saves.last().unwrap().desired_running,
             "desired_running should remain true"
+        );
+
+        // M13 reconcile: desired stays true, so re-submit native scheduling
+        // (mirror) so a future BGTask resumes delivery instead of silently dying.
+        let mirror = mock.mirror_calls.lock().unwrap();
+        assert_eq!(
+            mirror.len(),
+            mirror_before + 1,
+            "PlatformTimeout should re-submit native scheduling exactly once"
+        );
+        assert!(
+            mirror.last().unwrap().0,
+            "reconcile must mirror desired_running=true (never false)"
         );
     }
 
@@ -3441,11 +5861,12 @@ mod tests {
             "desired_running should remain true"
         );
 
-        // stop_keepalive should have been called (not PlatformExpiration)
+        // M13: AndroidTimeout maps to PlatformTimeout, which now preserves the
+        // keepalive (the OS already timed out the FGS window).
         assert_eq!(
             mock.stop_called.load(Ordering::Acquire),
-            1,
-            "AndroidTimeout should call stop_keepalive"
+            0,
+            "AndroidTimeout (PlatformTimeout) should NOT call stop_keepalive (M13)"
         );
     }
 
@@ -3537,7 +5958,10 @@ mod tests {
             setup_manager_with_factory_and_backend(Box::new(|| Box::new(BlockingService)), None);
         let app = tauri::test::mock_app();
         send_start(&handle, app.handle().clone()).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Poll for Running instead of a fixed sleep, which races the
+        // Initializing→Running transition under parallel-suite load
+        // (mem-1781352466-ae2a).
+        wait_until_running(&handle).await;
 
         let status = send_get_lifecycle_status(&handle).await;
         assert!(
@@ -3627,6 +6051,870 @@ mod tests {
             matches!(status.state, LifecycleState::Stopped),
             "expected Stopped, got {:?}",
             status.state
+        );
+    }
+
+    // ── Step 3: State merge / degraded detection tests ────────────────────
+
+    /// Mock mobile that returns a configurable [`AndroidServiceState`].
+    ///
+    /// `start_keepalive` / `stop_keepalive` are no-ops (always succeed).
+    /// `get_android_service_state` returns the value set via
+    /// [`Self::set_native_state`], or `Ok(None)` if unset.
+    struct MockNativeState {
+        native_state: std::sync::Mutex<Option<crate::models::AndroidServiceState>>,
+        android_calls: AtomicUsize,
+    }
+
+    impl MockNativeState {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                native_state: std::sync::Mutex::new(None),
+                android_calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn set_native_state(&self, state: crate::models::AndroidServiceState) {
+            *self.native_state.lock().unwrap() = Some(state);
+        }
+
+        fn android_call_count(&self) -> usize {
+            self.android_calls.load(Ordering::Acquire)
+        }
+    }
+
+    impl MobileKeepalive for MockNativeState {
+        #[allow(clippy::too_many_arguments)]
+        fn start_keepalive(
+            &self,
+            _label: &str,
+            _foreground_service_type: &str,
+            _ios_safety_timeout_secs: Option<f64>,
+            _ios_processing_safety_timeout_secs: Option<f64>,
+            _ios_earliest_refresh_begin_minutes: Option<f64>,
+            _ios_earliest_processing_begin_minutes: Option<f64>,
+            _ios_requires_external_power: Option<bool>,
+            _ios_requires_network_connectivity: Option<bool>,
+            _ios_processing_ceiling_multiplier: Option<f64>,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn stop_keepalive(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn get_android_service_state(
+            &self,
+        ) -> Result<Option<crate::models::AndroidServiceState>, ServiceError> {
+            self.android_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(self.native_state.lock().unwrap().clone())
+        }
+    }
+
+    /// Helper: create a default `AndroidServiceState` with the given
+    /// `native_running` flag. All other fields get sensible defaults.
+    fn native_state(running: bool) -> crate::models::AndroidServiceState {
+        crate::models::AndroidServiceState {
+            native_running: running,
+            native_foreground: running,
+            desired_running: running,
+            durable_state: if running { "running" } else { "stopped" }.into(),
+            service_label: None,
+            foreground_service_type: None,
+            notification_id: None,
+            notification_channel_id: None,
+            recovery_pending: false,
+            recovery_reason: None,
+            last_platform_error: None,
+            data_dir: "/data".into(),
+        }
+    }
+
+    /// AC1: Adopt native when running, Rust idle.
+    #[tokio::test]
+    async fn merge_adopt_native_when_running() {
+        let mock = MockNativeState::new();
+        let handle =
+            setup_manager_with_factory_and_backend(Box::new(|| Box::new(BlockingService)), None);
+        let app = tauri::test::mock_app();
+
+        send_set_mobile(&handle, mock.clone()).await;
+        // Start → Rust running, app handle stored.
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Stop → Rust becomes stopped.
+        send_stop(&handle).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Native reports running (OS restarted service).
+        mock.set_native_state(native_state(true));
+
+        let status = send_get_lifecycle_status(&handle).await;
+        assert_eq!(status.adopted, Some(true), "should adopt native");
+        assert_eq!(status.degraded, Some(false), "adopt is not degraded");
+        assert_eq!(status.native_running, Some(true));
+        assert!(
+            matches!(status.state, LifecycleState::Running),
+            "expected Running after adopt, got {:?}",
+            status.state,
+        );
+    }
+
+    /// AC2: Auto-heal when native stopped but Rust running.
+    #[tokio::test]
+    async fn merge_autoheal_when_native_stopped() {
+        let mock = MockNativeState::new();
+        let handle =
+            setup_manager_with_factory_and_backend(Box::new(|| Box::new(BlockingService)), None);
+        let app = tauri::test::mock_app();
+
+        send_set_mobile(&handle, mock.clone()).await;
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Native reports stopped while Rust is running.
+        mock.set_native_state(native_state(false));
+
+        let status = send_get_lifecycle_status(&handle).await;
+        assert_eq!(
+            status.degraded,
+            Some(true),
+            "transient degraded on mismatch"
+        );
+        assert_eq!(
+            status.degraded_reason,
+            Some("native_stopped_rust_running".into()),
+            "should explain the mismatch"
+        );
+        // Auto-healed: Rust is now idle/stopped.
+        assert!(
+            matches!(status.state, LifecycleState::Stopped | LifecycleState::Idle),
+            "expected Stopped or Idle after auto-heal, got {:?}",
+            status.state,
+        );
+    }
+
+    /// R-W1.4 / D-SPLITBRAIN: `is_running()` is native-authoritative.
+    ///
+    /// When the actor believes the service is running but the native authority
+    /// (`LifecycleService.isRunning`) reports stopped — e.g. the OS killed or
+    /// timed-out the FGS while the UI was closed — a direct `is_running()`
+    /// query MUST reconcile to native truth: converge to `false` (closing the
+    /// split-brain "stuck running" window the harness Scenario 8 tests) and
+    /// converge the lifecycle state to `Stopped`. The divergence is logged on
+    /// the reconcile path (NFR-1/NFR-5, no silent swallow).
+    #[tokio::test]
+    async fn actor_converges_to_native_stopped() {
+        let mock = MockNativeState::new();
+        let handle =
+            setup_manager_with_factory_and_backend(Box::new(|| Box::new(BlockingService)), None);
+        let app = tauri::test::mock_app();
+
+        send_set_mobile(&handle, mock.clone()).await;
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        // Poll for Running rather than a fixed sleep (mem-1781352466-ae2a).
+        wait_until_running(&handle).await;
+
+        // Precondition: with no native report yet, the actor believes it runs.
+        assert!(
+            send_is_running(&handle).await,
+            "precondition: actor should believe it is running after start",
+        );
+
+        // Native authority now reports STOPPED (OS killed/timed-out the FGS
+        // while the UI was closed) — the split-brain trigger.
+        mock.set_native_state(native_state(false));
+
+        // is_running() reconciles to native truth: converges to false, so a
+        // caller can never observe a stale "running" after a native stop.
+        assert!(
+            !send_is_running(&handle).await,
+            "is_running() must converge to native-stopped (no stuck 'running')",
+        );
+
+        // Full convergence: the lifecycle state also reflects native authority.
+        assert_eq!(
+            send_get_state(&handle).await.state,
+            ServiceLifecycle::Stopped,
+            "lifecycle state must converge to Stopped on native-authority reconcile",
+        );
+    }
+
+    /// AC3: Normal when both agree running.
+    #[tokio::test]
+    async fn merge_normal_both_running() {
+        let mock = MockNativeState::new();
+        let handle =
+            setup_manager_with_factory_and_backend(Box::new(|| Box::new(BlockingService)), None);
+        let app = tauri::test::mock_app();
+
+        send_set_mobile(&handle, mock.clone()).await;
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        // Poll for Running instead of a fixed sleep, which races the
+        // Initializing→Running transition under parallel-suite load
+        // (mem-1781352466-ae2a).
+        wait_until_running(&handle).await;
+
+        // Native agrees: running.
+        mock.set_native_state(native_state(true));
+
+        let status = send_get_lifecycle_status(&handle).await;
+        assert_eq!(status.degraded, Some(false));
+        assert_eq!(status.adopted, Some(false));
+        assert!(
+            matches!(status.state, LifecycleState::Running),
+            "expected Running, got {:?}",
+            status.state,
+        );
+    }
+
+    /// AC4: Normal when both agree idle.
+    #[tokio::test]
+    async fn merge_normal_both_idle() {
+        let mock = MockNativeState::new();
+        let handle = setup_manager();
+
+        send_set_mobile(&handle, mock.clone()).await;
+
+        // Neither started — Rust is idle, native reports stopped.
+        mock.set_native_state(native_state(false));
+
+        let status = send_get_lifecycle_status(&handle).await;
+        assert_eq!(status.degraded, Some(false));
+        assert!(
+            matches!(status.state, LifecycleState::Idle),
+            "expected Idle, got {:?}",
+            status.state,
+        );
+    }
+
+    /// AC5: Timeout detection — native timeout DurableState + Rust running.
+    #[tokio::test]
+    async fn merge_timeout_detection() {
+        let mock = MockNativeState::new();
+        let handle =
+            setup_manager_with_factory_and_backend(Box::new(|| Box::new(BlockingService)), None);
+        let app = tauri::test::mock_app();
+
+        send_set_mobile(&handle, mock.clone()).await;
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Native reports running but DurableState says "timeout".
+        let mut ns = native_state(true);
+        ns.durable_state = "timeout".into();
+        mock.set_native_state(ns);
+
+        let status = send_get_lifecycle_status(&handle).await;
+        assert_eq!(status.degraded, Some(true));
+        assert_eq!(
+            status.degraded_reason,
+            Some("native_timeout".into()),
+            "should report timeout degradation"
+        );
+    }
+
+    /// AC6: Recovery pending from native surfaces in status.
+    #[tokio::test]
+    async fn merge_recovery_pending_surfaces() {
+        let mock = MockNativeState::new();
+        let handle = setup_manager();
+
+        send_set_mobile(&handle, mock.clone()).await;
+
+        // Native reports recovery pending.
+        let mut ns = native_state(false);
+        ns.recovery_pending = true;
+        ns.recovery_reason = Some("core_start_failed".into());
+        mock.set_native_state(ns);
+
+        let status = send_get_lifecycle_status(&handle).await;
+        assert!(
+            status.recovery_pending,
+            "recovery_pending should be true from native state"
+        );
+    }
+
+    /// AC7: Degraded event emitted on state mismatch.
+    #[tokio::test]
+    async fn merge_degraded_event_emitted() {
+        let mock = MockNativeState::new();
+        let handle =
+            setup_manager_with_factory_and_backend(Box::new(|| Box::new(BlockingService)), None);
+        let app = tauri::test::mock_app();
+
+        let event_received = Arc::new(AtomicBool::new(false));
+        let event_received_clone = event_received.clone();
+        let _listener = app
+            .handle()
+            .listen("background-service:state-degraded", move |_event| {
+                event_received_clone.store(true, Ordering::Release);
+            });
+
+        send_set_mobile(&handle, mock.clone()).await;
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Trigger mismatch: native stopped, Rust running.
+        mock.set_native_state(native_state(false));
+
+        let _status = send_get_lifecycle_status(&handle).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            event_received.load(Ordering::Acquire),
+            "state-degraded event should be emitted on mismatch"
+        );
+    }
+
+    /// AC8: Degraded clears when states converge on next query.
+    #[tokio::test]
+    async fn merge_degraded_clears_on_convergence() {
+        let mock = MockNativeState::new();
+        let handle =
+            setup_manager_with_factory_and_backend(Box::new(|| Box::new(BlockingService)), None);
+        let app = tauri::test::mock_app();
+
+        send_set_mobile(&handle, mock.clone()).await;
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // First query: mismatch → degraded.
+        mock.set_native_state(native_state(false));
+        let status1 = send_get_lifecycle_status(&handle).await;
+        assert_eq!(
+            status1.degraded,
+            Some(true),
+            "first query should be degraded"
+        );
+
+        // Auto-heal set Rust to stopped. Now both agree stopped.
+        // Second query: convergence → degraded clears.
+        let status2 = send_get_lifecycle_status(&handle).await;
+        assert_eq!(
+            status2.degraded,
+            Some(false),
+            "degraded should clear on convergence"
+        );
+        assert_eq!(status2.degraded_reason, None);
+    }
+
+    // ── Step 10: iOS native reconciliation + Android-gating (H6, L4) ───────
+
+    /// Mock mobile that returns a configurable iOS [`IosNativeState`] via
+    /// `query_native_state` and COUNTS `get_android_service_state` calls, so a
+    /// test can assert the iOS status / reconcile paths never round-trip to the
+    /// Android bridge (L4).
+    struct MockIosNativeState {
+        ios_state: std::sync::Mutex<Option<crate::models::IosNativeState>>,
+        android_calls: AtomicUsize,
+    }
+
+    impl MockIosNativeState {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                ios_state: std::sync::Mutex::new(None),
+                android_calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn set_ios_state(&self, state: crate::models::IosNativeState) {
+            *self.ios_state.lock().unwrap() = Some(state);
+        }
+
+        fn android_call_count(&self) -> usize {
+            self.android_calls.load(Ordering::Acquire)
+        }
+    }
+
+    impl MobileKeepalive for MockIosNativeState {
+        #[allow(clippy::too_many_arguments)]
+        fn start_keepalive(
+            &self,
+            _label: &str,
+            _foreground_service_type: &str,
+            _ios_safety_timeout_secs: Option<f64>,
+            _ios_processing_safety_timeout_secs: Option<f64>,
+            _ios_earliest_refresh_begin_minutes: Option<f64>,
+            _ios_earliest_processing_begin_minutes: Option<f64>,
+            _ios_requires_external_power: Option<bool>,
+            _ios_requires_network_connectivity: Option<bool>,
+            _ios_processing_ceiling_multiplier: Option<f64>,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn stop_keepalive(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        fn get_android_service_state(
+            &self,
+        ) -> Result<Option<crate::models::AndroidServiceState>, ServiceError> {
+            // L4 tripwire: the iOS status/reconcile path must NEVER reach this.
+            self.android_calls.fetch_add(1, Ordering::AcqRel);
+            Ok(None)
+        }
+
+        fn get_ios_native_state(
+            &self,
+        ) -> Result<Option<crate::models::IosNativeState>, ServiceError> {
+            Ok(self.ios_state.lock().unwrap().clone())
+        }
+
+        fn query_native_state(&self) -> Result<Option<NativeAuthority>, ServiceError> {
+            // Mirror the real iOS `MobileLifecycle`: tag the snapshot `Ios` and
+            // never touch the Android bridge.
+            Ok(self.get_ios_native_state()?.map(NativeAuthority::Ios))
+        }
+    }
+
+    /// Helper: a default iOS native snapshot with the given desired-running
+    /// flag, in-budget, no active task / pending / error.
+    fn ios_state(desired_running: bool) -> crate::models::IosNativeState {
+        crate::models::IosNativeState {
+            desired_running,
+            refresh_scheduled: false,
+            processing_scheduled: false,
+            active_task_kind: None,
+            pending_task: None,
+            last_completed_at: None,
+            last_completion_reason: None,
+            last_refresh_error: None,
+            last_processing_error: None,
+            in_budget: true,
+        }
+    }
+
+    /// H6 / AC1: a native scheduling failure surfaces as degraded + the real
+    /// error string — not silently swallowed and not stale actor memory.
+    #[tokio::test]
+    async fn ios_status_reflects_scheduling_failure() {
+        let mock = MockIosNativeState::new();
+        let handle =
+            setup_manager_with_factory_and_backend(Box::new(|| Box::new(BlockingService)), None);
+        send_set_mobile(&handle, mock.clone()).await;
+
+        let mut s = ios_state(true);
+        s.last_refresh_error = Some("BGTaskSchedulerErrorDomain code 1".into());
+        mock.set_ios_state(s);
+
+        let status = send_get_lifecycle_status(&handle).await;
+        assert_eq!(
+            status.degraded,
+            Some(true),
+            "iOS scheduling failure must report degraded",
+        );
+        assert_eq!(
+            status.degraded_reason,
+            Some("ios_scheduling_error".into()),
+            "degraded reason must name the iOS scheduling error",
+        );
+        assert_eq!(
+            status.last_platform_error,
+            Some("BGTaskSchedulerErrorDomain code 1".into()),
+            "the real native error string must surface",
+        );
+        assert_eq!(mock.android_call_count(), 0, "L4: no Android round-trip");
+    }
+
+    /// H6 / AC1: with the service desired but no BGTask currently executing,
+    /// the status reflects the native "waiting for next BGTask" phase and an
+    /// honest `native_running=false`, instead of the actor's stale "running".
+    #[tokio::test]
+    async fn ios_status_reflects_waiting_for_next_bgtask() {
+        let mock = MockIosNativeState::new();
+        let handle =
+            setup_manager_with_factory_and_backend(Box::new(|| Box::new(BlockingService)), None);
+        let app = tauri::test::mock_app();
+        send_set_mobile(&handle, mock.clone()).await;
+        // Actor believes it is running (BlockingService keeps run() alive)…
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        wait_until_running(&handle).await;
+
+        // …but the native snapshot shows no active BGTask (window expired).
+        mock.set_ios_state(ios_state(true));
+
+        let status = send_get_lifecycle_status(&handle).await;
+        assert_eq!(
+            status.last_platform_state,
+            Some("waitingForBgTask".into()),
+            "status must reflect the native waiting phase, not stale actor memory",
+        );
+        assert_eq!(
+            status.native_running,
+            Some(false),
+            "no BGTask is executing natively",
+        );
+        assert_eq!(status.degraded, Some(false));
+        assert_eq!(mock.android_call_count(), 0, "L4: no Android round-trip");
+    }
+
+    /// H6 / AC1: a desired-but-out-of-budget snapshot reports degraded.
+    #[tokio::test]
+    async fn ios_status_out_of_budget_is_degraded() {
+        let mock = MockIosNativeState::new();
+        let handle =
+            setup_manager_with_factory_and_backend(Box::new(|| Box::new(BlockingService)), None);
+        send_set_mobile(&handle, mock.clone()).await;
+
+        let mut s = ios_state(true);
+        s.in_budget = false;
+        mock.set_ios_state(s);
+
+        let status = send_get_lifecycle_status(&handle).await;
+        assert_eq!(status.degraded, Some(true));
+        assert_eq!(status.degraded_reason, Some("ios_out_of_budget".into()));
+    }
+
+    /// L4 / AC2: an iOS status poll must NOT invoke `getAndroidServiceState`.
+    #[tokio::test]
+    async fn ios_status_poll_does_not_call_get_android_service_state() {
+        let mock = MockIosNativeState::new();
+        let handle =
+            setup_manager_with_factory_and_backend(Box::new(|| Box::new(BlockingService)), None);
+        send_set_mobile(&handle, mock.clone()).await;
+        mock.set_ios_state(ios_state(true));
+
+        let status = send_get_lifecycle_status(&handle).await;
+        // Proof the iOS native path actually ran:
+        assert_eq!(status.last_platform_state, Some("waitingForBgTask".into()));
+        // …without ever touching the Android bridge.
+        assert_eq!(
+            mock.android_call_count(),
+            0,
+            "iOS status poll must not call getAndroidServiceState (L4)",
+        );
+    }
+
+    /// L4 / AC2: the iOS reconcile path (is_running) must not flip the actor's
+    /// belief (iOS has no authoritative native running bit) and must not call
+    /// `getAndroidServiceState`.
+    #[tokio::test]
+    async fn ios_reconcile_keeps_actor_belief_without_android_call() {
+        let mock = MockIosNativeState::new();
+        let handle =
+            setup_manager_with_factory_and_backend(Box::new(|| Box::new(BlockingService)), None);
+        let app = tauri::test::mock_app();
+        send_set_mobile(&handle, mock.clone()).await;
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        wait_until_running(&handle).await;
+
+        mock.set_ios_state(ios_state(true));
+
+        assert!(
+            send_is_running(&handle).await,
+            "iOS reconcile must keep the actor's running belief",
+        );
+        assert_eq!(
+            mock.android_call_count(),
+            0,
+            "iOS reconcile must not call getAndroidServiceState (L4)",
+        );
+    }
+
+    /// AC2 (Android path unchanged): the default `query_native_state` route
+    /// still queries `getAndroidServiceState` for the Android/desktop bridge.
+    #[tokio::test]
+    async fn android_status_poll_still_queries_android_state() {
+        let mock = MockNativeState::new();
+        let handle =
+            setup_manager_with_factory_and_backend(Box::new(|| Box::new(BlockingService)), None);
+        send_set_mobile(&handle, mock.clone()).await;
+        mock.set_native_state(native_state(true));
+
+        let _ = send_get_lifecycle_status(&handle).await;
+        assert!(
+            mock.android_call_count() >= 1,
+            "Android path must still query getAndroidServiceState",
+        );
+    }
+
+    // ── Step 11: Core Adoption Tests ──────────────────────────────────────
+
+    /// AC1: Native headless Core start → UI attach → event reception.
+    ///
+    /// Simulates Android OS sticky-restarting the service. The native layer
+    /// starts Core via JNI without Rust knowing. When the UI (re)attaches and
+    /// calls `get_lifecycle_status`, the merge logic adopts the native state.
+    /// The late subscriber can then receive events from the adopted Core.
+    #[tokio::test]
+    async fn adoption_native_start_ui_attach_events() {
+        let mock = MockNativeState::new();
+        let handle =
+            setup_manager_with_factory_and_backend(Box::new(|| Box::new(BlockingService)), None);
+        let app = tauri::test::mock_app();
+
+        // Register event listener BEFORE adoption (late subscriber).
+        let event_received = Arc::new(AtomicBool::new(false));
+        let event_received_clone = event_received.clone();
+        let _listener = app
+            .handle()
+            .listen("background-service:state-degraded", move |_event| {
+                event_received_clone.store(true, Ordering::Release);
+            });
+
+        send_set_mobile(&handle, mock.clone()).await;
+
+        // Start service normally → sets app handle in state.
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Stop service → Rust becomes stopped (simulating app killed by OS).
+        send_stop(&handle).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Native reports running (OS sticky restart).
+        mock.set_native_state(native_state(true));
+
+        // UI attaches → calls get_lifecycle_status.
+        let status = send_get_lifecycle_status(&handle).await;
+
+        // Adoption: native running, Rust idle → adopt.
+        assert_eq!(status.adopted, Some(true), "should adopt native state");
+        assert_eq!(status.degraded, Some(false), "adoption is not degraded");
+        assert!(
+            matches!(status.state, LifecycleState::Running),
+            "expected Running after adoption, got {:?}",
+            status.state,
+        );
+
+        // Verify the event system still works after adoption.
+        // Trigger a state mismatch to emit the degraded event.
+        mock.set_native_state(native_state(false));
+        let _ = send_get_lifecycle_status(&handle).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            event_received.load(Ordering::Acquire),
+            "late subscriber should receive events after adoption"
+        );
+    }
+
+    /// AC2: Data directory from native state surfaces in LifecycleStatus.
+    ///
+    /// When native reports its data directory, it should be visible in the
+    /// merged status so the UI can validate path consistency.
+    #[tokio::test]
+    async fn adoption_data_dir_surfaces_in_status() {
+        let mock = MockNativeState::new();
+        let handle = setup_manager();
+
+        send_set_mobile(&handle, mock.clone()).await;
+
+        let mut ns = native_state(false);
+        ns.data_dir = "/data/app/com.sila".into();
+        mock.set_native_state(ns);
+
+        let status = send_get_lifecycle_status(&handle).await;
+        assert_eq!(
+            status.data_dir,
+            Some("/data/app/com.sila".to_string()),
+            "data_dir from native should surface in status"
+        );
+    }
+
+    /// AC3: setup_idle is reported as healthy, not failed.
+    ///
+    /// When Core reports setup_idle (account setup needed), the service
+    /// is running in the background but waiting for user action.
+    /// This is a valid healthy state, not an error.
+    #[tokio::test]
+    async fn adoption_setup_idle_is_healthy() {
+        let mock = MockNativeState::new();
+        let handle = setup_manager();
+
+        send_set_mobile(&handle, mock.clone()).await;
+
+        // Native reports setup_idle: service running, Core in setup mode.
+        let mut ns = native_state(true);
+        ns.durable_state = "setup_idle".into();
+        mock.set_native_state(ns);
+
+        let status = send_get_lifecycle_status(&handle).await;
+
+        // Must NOT be Error or degraded.
+        assert!(
+            !matches!(status.state, LifecycleState::Error),
+            "setup_idle should not be reported as Error"
+        );
+        assert_ne!(
+            status.degraded,
+            Some(true),
+            "setup_idle should not be degraded"
+        );
+
+        // Must be reported as SetupIdle (not generic Running/Idle).
+        assert!(
+            matches!(status.state, LifecycleState::SetupIdle),
+            "expected SetupIdle, got {:?}",
+            status.state,
+        );
+    }
+
+    /// AC4: locked_idle is reported as healthy, not failed.
+    ///
+    /// When Core reports locked_idle (account locked, needs unlock), the
+    /// service is running in the background but waiting for user action.
+    /// This is a valid healthy state, not an error.
+    #[tokio::test]
+    async fn adoption_locked_idle_is_healthy() {
+        let mock = MockNativeState::new();
+        let handle = setup_manager();
+
+        send_set_mobile(&handle, mock.clone()).await;
+
+        // Native reports locked_idle: service running, Core in locked mode.
+        let mut ns = native_state(true);
+        ns.durable_state = "locked_idle".into();
+        mock.set_native_state(ns);
+
+        let status = send_get_lifecycle_status(&handle).await;
+
+        // Must NOT be Error or degraded.
+        assert!(
+            !matches!(status.state, LifecycleState::Error),
+            "locked_idle should not be reported as Error"
+        );
+        assert_ne!(
+            status.degraded,
+            Some(true),
+            "locked_idle should not be degraded"
+        );
+
+        // Must be reported as LockedIdle (not generic Running/Idle).
+        assert!(
+            matches!(status.state, LifecycleState::LockedIdle),
+            "expected LockedIdle, got {:?}",
+            status.state,
+        );
+    }
+
+    // ── Step 12: Stale DurableState Safety Checks ──────────────────────────
+
+    /// AC3: Stale timeout DurableState surfaces in status even when Rust is not running.
+    ///
+    /// Simulates: Android FGS timeout occurred (DurableState="timeout") but the
+    /// app relaunched. Rust actor is idle. `get_lifecycle_status` must still
+    /// surface the stale timeout so the UI can handle recovery.
+    #[tokio::test]
+    async fn stale_timeout_surfaces_in_status_when_not_running() {
+        let mock = MockNativeState::new();
+        let handle = setup_manager();
+
+        send_set_mobile(&handle, mock.clone()).await;
+
+        // Rust is idle (not started). Native reports NOT running, but DurableState
+        // has "timeout" from a previous session.
+        let mut ns = native_state(false);
+        ns.durable_state = "timeout".into();
+        ns.last_platform_error = Some("FGS timeout (type: remoteMessaging)".into());
+        mock.set_native_state(ns);
+
+        let status = send_get_lifecycle_status(&handle).await;
+        assert!(
+            status.degraded == Some(true) || status.degraded_reason.is_some(),
+            "stale timeout DurableState should be reflected in status even when Rust is not running — \
+             got degraded={:?}, degraded_reason={:?}",
+            status.degraded,
+            status.degraded_reason,
+        );
+    }
+
+    // ── BGS-31: graceful SIGTERM stop (doc-08 Step 9) ──────────────────
+    //
+    // The SIGTERM handler's graceful path is factored into
+    // `graceful_sigterm_shutdown` (desktop mod) so this test can drive the
+    // SAME code the real signal arm runs — a real SIGTERM is not deliverable
+    // in a unit test. Requires `--features desktop-service` (the desktop mod)
+    // and is unix-only to match SIGTERM semantics.
+
+    /// A service that stays running until its shutdown token is cancelled AND
+    /// records `shutdown_gracefully` (the BGS-31 bounded-drain hook). The hook
+    /// is stateless w.r.t. the instance — it sets a shared flag — so a fresh
+    /// factory instance setting it is equivalent to the running instance.
+    #[cfg(all(unix, feature = "desktop-service"))]
+    struct GracefulShutdownService {
+        drained: Arc<AtomicBool>,
+    }
+
+    #[cfg(all(unix, feature = "desktop-service"))]
+    #[async_trait]
+    impl BackgroundService<tauri::test::MockRuntime> for GracefulShutdownService {
+        async fn init(
+            &mut self,
+            _ctx: &ServiceContext<tauri::test::MockRuntime>,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+
+        async fn run(
+            &mut self,
+            ctx: &ServiceContext<tauri::test::MockRuntime>,
+        ) -> Result<(), ServiceError> {
+            // Block until stopped so the running token stays Some — else Stop
+            // returns NotRunning and SKIPS all bookkeeping (AC1 precondition).
+            ctx.shutdown.cancelled().await;
+            Ok(())
+        }
+
+        async fn shutdown_gracefully(
+            &mut self,
+            _ctx: &ServiceContext<tauri::test::MockRuntime>,
+        ) -> Result<(), ServiceError> {
+            self.drained.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// BGS-31 (doc-08 Step 9): SIGTERM/SIGINT triggers `ManagerCommand::Stop`
+    /// that REACHES manager_loop (bookkeeping) AND `ManagerCommand::ShutdownGracefully`
+    /// that drives the bounded-drain hook — NOT the abrupt Drop abort.
+    #[cfg(all(unix, feature = "desktop-service"))]
+    #[tokio::test]
+    async fn bgs31_sigterm_graceful_stop() {
+        use crate::desktop::headless::graceful_sigterm_shutdown;
+
+        let drained = Arc::new(AtomicBool::new(false));
+        let drained_for_factory = drained.clone();
+        let handle = setup_manager_with_factory(Box::new(move || {
+            Box::new(GracefulShutdownService {
+                drained: drained_for_factory.clone(),
+            })
+        }));
+
+        // AC1 precondition: arrange a RUNNING token first. Without a running
+        // service, handle_stop_with_reason returns NotRunning and SKIPS all
+        // bookkeeping.
+        let app = tauri::test::mock_app();
+        send_start(&handle, app.handle().clone())
+            .await
+            .expect("Start should succeed");
+        wait_until_running(&handle).await;
+        assert!(
+            handle.is_running().await,
+            "precondition: service should be running before SIGTERM"
+        );
+
+        // Drive the SIGTERM graceful path — the SAME code the signal arm runs.
+        graceful_sigterm_shutdown(&handle.cmd_tx).await;
+
+        // AC1 (i): the bookkeeping Stop REACHED manager_loop — is_running
+        // flipped to false (handle_stop clears it; the token was Some, so the
+        // bookkeeping ran). NOT a placebo: a send that never reached the loop
+        // would leave is_running true.
+        assert!(
+            !handle.is_running().await,
+            "Stop did not reach manager_loop (is_running still true)"
+        );
+
+        // AC1 (ii): shutdown_gracefully RAN (the bounded-drain hook fired via
+        // the fresh factory service) — NOT the abrupt process-exit Drop abort.
+        assert!(
+            drained.load(Ordering::SeqCst),
+            "shutdown_gracefully hook did not run (bounded drain not driven)"
         );
     }
 }

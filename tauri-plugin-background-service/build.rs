@@ -6,6 +6,8 @@ const COMMANDS: &[&str] = &[
     "get_platform_capabilities",
     "get_scheduling_status",
     "get_pending_bg_task",
+    "can_use_full_screen_intent",
+    "open_full_screen_intent_settings",
     "enable_auto_restart",
     "disable_auto_restart",
     "get_desired_service_state",
@@ -13,6 +15,18 @@ const COMMANDS: &[&str] = &[
     "validate_setup",
     "get_lifecycle_status",
     "configure_recovery",
+    // BGS-21 (doc-08 Step 12): notification-permission status + request. These
+    // route to the Android Kotlin @Command methods of the same camelCase names
+    // via run_mobile_plugin; the build.rs entry drives permission-token
+    // autogeneration (allow-get-/allow-request-notification-permission).
+    "get_notification_permission_status",
+    "request_notification_permission",
+    // BGS-22 (doc-08 Step 14): Android battery-optimization exemption request.
+    // Routes to the Kotlin requestBatteryExemption @Command via run_mobile_plugin
+    // (ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS). The
+    // REQUEST_IGNORE_BATTERY_OPTIMIZATIONS permission is declared in the plugin
+    // AndroidManifest.xml but was never requested (dead) until this flow.
+    "request_battery_exemption",
 ];
 
 #[cfg(feature = "desktop-service")]

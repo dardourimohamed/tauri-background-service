@@ -48,6 +48,40 @@ pub fn validate_foreground_service_type(t: &str) -> Result<(), ServiceError> {
     }
 }
 
+/// Validate a foreground service type against the plugin config allowlist.
+///
+/// Returns `Ok(())` if:
+/// - `validate` is `false` (skip check), OR
+/// - `fg_type` is empty (handled by [`validate_foreground_service_type`]), OR
+/// - `fg_type` matches an entry in `allowlist` (case-insensitive).
+///
+/// Returns `Err(ServiceError::Platform)` if:
+/// - `fg_type` is empty (when validate is true), OR
+/// - `fg_type` is not in the allowlist.
+pub fn validate_fg_type_against_allowlist(
+    fg_type: &str,
+    allowlist: &[String],
+    validate: bool,
+) -> Result<(), ServiceError> {
+    if !validate {
+        return Ok(());
+    }
+    if fg_type.is_empty() {
+        return Err(ServiceError::Platform(
+            "foreground_service_type must not be empty".into(),
+        ));
+    }
+    let fg_type_lower = fg_type.to_lowercase();
+    if allowlist.iter().any(|t| t.to_lowercase() == fg_type_lower) {
+        Ok(())
+    } else {
+        Err(ServiceError::Platform(format!(
+            "foreground_service_type '{}' is not allowed. Allowed types: {:?}",
+            fg_type, allowlist
+        )))
+    }
+}
+
 /// Passed into both `init` and `run`.
 /// Gives your service everything it needs to interact with the outside world.
 pub struct ServiceContext<R: Runtime> {
@@ -89,7 +123,7 @@ fn default_label() -> String {
 }
 
 fn default_foreground_service_type() -> String {
-    "dataSync".into()
+    "remoteMessaging".into()
 }
 
 /// Plugin-level configuration, deserialized from the Tauri plugin config.
@@ -135,6 +169,13 @@ pub struct PluginConfig {
     #[serde(default)]
     pub ios_requires_network_connectivity: bool,
 
+    /// iOS adaptive `BGProcessingTask` scheduling ceiling, as a multiplier of
+    /// `ios_earliest_processing_begin_minutes`. Default: 4.0. The Swift
+    /// adaptive scheduler backs off the processing request's earliest begin
+    /// date after expired runs, never beyond `configured * multiplier`.
+    #[serde(default = "default_ios_processing_ceiling_multiplier")]
+    pub ios_processing_ceiling_multiplier: f64,
+
     /// Capacity for the manager command channel (mpsc).
     /// Default: 16. Increase for high-throughput scenarios with many
     /// concurrent start/stop/is-running calls.
@@ -142,7 +183,7 @@ pub struct PluginConfig {
     pub channel_capacity: usize,
 
     /// Android foreground service types allowed for `startService()`.
-    /// Default: `["dataSync"]`. The preflight validation rejects any type
+    /// Default: `["remoteMessaging"]`. The preflight validation rejects any type
     /// not in this list when `android_validate_foreground_service_type` is true.
     #[serde(default = "default_android_foreground_service_types")]
     pub android_foreground_service_types: Vec<String>,
@@ -188,10 +229,32 @@ pub struct PluginConfig {
     pub android_show_stop_action: bool,
 
     /// Whether to automatically request POST_NOTIFICATIONS permission on
-    /// Android API 33+ when the plugin loads. Default: true (backward compat).
-    /// Set to false to manage permission requests explicitly from JS.
-    #[serde(default = "default_true")]
+    /// Android API 33+ when the plugin loads. Default: false (NTF-09: the
+    /// request is consented via an explainer rather than fired unconditionally
+    /// on load). Note the load-bearing gate lives in the Kotlin `load()` /
+    /// `optBoolean` fallback — Tauri forwards the RAW plugin config to mobile,
+    /// so this Rust default governs only the Rust-side `PluginConfig`.
+    #[serde(default)]
     pub android_request_notification_permission_on_load: bool,
+
+    /// Post a local notification when the OS pauses background delivery
+    /// (platform timeout/expiration). Default: false (opt-in).
+    ///
+    /// On Android this is suppressed when `androidOnTimeout` is
+    /// `"notifyUser"`: the Kotlin service already posts a native timeout
+    /// notification there, and plugin-side notification ids cannot dedupe
+    /// against `NotificationManager` ids (DEC-002).
+    #[serde(default)]
+    pub notify_on_timeout: bool,
+
+    /// Post a local notification when background delivery is restored
+    /// after an OS restart or boot recovery. Default: false (opt-in).
+    ///
+    /// Always suppressed on Android: the native BootReceiver recovery
+    /// notification path is unconditionally active there, so a plugin-side
+    /// notice would double-notify (DEC-002).
+    #[serde(default)]
+    pub notify_on_recovery: bool,
 
     /// Desktop service mode: "inProcess" (default) or "osService".
     /// Controls whether the background service runs in-process or as a
@@ -228,6 +291,14 @@ pub struct PluginConfig {
     #[cfg(feature = "desktop-service")]
     #[serde(default = "default_desktop_service_start_timeout_ms")]
     pub desktop_service_start_timeout_ms: u64,
+
+    /// When `true`, the Windows GUI uses the daemon-first backend path
+    /// (identical to Unix). Default: false — Windows stays on the
+    /// in-process Local backend until the daemon suite passes on Windows
+    /// CI (spec 01 §6 D3 compat clause). Unix ignores this flag.
+    #[cfg(feature = "desktop-service")]
+    #[serde(default)]
+    pub desktop_windows_daemon_opt_in: bool,
 }
 
 fn default_ios_safety_timeout() -> f64 {
@@ -250,8 +321,12 @@ fn default_ios_earliest_processing_begin_minutes() -> f64 {
     15.0
 }
 
+fn default_ios_processing_ceiling_multiplier() -> f64 {
+    4.0
+}
+
 fn default_android_foreground_service_types() -> Vec<String> {
-    vec!["dataSync".into()]
+    vec!["remoteMessaging".into()]
 }
 
 fn default_android_on_timeout() -> String {
@@ -343,6 +418,10 @@ pub enum LifecycleState {
     Blocked,
     /// Service encountered an error.
     Error,
+    /// Core is running but account setup is needed (Android native state).
+    SetupIdle,
+    /// Core is running but account is locked, awaiting unlock (Android native state).
+    LockedIdle,
 }
 
 impl From<ServiceState> for LifecycleState {
@@ -564,6 +643,10 @@ pub enum StopReason {
     TaskCompleted,
     /// Service's run() returned an error.
     Error,
+    /// The host process is exiting (e.g. iOS app backgrounded/terminated by the
+    /// OS). Not a user stop: desired state and BGTask scheduling are preserved so
+    /// recovery can resume background delivery (H2).
+    ProcessExit,
 }
 
 impl<'de> serde::Deserialize<'de> for StopReason {
@@ -579,6 +662,7 @@ impl<'de> serde::Deserialize<'de> for StopReason {
             "bootRecovery" => Ok(Self::BootRecovery),
             "taskCompleted" => Ok(Self::TaskCompleted),
             "error" => Ok(Self::Error),
+            "processExit" => Ok(Self::ProcessExit),
             // Legacy string mappings for backward compatibility
             "completed" => Ok(Self::TaskCompleted),
             "cancelled" | "user" => Ok(Self::UserStop),
@@ -594,6 +678,7 @@ impl<'de> serde::Deserialize<'de> for StopReason {
                     "bootRecovery",
                     "taskCompleted",
                     "error",
+                    "processExit",
                 ],
             )),
         }
@@ -617,6 +702,17 @@ pub enum NativeLifecycleEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         fgs_type: Option<String>,
     },
+    /// Android restarted the service (START_STICKY) and the core start was
+    /// accepted — background delivery is restored.
+    AndroidOsRestartAccepted,
+    /// The service was recovered after device boot or package replacement
+    /// and the core start was accepted.
+    AndroidBootRecoveryAccepted,
+    /// The iOS `BGTask` execution window expired (the OS invoked the task's
+    /// expiration handler). Maps to [`StopReason::PlatformExpiration`]: the
+    /// BGTask schedule and desired state are preserved so recovery resumes
+    /// background delivery on the next window (H6).
+    IosBgTaskExpired,
 }
 
 impl NativeLifecycleEvent {
@@ -625,7 +721,20 @@ impl NativeLifecycleEvent {
         match self {
             Self::AndroidNotificationStop => StopReason::NativeNotificationStop,
             Self::AndroidTimeout { .. } => StopReason::PlatformTimeout,
+            Self::AndroidOsRestartAccepted => StopReason::OsRestart,
+            Self::AndroidBootRecoveryAccepted => StopReason::BootRecovery,
+            Self::IosBgTaskExpired => StopReason::PlatformExpiration,
         }
+    }
+
+    /// `true` for start-ACCEPTANCE events: the native layer restarted the
+    /// service and the core start succeeded. These are not stops — the
+    /// manager fires the recovery notification instead of tearing down.
+    pub fn is_recovery_acceptance(&self) -> bool {
+        matches!(
+            self,
+            Self::AndroidOsRestartAccepted | Self::AndroidBootRecoveryAccepted
+        )
     }
 }
 
@@ -652,6 +761,7 @@ impl Default for PluginConfig {
             ios_earliest_processing_begin_minutes: default_ios_earliest_processing_begin_minutes(),
             ios_requires_external_power: false,
             ios_requires_network_connectivity: false,
+            ios_processing_ceiling_multiplier: default_ios_processing_ceiling_multiplier(),
             channel_capacity: default_channel_capacity(),
             android_foreground_service_types: default_android_foreground_service_types(),
             android_validate_foreground_service_type: default_true(),
@@ -661,7 +771,9 @@ impl Default for PluginConfig {
             android_notification_id: default_android_notification_id(),
             android_notification_small_icon: None,
             android_show_stop_action: default_true(),
-            android_request_notification_permission_on_load: default_true(),
+            android_request_notification_permission_on_load: false,
+            notify_on_timeout: false,
+            notify_on_recovery: false,
             #[cfg(feature = "desktop-service")]
             desktop_service_mode: default_desktop_service_mode(),
             #[cfg(feature = "desktop-service")]
@@ -672,6 +784,8 @@ impl Default for PluginConfig {
             desktop_start_service_if_missing: false,
             #[cfg(feature = "desktop-service")]
             desktop_service_start_timeout_ms: default_desktop_service_start_timeout_ms(),
+            #[cfg(feature = "desktop-service")]
+            desktop_windows_daemon_opt_in: false,
         }
     }
 }
@@ -704,35 +818,9 @@ pub(crate) struct StartKeepaliveArgs<'a> {
     /// iOS BGProcessingTask requires network connectivity. Only sent to iOS; `None` omits the key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ios_requires_network_connectivity: Option<bool>,
-}
-
-/// Auto-start config returned by the Kotlin bridge.
-///
-/// Deserialized from SharedPreferences values read by `getAutoStartConfig`.
-/// Only used on Android (the iOS path doesn't have auto-start).
-#[doc(hidden)]
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AutoStartConfig {
-    pub pending: bool,
-    pub label: Option<String>,
-    pub service_type: Option<String>,
-}
-
-impl AutoStartConfig {
-    /// Convert to `StartConfig` if auto-start is pending and label is available.
-    pub fn into_start_config(self) -> Option<StartConfig> {
-        if self.pending {
-            self.label.map(|label| StartConfig {
-                service_label: label,
-                foreground_service_type: self
-                    .service_type
-                    .unwrap_or_else(default_foreground_service_type),
-            })
-        } else {
-            None
-        }
-    }
+    /// iOS adaptive processing ceiling multiplier. Only sent to iOS; `None` omits the key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ios_processing_ceiling_multiplier: Option<f64>,
 }
 
 /// Information about a pending iOS background task that launched the app.
@@ -757,6 +845,33 @@ pub struct PendingTaskInfo {
     pub consumed_at: Option<f64>,
 }
 
+impl PendingTaskInfo {
+    /// Resolve a raw `getPendingBgTask` payload to an *active* pending task.
+    ///
+    /// Enforces the H5/M14 invariant `pending ⟺ consumedAt == nil`: a payload
+    /// with a null `taskKind` (no record) **or** a non-null `consumedAt`
+    /// (already consumed/stale) yields `None`; only a fresh, unconsumed record
+    /// is surfaced. This mirrors the Swift `getPendingBgTask` gate on the Rust
+    /// side so a consumed record can't re-arm a cold auto-start even if the
+    /// native payload still carries the keys — gating on `consumed_at`, not
+    /// only `taskKind.is_null()`.
+    pub fn from_pending_payload(
+        value: &serde_json::Value,
+    ) -> Result<Option<Self>, serde_json::Error> {
+        if value
+            .get("taskKind")
+            .map_or(true, serde_json::Value::is_null)
+        {
+            return Ok(None);
+        }
+        let info: Self = serde_json::from_value(value.clone())?;
+        if info.consumed_at.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(info))
+    }
+}
+
 /// iOS scheduling status returned by the native layer.
 ///
 /// Reports which background task types were successfully scheduled
@@ -778,6 +893,74 @@ pub struct IOSSchedulingStatus {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub processing_error: Option<String>,
+}
+
+/// Persisted iOS desired-state facts, queried from the native layer.
+///
+/// Returned by `getDesiredStateStatus` on iOS — the *persisted* half of the
+/// status split (C1). Distinct from [`IOSSchedulingStatus`], which carries the
+/// *submit-result* facts of the most recent scheduling attempt. The iOS
+/// auto-start path reads `desired_running` + `last_start_config` from this DTO
+/// (replacing the deleted untyped `get_scheduling_status_raw` bypass).
+///
+/// All fields except `desired_running` are genuinely optional: Swift resolves
+/// them as `NSNull()` (JSON `null`) before any task has run, so they carry
+/// `#[serde(default)]`. Timestamps are wall-clock seconds (`TimeInterval`),
+/// which serialize as JSON floats.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct IOSDesiredStateStatus {
+    /// Whether the user desires the service running (persisted across launches).
+    pub desired_running: bool,
+    /// JSON-serialized `StartConfig` of the last successful start, if any.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_start_config: Option<String>,
+    /// Kind of the most recent BGTask: "refresh" or "processing".
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_task_kind: Option<String>,
+    /// Wall-clock seconds when the most recent BGTask started, if any.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_task_started_at: Option<f64>,
+    /// Wall-clock seconds when the most recent BGTask completed, if any.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_task_completed_at: Option<f64>,
+    /// Last persisted scheduling error, if any.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_schedule_error: Option<String>,
+    /// Durable reason the most recent BGTask run ended ("completed" | "expired"),
+    /// persisted under `ios_last_completion_reason`. Unlike the one-shot
+    /// adaptation outcome (`ios_last_task_outcome`, consumed by `scheduleNext`),
+    /// this is never wiped, so the "why did the last run end?" question (M7) is
+    /// always answerable.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_completion_reason: Option<String>,
+    /// Whether notification authorization was granted on iOS (M4), persisted under
+    /// `ios_notification_granted`. The deferred authorization request (service
+    /// start, not plugin load) forwards its decision here so the Notifier can
+    /// degrade when notifications are denied. `None` until the first
+    /// notification-requiring intent has requested authorization.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notification_granted: Option<bool>,
+}
+
+/// Notification-permission status (NTF-09), returned by the Android
+/// `getNotificationPermissionStatus` / `requestNotificationPermission` Kotlin
+/// commands. A permissive `status` string accommodates both vocabularies:
+/// `getNotificationPermissionStatus` resolves `granted` | `notDetermined` |
+/// `denied`, while the `requestNotificationPermission` `@PermissionCallback`
+/// (Step 10a) resolves `granted` | `denied`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NotificationPermissionStatus {
+    /// Current POST_NOTIFICATIONS authorization.
+    pub status: String,
 }
 
 /// A single setup issue found during validation.
@@ -877,11 +1060,137 @@ pub struct LifecycleStatus {
     pub platform: Platform,
     pub capabilities: PlatformCapabilities,
     pub issues: Vec<ValidationIssue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_running: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_foreground: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adopted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<String>,
+}
+
+/// Android native service state, bridged from Kotlin via `getAndroidServiceState`.
+///
+/// Mirrors the Kotlin `AndroidServiceState` data class field-for-field.
+/// Only populated on Android (gated by `self.mobile.is_some()`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct AndroidServiceState {
+    pub native_running: bool,
+    pub native_foreground: bool,
+    pub desired_running: bool,
+    pub durable_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub foreground_service_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notification_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notification_channel_id: Option<String>,
+    pub recovery_pending: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_platform_error: Option<String>,
+    pub data_dir: String,
+}
+
+/// iOS native background-task state, assembled from the typed iOS status
+/// queries (`getSchedulingStatus`, `getDesiredStateStatus`, `getPendingBgTask`).
+///
+/// Unlike Android — which runs a long-lived foreground service whose
+/// `native_running` bit is authoritative — iOS has no persistent native
+/// service: a `BGTask` executes for a short window and the Rust actor is the
+/// runtime authority during it. This snapshot therefore reports *scheduling /
+/// budget health* facts (H6) so `build_lifecycle_status` can surface the real
+/// native situation (a pending task waiting, a scheduling error, an exhausted
+/// budget) instead of relying on the actor's possibly-stale in-memory state.
+/// Only populated on iOS (the mobile bridge tags it via `query_native_state`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct IosNativeState {
+    /// Persisted desired-running intent (mirror of the Rust-backed authority).
+    /// Answers the "desired?" status question.
+    pub desired_running: bool,
+    /// Whether a `BGAppRefreshTask` is currently scheduled (submit succeeded on
+    /// the most recent attempt). Part of the "scheduled?" answer (M7).
+    #[serde(default)]
+    pub refresh_scheduled: bool,
+    /// Whether a `BGProcessingTask` is currently scheduled. Part of the
+    /// "scheduled?" answer (M7).
+    #[serde(default)]
+    pub processing_scheduled: bool,
+    /// Kind ("refresh"/"processing") of the BGTask currently executing, or
+    /// `None` when no task is running (idle / expired / between windows).
+    /// Answers the "active?" question.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_task_kind: Option<String>,
+    /// An unconsumed pending BGTask that launched / woke the app, if any.
+    /// Answers the "pending?" question.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_task: Option<PendingTaskInfo>,
+    /// Wall-clock seconds when the most recent BGTask completed, if any.
+    /// Answers the "last-completed?" question.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_completed_at: Option<f64>,
+    /// Durable reason the most recent BGTask run ended ("completed" | "expired").
+    /// Answers the "why?" question (M7). Unlike the one-shot adaptation outcome,
+    /// this survives the next `scheduleNext()` so the last completion is always
+    /// reportable.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_completion_reason: Option<String>,
+    /// Error from the most recent `BGAppRefreshTask` scheduling attempt, if any.
+    /// Half of the split "last-failed?" answer (M7) — kept distinct from the
+    /// processing error rather than collapsed into one aggregate.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_refresh_error: Option<String>,
+    /// Error from the most recent `BGProcessingTask` scheduling attempt, if any.
+    /// The other half of the split "last-failed?" answer (M7).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_processing_error: Option<String>,
+    /// Whether the app still has background-execution budget. `false` means iOS
+    /// is unlikely to run further BGTasks (surfaced as degraded).
+    pub in_budget: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Default foreground service type tests ---
+
+    #[test]
+    fn default_foreground_service_type_is_remote_messaging() {
+        assert_eq!(default_foreground_service_type(), "remoteMessaging");
+    }
+
+    #[test]
+    fn default_android_foreground_service_types_is_remote_messaging() {
+        assert_eq!(
+            default_android_foreground_service_types(),
+            vec!["remoteMessaging"]
+        );
+    }
+
+    #[test]
+    fn start_config_default_uses_remote_messaging() {
+        let config = StartConfig::default();
+        assert_eq!(config.foreground_service_type, "remoteMessaging");
+    }
 
     // --- StartConfig tests ---
 
@@ -961,7 +1270,7 @@ mod tests {
         let json = r#"{"serviceLabel":"test","unknownField":42,"extra":"data"}"#;
         let de: StartConfig = serde_json::from_str(json).unwrap();
         assert_eq!(de.service_label, "test");
-        assert_eq!(de.foreground_service_type, "dataSync");
+        assert_eq!(de.foreground_service_type, "remoteMessaging");
     }
 
     #[test]
@@ -1077,6 +1386,10 @@ mod tests {
             serde_json::to_string(&StopReason::Error).unwrap(),
             "\"error\""
         );
+        assert_eq!(
+            serde_json::to_string(&StopReason::ProcessExit).unwrap(),
+            "\"processExit\""
+        );
     }
 
     #[test]
@@ -1091,11 +1404,19 @@ mod tests {
             StopReason::BootRecovery,
             StopReason::TaskCompleted,
             StopReason::Error,
+            StopReason::ProcessExit,
         ] {
             let json = serde_json::to_string(&variant).unwrap();
             let de: StopReason = serde_json::from_str(&json).unwrap();
             assert_eq!(de, variant, "roundtrip failed for {variant:?}");
         }
+    }
+
+    #[test]
+    fn stop_reason_process_exit_deserializes_from_camel_case() {
+        // H2: OS-driven process exit is a distinct, non-user stop reason.
+        let de: StopReason = serde_json::from_str("\"processExit\"").unwrap();
+        assert_eq!(de, StopReason::ProcessExit);
     }
 
     #[test]
@@ -1180,6 +1501,202 @@ mod tests {
     }
 
     #[test]
+    fn native_lifecycle_event_recovery_acceptance_roundtrips() {
+        let event = NativeLifecycleEvent::AndroidOsRestartAccepted;
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(json, r#"{"type":"androidOsRestartAccepted"}"#);
+        let de: NativeLifecycleEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, event);
+
+        let event = NativeLifecycleEvent::AndroidBootRecoveryAccepted;
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(json, r#"{"type":"androidBootRecoveryAccepted"}"#);
+        let de: NativeLifecycleEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, event);
+    }
+
+    #[test]
+    fn native_lifecycle_event_recovery_acceptance_stop_reasons() {
+        assert_eq!(
+            NativeLifecycleEvent::AndroidOsRestartAccepted.to_stop_reason(),
+            StopReason::OsRestart
+        );
+        assert_eq!(
+            NativeLifecycleEvent::AndroidBootRecoveryAccepted.to_stop_reason(),
+            StopReason::BootRecovery
+        );
+    }
+
+    #[test]
+    fn native_lifecycle_event_recovery_acceptance_classification() {
+        assert!(NativeLifecycleEvent::AndroidOsRestartAccepted.is_recovery_acceptance());
+        assert!(NativeLifecycleEvent::AndroidBootRecoveryAccepted.is_recovery_acceptance());
+        assert!(!NativeLifecycleEvent::AndroidNotificationStop.is_recovery_acceptance());
+        assert!(!NativeLifecycleEvent::AndroidTimeout { fgs_type: None }.is_recovery_acceptance());
+    }
+
+    /// H6: the iOS BGTask-expiration event maps to `PlatformExpiration` (so the
+    /// schedule + desired state survive), is not a recovery acceptance, and
+    /// round-trips through the camelCase wire format.
+    #[test]
+    fn native_lifecycle_event_ios_bg_task_expired() {
+        let event = NativeLifecycleEvent::IosBgTaskExpired;
+        assert_eq!(event.to_stop_reason(), StopReason::PlatformExpiration);
+        assert!(!event.is_recovery_acceptance());
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(json, r#"{"type":"iosBgTaskExpired"}"#);
+        let de: NativeLifecycleEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, event);
+    }
+
+    /// H6: `IosNativeState` round-trips through camelCase JSON, including the
+    /// nested pending task and the optional health fields.
+    #[test]
+    fn ios_native_state_serde_roundtrip() {
+        let state = IosNativeState {
+            desired_running: true,
+            refresh_scheduled: true,
+            processing_scheduled: false,
+            active_task_kind: Some("refresh".into()),
+            pending_task: Some(PendingTaskInfo {
+                task_kind: "processing".into(),
+                identifier: "com.example.app.bg-processing".into(),
+                received_at: 1000.0,
+                consumed_at: None,
+            }),
+            last_completed_at: Some(900.0),
+            last_completion_reason: Some("completed".into()),
+            last_refresh_error: Some("BGTaskSchedulerErrorDomain code 1".into()),
+            last_processing_error: None,
+            in_budget: false,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("\"desiredRunning\":true"));
+        assert!(json.contains("\"refreshScheduled\":true"));
+        assert!(json.contains("\"activeTaskKind\":\"refresh\""));
+        assert!(json.contains("\"inBudget\":false"));
+        let de: IosNativeState = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, state);
+    }
+
+    /// H6: optional health fields default to `None` when absent from the wire.
+    #[test]
+    fn ios_native_state_defaults_optional_fields() {
+        let json = r#"{"desiredRunning":false,"inBudget":true}"#;
+        let de: IosNativeState = serde_json::from_str(json).unwrap();
+        assert!(!de.desired_running);
+        assert!(de.in_budget);
+        assert!(!de.refresh_scheduled);
+        assert!(!de.processing_scheduled);
+        assert_eq!(de.active_task_kind, None);
+        assert_eq!(de.pending_task, None);
+        assert_eq!(de.last_completed_at, None);
+        assert_eq!(de.last_completion_reason, None);
+        assert_eq!(de.last_refresh_error, None);
+        assert_eq!(de.last_processing_error, None);
+    }
+
+    /// M7: one `IosNativeState` snapshot answers all seven status questions —
+    /// desired? scheduled? pending? active? last-completed? last-failed? why?
+    /// Each question maps to an explicit, non-derived field on the snapshot.
+    #[test]
+    fn ios_native_state_answers_seven_questions() {
+        let state = IosNativeState {
+            desired_running: true,                    // desired?
+            refresh_scheduled: true,                  // scheduled?
+            processing_scheduled: true,               // scheduled?
+            active_task_kind: Some("refresh".into()), // active?
+            pending_task: Some(PendingTaskInfo {
+                // pending?
+                task_kind: "refresh".into(),
+                identifier: "com.example.app.bg-refresh".into(),
+                received_at: 1000.0,
+                consumed_at: None,
+            }),
+            last_completed_at: Some(950.0), // last-completed?
+            last_completion_reason: Some("completed".into()), // why?
+            last_refresh_error: Some("refresh boom".into()), // last-failed? (refresh)
+            last_processing_error: Some("processing boom".into()), // last-failed? (processing)
+            in_budget: false,
+        };
+
+        // 1 desired?      2 scheduled?                        3 pending?
+        assert!(state.desired_running);
+        assert!(state.refresh_scheduled && state.processing_scheduled);
+        assert!(state.pending_task.is_some());
+        // 4 active?       5 last-completed?                   7 why?
+        assert_eq!(state.active_task_kind.as_deref(), Some("refresh"));
+        assert_eq!(state.last_completed_at, Some(950.0));
+        assert_eq!(state.last_completion_reason.as_deref(), Some("completed"));
+        // 6 last-failed? — split per task type, not a single aggregate.
+        assert_eq!(state.last_refresh_error.as_deref(), Some("refresh boom"));
+        assert_eq!(
+            state.last_processing_error.as_deref(),
+            Some("processing boom")
+        );
+    }
+
+    /// M7 (req 2): the two scheduling errors round-trip independently — a refresh
+    /// failure and a processing failure are distinguishable on the wire, not
+    /// collapsed into one aggregate `lastScheduleError`.
+    #[test]
+    fn ios_native_state_splits_schedule_errors() {
+        let state = IosNativeState {
+            desired_running: true,
+            refresh_scheduled: false,
+            processing_scheduled: true,
+            active_task_kind: None,
+            pending_task: None,
+            last_completed_at: None,
+            last_completion_reason: None,
+            last_refresh_error: Some("only refresh failed".into()),
+            last_processing_error: None,
+            in_budget: true,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("\"lastRefreshError\":\"only refresh failed\""),
+            "{json}"
+        );
+        // The processing error is absent (skip_serializing_if None), proving the
+        // split: a refresh-only failure does not surface as a processing error.
+        assert!(!json.contains("lastProcessingError"), "{json}");
+        let de: IosNativeState = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, state);
+        assert_eq!(
+            de.last_refresh_error.as_deref(),
+            Some("only refresh failed")
+        );
+        assert_eq!(de.last_processing_error, None);
+    }
+
+    /// M7 (req 3): the durable last-completion reason round-trips through the
+    /// camelCase wire as `lastCompletionReason`.
+    #[test]
+    fn ios_native_state_carries_last_completion_reason() {
+        let state = IosNativeState {
+            desired_running: true,
+            refresh_scheduled: true,
+            processing_scheduled: true,
+            active_task_kind: None,
+            pending_task: None,
+            last_completed_at: Some(900.0),
+            last_completion_reason: Some("expired".into()),
+            last_refresh_error: None,
+            last_processing_error: None,
+            in_budget: true,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(
+            json.contains("\"lastCompletionReason\":\"expired\""),
+            "{json}"
+        );
+        let de: IosNativeState = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.last_completion_reason.as_deref(), Some("expired"));
+    }
+
+    #[test]
     fn plugin_event_stopped_with_stop_reason_roundtrip() {
         let event = PluginEvent::Stopped {
             reason: StopReason::TaskCompleted,
@@ -1224,7 +1741,7 @@ mod tests {
     #[test]
     fn start_config_default_service_type() {
         let config = StartConfig::default();
-        assert_eq!(config.foreground_service_type, "dataSync");
+        assert_eq!(config.foreground_service_type, "remoteMessaging");
     }
 
     #[test]
@@ -1251,7 +1768,7 @@ mod tests {
     fn start_config_deserialize_missing_service_type() {
         let json = r#"{"serviceLabel":"test"}"#;
         let de: StartConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(de.foreground_service_type, "dataSync");
+        assert_eq!(de.foreground_service_type, "remoteMessaging");
     }
 
     #[test]
@@ -1291,66 +1808,6 @@ mod tests {
             json.contains("foregroundServiceType"),
             "JSON should use camelCase: {json}"
         );
-    }
-
-    // --- AutoStartConfig tests ---
-
-    #[test]
-    fn auto_start_config_pending_with_label_returns_start_config() {
-        let json = r#"{"pending": true, "label": "Syncing"}"#;
-        let config: AutoStartConfig = serde_json::from_str(json).unwrap();
-        let result = config.into_start_config();
-        assert!(result.is_some());
-        let start_config = result.unwrap();
-        assert_eq!(start_config.service_label, "Syncing");
-        assert_eq!(start_config.foreground_service_type, "dataSync");
-    }
-
-    #[test]
-    fn auto_start_config_not_pending_returns_none() {
-        let json = r#"{"pending": false, "label": null}"#;
-        let config: AutoStartConfig = serde_json::from_str(json).unwrap();
-        let result = config.into_start_config();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn auto_start_config_pending_no_label_returns_none() {
-        let json = r#"{"pending": true, "label": null}"#;
-        let config: AutoStartConfig = serde_json::from_str(json).unwrap();
-        let result = config.into_start_config();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn auto_start_config_with_service_type_preserves_it() {
-        let json = r#"{"pending":true,"label":"test","serviceType":"specialUse"}"#;
-        let config: AutoStartConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.service_type, Some("specialUse".to_string()));
-        let result = config.into_start_config();
-        assert!(result.is_some());
-        let start_config = result.unwrap();
-        assert_eq!(start_config.foreground_service_type, "specialUse");
-    }
-
-    #[test]
-    fn auto_start_config_without_service_type_uses_default() {
-        let json = r#"{"pending":true,"label":"test"}"#;
-        let config: AutoStartConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.service_type, None);
-        let result = config.into_start_config();
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().foreground_service_type, "dataSync");
-    }
-
-    #[test]
-    fn auto_start_config_null_service_type_uses_default() {
-        let json = r#"{"pending":true,"label":"test","serviceType":null}"#;
-        let config: AutoStartConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.service_type, None);
-        let result = config.into_start_config();
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().foreground_service_type, "dataSync");
     }
 
     // --- PluginConfig tests ---
@@ -1462,6 +1919,7 @@ mod tests {
             ios_earliest_processing_begin_minutes: None,
             ios_requires_external_power: None,
             ios_requires_network_connectivity: None,
+            ios_processing_ceiling_multiplier: None,
         };
         let json = serde_json::to_string(&args).unwrap();
         assert!(
@@ -1481,6 +1939,7 @@ mod tests {
             ios_earliest_processing_begin_minutes: None,
             ios_requires_external_power: None,
             ios_requires_network_connectivity: None,
+            ios_processing_ceiling_multiplier: None,
         };
         let json = serde_json::to_string(&args).unwrap();
         assert!(
@@ -1500,6 +1959,7 @@ mod tests {
             ios_earliest_processing_begin_minutes: None,
             ios_requires_external_power: None,
             ios_requires_network_connectivity: None,
+            ios_processing_ceiling_multiplier: None,
         };
         let json = serde_json::to_string(&args).unwrap();
         assert!(
@@ -1519,6 +1979,7 @@ mod tests {
             ios_earliest_processing_begin_minutes: None,
             ios_requires_external_power: None,
             ios_requires_network_connectivity: None,
+            ios_processing_ceiling_multiplier: None,
         };
         let json = serde_json::to_string(&args).unwrap();
         assert!(
@@ -1538,6 +1999,7 @@ mod tests {
             ios_earliest_processing_begin_minutes: None,
             ios_requires_external_power: None,
             ios_requires_network_connectivity: None,
+            ios_processing_ceiling_multiplier: None,
         };
         let json = serde_json::to_string(&args).unwrap();
         assert!(json.contains("\"label\""), "label: {json}");
@@ -1558,6 +2020,7 @@ mod tests {
             ios_earliest_processing_begin_minutes: Some(60.0),
             ios_requires_external_power: None,
             ios_requires_network_connectivity: None,
+            ios_processing_ceiling_multiplier: None,
         };
         let json = serde_json::to_string(&args).unwrap();
         assert!(
@@ -1581,6 +2044,7 @@ mod tests {
             ios_earliest_processing_begin_minutes: None,
             ios_requires_external_power: Some(true),
             ios_requires_network_connectivity: Some(true),
+            ios_processing_ceiling_multiplier: None,
         };
         let json = serde_json::to_string(&args).unwrap();
         assert!(
@@ -1590,6 +2054,26 @@ mod tests {
         assert!(
             json.contains("\"iosRequiresNetworkConnectivity\":true"),
             "JSON should contain iosRequiresNetworkConnectivity: {json}"
+        );
+    }
+
+    #[test]
+    fn start_keepalive_args_processing_ceiling_multiplier() {
+        let args = StartKeepaliveArgs {
+            label: "Test",
+            foreground_service_type: "dataSync",
+            ios_safety_timeout_secs: None,
+            ios_processing_safety_timeout_secs: None,
+            ios_earliest_refresh_begin_minutes: None,
+            ios_earliest_processing_begin_minutes: None,
+            ios_requires_external_power: None,
+            ios_requires_network_connectivity: None,
+            ios_processing_ceiling_multiplier: Some(4.0),
+        };
+        let json = serde_json::to_string(&args).unwrap();
+        assert!(
+            json.contains("\"iosProcessingCeilingMultiplier\":4.0"),
+            "JSON should contain iosProcessingCeilingMultiplier: {json}"
         );
     }
 
@@ -1640,6 +2124,37 @@ mod tests {
         assert!(config.ios_requires_network_connectivity);
     }
 
+    // --- PluginConfig ios_processing_ceiling_multiplier tests (D2) ---
+
+    #[test]
+    fn plugin_config_processing_ceiling_multiplier_default() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.ios_processing_ceiling_multiplier, 4.0);
+    }
+
+    #[test]
+    fn plugin_config_processing_ceiling_multiplier_custom() {
+        let json = r#"{"iosProcessingCeilingMultiplier":6.0}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.ios_processing_ceiling_multiplier, 6.0);
+    }
+
+    #[test]
+    fn plugin_config_processing_ceiling_multiplier_serde_roundtrip() {
+        let config = PluginConfig {
+            ios_processing_ceiling_multiplier: 6.0,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("\"iosProcessingCeilingMultiplier\":6.0"),
+            "JSON should contain iosProcessingCeilingMultiplier: {json}"
+        );
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.ios_processing_ceiling_multiplier, 6.0);
+    }
+
     // --- PluginConfig channel_capacity tests ---
 
     #[test]
@@ -1686,7 +2201,10 @@ mod tests {
     fn plugin_config_android_fgs_types_default() {
         let json = "{}";
         let config: PluginConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.android_foreground_service_types, vec!["dataSync"]);
+        assert_eq!(
+            config.android_foreground_service_types,
+            vec!["remoteMessaging"]
+        );
     }
 
     #[test]
@@ -2026,7 +2544,9 @@ mod tests {
     fn plugin_config_android_request_notification_permission_default() {
         let json = "{}";
         let config: PluginConfig = serde_json::from_str(json).unwrap();
-        assert!(config.android_request_notification_permission_on_load);
+        // NTF-09 (Step 10a): the serde default is now false — the load() startup
+        // prompt is suppressed by default and requested via a consented path.
+        assert!(!config.android_request_notification_permission_on_load);
     }
 
     #[test]
@@ -2066,6 +2586,59 @@ mod tests {
         assert_eq!(de.android_notification_id, 42);
         assert_eq!(de.android_notification_small_icon, Some("ic_bg".into()));
         assert!(!de.android_show_stop_action);
+    }
+
+    // --- PluginConfig D1 lifecycle notification opt-in tests ---
+
+    #[test]
+    fn plugin_config_notify_keys_default_false() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.notify_on_timeout);
+        assert!(!config.notify_on_recovery);
+    }
+
+    #[test]
+    fn plugin_config_notify_on_timeout_custom() {
+        let json = r#"{"notifyOnTimeout":true}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert!(config.notify_on_timeout);
+        assert!(!config.notify_on_recovery);
+    }
+
+    #[test]
+    fn plugin_config_notify_on_recovery_custom() {
+        let json = r#"{"notifyOnRecovery":true}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.notify_on_timeout);
+        assert!(config.notify_on_recovery);
+    }
+
+    #[test]
+    fn plugin_config_notify_keys_serde_roundtrip() {
+        let config = PluginConfig {
+            notify_on_timeout: true,
+            notify_on_recovery: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert!(de.notify_on_timeout);
+        assert!(de.notify_on_recovery);
+    }
+
+    #[test]
+    fn plugin_config_notify_keys_json_camel_case() {
+        let config = PluginConfig {
+            notify_on_timeout: true,
+            notify_on_recovery: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("notifyOnTimeout") && json.contains("notifyOnRecovery"),
+            "JSON should use camelCase: {json}"
+        );
     }
 
     // --- PluginConfig desktop fields tests (feature-gated) ---
@@ -2196,6 +2769,48 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         assert!(
             json.contains("desktopStartServiceIfMissing"),
+            "JSON should use camelCase: {json}"
+        );
+    }
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn plugin_config_windows_daemon_opt_in_default_false() {
+        let json = "{}";
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.desktop_windows_daemon_opt_in);
+    }
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn plugin_config_windows_daemon_opt_in_true() {
+        let json = r#"{"desktopWindowsDaemonOptIn":true}"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert!(config.desktop_windows_daemon_opt_in);
+    }
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn plugin_config_windows_daemon_opt_in_serde_roundtrip() {
+        let config = PluginConfig {
+            desktop_windows_daemon_opt_in: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let de: PluginConfig = serde_json::from_str(&json).unwrap();
+        assert!(de.desktop_windows_daemon_opt_in);
+    }
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn plugin_config_windows_daemon_opt_in_json_key_camel_case() {
+        let config = PluginConfig {
+            desktop_windows_daemon_opt_in: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            json.contains("desktopWindowsDaemonOptIn"),
             "JSON should use camelCase: {json}"
         );
     }
@@ -2355,6 +2970,90 @@ mod tests {
         assert!(
             result.is_err(),
             "validation should be case-sensitive: DataSync should fail"
+        );
+    }
+
+    // --- Foreground service type allowlist validation tests ---
+
+    #[test]
+    fn allowlist_accepted_type_in_list() {
+        let allowlist = vec!["remoteMessaging".to_string()];
+        let result = validate_fg_type_against_allowlist("remoteMessaging", &allowlist, true);
+        assert!(result.is_ok(), "type in allowlist should be accepted");
+    }
+
+    #[test]
+    fn allowlist_rejected_type_not_in_list() {
+        let allowlist = vec!["remoteMessaging".to_string()];
+        let result = validate_fg_type_against_allowlist("specialUse", &allowlist, true);
+        assert!(result.is_err(), "type not in allowlist should be rejected");
+        match result {
+            Err(ServiceError::Platform(msg)) => {
+                assert!(
+                    msg.contains("specialUse"),
+                    "error should mention the type: {msg}"
+                );
+                assert!(
+                    msg.contains("not allowed"),
+                    "error should say not allowed: {msg}"
+                );
+            }
+            other => panic!("Expected Platform error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allowlist_empty_type_rejected() {
+        let allowlist = vec!["dataSync".to_string()];
+        let result = validate_fg_type_against_allowlist("", &allowlist, true);
+        assert!(result.is_err(), "empty type should be rejected");
+        match result {
+            Err(ServiceError::Platform(msg)) => {
+                assert!(
+                    msg.contains("must not be empty"),
+                    "error should mention empty: {msg}"
+                );
+            }
+            other => panic!("Expected Platform error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allowlist_case_insensitive_match() {
+        let allowlist = vec!["remoteMessaging".to_string()];
+        let result = validate_fg_type_against_allowlist("RemoteMessaging", &allowlist, true);
+        assert!(result.is_ok(), "case-insensitive match should be accepted");
+    }
+
+    #[test]
+    fn allowlist_validation_skipped_when_disabled() {
+        let allowlist = vec!["dataSync".to_string()];
+        let result = validate_fg_type_against_allowlist("specialUse", &allowlist, false);
+        assert!(result.is_ok(), "validation disabled should accept any type");
+    }
+
+    #[test]
+    fn allowlist_multiple_types() {
+        let allowlist = vec![
+            "dataSync".to_string(),
+            "remoteMessaging".to_string(),
+            "specialUse".to_string(),
+        ];
+        assert!(
+            validate_fg_type_against_allowlist("dataSync", &allowlist, true).is_ok(),
+            "dataSync should be in allowlist"
+        );
+        assert!(
+            validate_fg_type_against_allowlist("remoteMessaging", &allowlist, true).is_ok(),
+            "remoteMessaging should be in allowlist"
+        );
+        assert!(
+            validate_fg_type_against_allowlist("specialUse", &allowlist, true).is_ok(),
+            "specialUse should be in allowlist"
+        );
+        assert!(
+            validate_fg_type_against_allowlist("camera", &allowlist, true).is_err(),
+            "camera should NOT be in allowlist"
         );
     }
 
@@ -2934,6 +3633,127 @@ mod tests {
         assert_eq!(status.processing_error, None);
     }
 
+    // --- C1/M9: exact-Swift-payload drift-guard fixtures ---
+    //
+    // The iOS native layer splits its status query into two `@objc` calls:
+    //   * `getSchedulingStatus`   -> submit-result shape -> `IOSSchedulingStatus`
+    //   * `getDesiredStateStatus` -> persisted shape     -> `IOSDesiredStateStatus`
+    //
+    // These fixtures commit the *exact* JSON those Swift handlers resolve (NSNull
+    // serializes to JSON `null`, `TimeInterval` to a JSON float) and prove it
+    // `from_value`s into the typed DTOs. They live here, not in `mobile.rs`,
+    // because `mobile.rs` is `#[cfg(mobile)]` and is excluded from the canonical
+    // macOS gate (`cargo test -p tauri-plugin-background-service --lib`); the
+    // contract being pinned is the serde shape, which is defined in this file.
+
+    /// The exact payload `BackgroundServicePlugin.getSchedulingStatus` resolves
+    /// after a successful `startKeepalive` (both task types scheduled, no errors).
+    const SWIFT_SCHEDULING_STATUS_PAYLOAD: &str = r#"{"refreshScheduled":true,"processingScheduled":true,"refreshError":null,"processingError":null}"#;
+
+    /// The exact payload `BackgroundServicePlugin.getDesiredStateStatus` resolves
+    /// while the service is desired-running with one refresh task started but not
+    /// yet completed. `lastScheduleError`/`lastTaskCompletedAt`/
+    /// `lastCompletionReason` are `NSNull()` (no run has completed yet).
+    const SWIFT_DESIRED_STATE_PAYLOAD: &str = r#"{"desiredRunning":true,"lastStartConfig":"{\"label\":\"Sila\"}","lastScheduleError":null,"lastTaskKind":"refresh","lastTaskStartedAt":1719500000.5,"lastTaskCompletedAt":null,"lastCompletionReason":null,"notificationGranted":null}"#;
+
+    #[test]
+    fn ios_scheduling_status_parses_exact_swift_payload() {
+        let status: IOSSchedulingStatus =
+            serde_json::from_value(serde_json::from_str(SWIFT_SCHEDULING_STATUS_PAYLOAD).unwrap())
+                .expect("the exact Swift getSchedulingStatus payload must deserialize");
+        assert!(status.refresh_scheduled);
+        assert!(status.processing_scheduled);
+        assert_eq!(status.refresh_error, None);
+        assert_eq!(status.processing_error, None);
+    }
+
+    #[test]
+    fn ios_desired_state_status_parses_exact_swift_payload() {
+        let status: IOSDesiredStateStatus =
+            serde_json::from_value(serde_json::from_str(SWIFT_DESIRED_STATE_PAYLOAD).unwrap())
+                .expect("the exact Swift getDesiredStateStatus payload must deserialize");
+        assert!(status.desired_running);
+        assert_eq!(
+            status.last_start_config.as_deref(),
+            Some("{\"label\":\"Sila\"}")
+        );
+        assert_eq!(status.last_schedule_error, None);
+        assert_eq!(status.last_task_kind.as_deref(), Some("refresh"));
+        assert_eq!(status.last_task_started_at, Some(1719500000.5));
+        assert_eq!(status.last_task_completed_at, None);
+        assert_eq!(status.last_completion_reason, None);
+        assert_eq!(status.notification_granted, None);
+    }
+
+    #[test]
+    fn ios_desired_state_status_defaults_when_never_started() {
+        // Fresh install: Swift resolves desiredRunning=false with every optional
+        // field NSNull(). Required `desired_running` is present; the rest default.
+        let json = r#"{"desiredRunning":false,"lastStartConfig":null,"lastScheduleError":null,"lastTaskKind":null,"lastTaskStartedAt":null,"lastTaskCompletedAt":null}"#;
+        let status: IOSDesiredStateStatus = serde_json::from_str(json).unwrap();
+        assert!(!status.desired_running);
+        assert_eq!(status.last_start_config, None);
+        assert_eq!(status.last_task_started_at, None);
+    }
+
+    #[test]
+    fn ios_desired_state_status_camel_case_roundtrip() {
+        let status = IOSDesiredStateStatus {
+            desired_running: true,
+            last_start_config: Some("{}".into()),
+            last_task_kind: Some("processing".into()),
+            last_task_started_at: Some(1.0),
+            last_task_completed_at: None,
+            last_schedule_error: Some("boom".into()),
+            last_completion_reason: Some("expired".into()),
+            notification_granted: Some(true),
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"desiredRunning\":"), "{json}");
+        assert!(json.contains("\"lastStartConfig\":"), "{json}");
+        assert!(json.contains("\"lastTaskKind\":"), "{json}");
+        assert!(json.contains("\"lastScheduleError\":"), "{json}");
+        assert!(json.contains("\"lastCompletionReason\":"), "{json}");
+        assert!(json.contains("\"notificationGranted\":"), "{json}");
+        let de: IOSDesiredStateStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, status);
+    }
+
+    /// M7 (req 3): the persisted desired-state DTO carries the durable
+    /// last-completion reason the iOS native layer now resolves under
+    /// `lastCompletionReason`. Absent (legacy) payloads default it to `None`.
+    #[test]
+    fn ios_desired_state_status_carries_last_completion_reason() {
+        let json = r#"{"desiredRunning":true,"lastCompletionReason":"completed"}"#;
+        let status: IOSDesiredStateStatus = serde_json::from_str(json).unwrap();
+        assert_eq!(status.last_completion_reason.as_deref(), Some("completed"));
+
+        // Legacy payload without the key defaults to None (forward-compatible).
+        let legacy = r#"{"desiredRunning":false}"#;
+        let de: IOSDesiredStateStatus = serde_json::from_str(legacy).unwrap();
+        assert_eq!(de.last_completion_reason, None);
+    }
+
+    /// M4: the persisted desired-state DTO carries the notification-authorization
+    /// decision the iOS native layer now forwards under `notificationGranted`, so
+    /// Rust's Notifier can degrade when notifications are denied. Absent (legacy /
+    /// pre-intent) payloads default it to `None`.
+    #[test]
+    fn ios_desired_state_status_carries_notification_granted() {
+        let granted = r#"{"desiredRunning":true,"notificationGranted":true}"#;
+        let status: IOSDesiredStateStatus = serde_json::from_str(granted).unwrap();
+        assert_eq!(status.notification_granted, Some(true));
+
+        let denied = r#"{"desiredRunning":true,"notificationGranted":false}"#;
+        let status: IOSDesiredStateStatus = serde_json::from_str(denied).unwrap();
+        assert_eq!(status.notification_granted, Some(false));
+
+        // Pre-intent payload without the key defaults to None (unknown decision).
+        let legacy = r#"{"desiredRunning":false}"#;
+        let de: IOSDesiredStateStatus = serde_json::from_str(legacy).unwrap();
+        assert_eq!(de.notification_granted, None);
+    }
+
     // --- OsServiceInstallState tests ---
 
     #[test]
@@ -3129,6 +3949,57 @@ mod tests {
         let json = r#"{"taskKind":"refresh","identifier":"id","receivedAt":1.0,"consumedAt":null}"#;
         let info: PendingTaskInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.consumed_at, None);
+    }
+
+    // --- from_pending_payload gate (H5/M14 part 1): pending ⟺ consumedAt == nil ---
+
+    #[test]
+    fn from_pending_payload_unconsumed_returns_some() {
+        // A fresh, unconsumed record surfaces as a pending task.
+        let value = serde_json::json!({
+            "taskKind": "refresh",
+            "identifier": "com.example.bg-refresh",
+            "receivedAt": 1700000000.0,
+            "consumedAt": serde_json::Value::Null,
+        });
+        let pending = PendingTaskInfo::from_pending_payload(&value).unwrap();
+        assert_eq!(
+            pending,
+            Some(PendingTaskInfo {
+                task_kind: "refresh".into(),
+                identifier: "com.example.bg-refresh".into(),
+                received_at: 1700000000.0,
+                consumed_at: None,
+            })
+        );
+    }
+
+    #[test]
+    fn from_pending_payload_consumed_returns_none() {
+        // H5: a record carrying a non-null `consumedAt` is stale — it must not
+        // re-arm a cold auto-start. The old `taskKind.is_null()`-only gate would
+        // have surfaced this as pending; the consumedAt gate suppresses it.
+        let value = serde_json::json!({
+            "taskKind": "processing",
+            "identifier": "com.example.bg-processing",
+            "receivedAt": 1700000000.0,
+            "consumedAt": 1700000060.5,
+        });
+        let pending = PendingTaskInfo::from_pending_payload(&value).unwrap();
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn from_pending_payload_no_record_returns_none() {
+        // The all-null payload Swift resolves when nothing is pending.
+        let value = serde_json::json!({
+            "taskKind": serde_json::Value::Null,
+            "identifier": serde_json::Value::Null,
+            "receivedAt": serde_json::Value::Null,
+            "consumedAt": serde_json::Value::Null,
+        });
+        let pending = PendingTaskInfo::from_pending_payload(&value).unwrap();
+        assert_eq!(pending, None);
     }
 
     // --- LifecycleState tests ---
@@ -3332,6 +4203,12 @@ mod tests {
                 required_setup: vec![],
             },
             issues: vec![],
+            native_running: None,
+            native_foreground: None,
+            adopted: None,
+            degraded: None,
+            degraded_reason: None,
+            data_dir: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         let de: LifecycleStatus = serde_json::from_str(&json).unwrap();
@@ -3372,6 +4249,12 @@ mod tests {
                 required_setup: vec![],
             },
             issues: vec![],
+            native_running: None,
+            native_foreground: None,
+            adopted: None,
+            degraded: None,
+            degraded_reason: None,
+            data_dir: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("recoveryReason"), "should be absent: {json}");
@@ -3388,6 +4271,14 @@ mod tests {
             "should be absent: {json}"
         );
         assert!(!json.contains("lastError"), "should be absent: {json}");
+        assert!(!json.contains("nativeRunning"), "should be absent: {json}");
+        assert!(
+            !json.contains("nativeForeground"),
+            "should be absent: {json}"
+        );
+        assert!(!json.contains("adopted"), "should be absent: {json}");
+        assert!(!json.contains("degraded"), "should be absent: {json}");
+        assert!(!json.contains("degradedReason"), "should be absent: {json}");
     }
 
     #[test]
@@ -3423,6 +4314,12 @@ mod tests {
                 fix: Some("Request REQUEST_IGNORE_BATTERY_OPTIMIZATIONS".into()),
                 platform: Platform::Android,
             }],
+            native_running: Some(true),
+            native_foreground: Some(true),
+            adopted: Some(false),
+            degraded: Some(false),
+            degraded_reason: None,
+            data_dir: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         let de: LifecycleStatus = serde_json::from_str(&json).unwrap();
@@ -3437,6 +4334,11 @@ mod tests {
         assert_eq!(de.last_error, Some("previous crash".into()));
         assert_eq!(de.platform, Platform::Android);
         assert_eq!(de.issues.len(), 1);
+        assert_eq!(de.native_running, Some(true));
+        assert_eq!(de.native_foreground, Some(true));
+        assert_eq!(de.adopted, Some(false));
+        assert_eq!(de.degraded, Some(false));
+        assert_eq!(de.degraded_reason, None);
     }
 
     #[test]
@@ -3463,6 +4365,12 @@ mod tests {
                 required_setup: vec![],
             },
             issues: vec![],
+            native_running: None,
+            native_foreground: None,
+            adopted: None,
+            degraded: None,
+            degraded_reason: None,
+            data_dir: None,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"state\":"), "{json}");
@@ -3474,5 +4382,238 @@ mod tests {
         assert!(json.contains("\"platform\":"), "{json}");
         assert!(json.contains("\"capabilities\":"), "{json}");
         assert!(json.contains("\"issues\":"), "{json}");
+    }
+
+    // --- tauri.conf.json camelCase deserialization proof (Step 1) ---
+
+    #[test]
+    fn plugin_config_camel_case_json_deserializes_correctly() {
+        let json = r#"{
+            "androidForegroundServiceTypes": ["remoteMessaging", "dataSync"],
+            "androidOnTimeout": "notifyUser",
+            "androidNotificationChannelId": "sila_bg_service",
+            "androidNotificationChannelName": "Sila Background Service",
+            "androidShowStopAction": true,
+            "iosSafetyTimeoutSecs": 28.0,
+            "iosEarliestRefreshBeginMinutes": 15.0,
+            "iosEarliestProcessingBeginMinutes": 15.0,
+            "desktopServiceMode": "inProcess"
+        }"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.android_foreground_service_types,
+            vec!["remoteMessaging", "dataSync"]
+        );
+        assert_eq!(config.android_on_timeout, "notifyUser");
+        assert_eq!(config.android_notification_channel_id, "sila_bg_service");
+        assert_eq!(
+            config.android_notification_channel_name,
+            "Sila Background Service"
+        );
+        assert!(config.android_show_stop_action);
+        assert_eq!(config.ios_safety_timeout_secs, 28.0);
+        assert_eq!(config.ios_earliest_refresh_begin_minutes, 15.0);
+        assert_eq!(config.ios_earliest_processing_begin_minutes, 15.0);
+        #[cfg(feature = "desktop-service")]
+        assert_eq!(config.desktop_service_mode, "inProcess");
+    }
+
+    #[test]
+    fn plugin_config_snake_case_json_falls_back_to_defaults() {
+        let json = r#"{
+            "android_foreground_service_types": ["remoteMessaging", "dataSync"],
+            "desktop_service_mode": "inProcess"
+        }"#;
+        let config: PluginConfig = serde_json::from_str(json).unwrap();
+        // snake_case keys are ignored by #[serde(rename_all = "camelCase")]
+        assert_eq!(
+            config.android_foreground_service_types,
+            vec!["remoteMessaging"],
+            "snake_case key should fall back to default"
+        );
+    }
+
+    // --- AndroidServiceState tests ---
+
+    #[test]
+    fn android_service_state_deserialize_full_kotlin_output() {
+        let json = r#"{
+            "nativeRunning": true,
+            "nativeForeground": true,
+            "desiredRunning": true,
+            "durableState": "running",
+            "serviceLabel": "Sila Service",
+            "foregroundServiceType": "remoteMessaging",
+            "notificationId": 9001,
+            "notificationChannelId": "bg_service",
+            "recoveryPending": false,
+            "recoveryReason": null,
+            "lastPlatformError": null,
+            "dataDir": "/data/data/com.sila.app"
+        }"#;
+        let state: AndroidServiceState = serde_json::from_str(json).unwrap();
+        assert!(state.native_running);
+        assert!(state.native_foreground);
+        assert!(state.desired_running);
+        assert_eq!(state.durable_state, "running");
+        assert_eq!(state.service_label, Some("Sila Service".into()));
+        assert_eq!(
+            state.foreground_service_type,
+            Some("remoteMessaging".into())
+        );
+        assert_eq!(state.notification_id, Some(9001));
+        assert_eq!(state.notification_channel_id, Some("bg_service".into()));
+        assert!(!state.recovery_pending);
+        assert_eq!(state.recovery_reason, None);
+        assert_eq!(state.last_platform_error, None);
+        assert_eq!(state.data_dir, "/data/data/com.sila.app");
+    }
+
+    #[test]
+    fn android_service_state_deserialize_minimal() {
+        let json = r#"{
+            "nativeRunning": false,
+            "nativeForeground": false,
+            "desiredRunning": false,
+            "durableState": "stopped",
+            "recoveryPending": false,
+            "dataDir": ""
+        }"#;
+        let state: AndroidServiceState = serde_json::from_str(json).unwrap();
+        assert!(!state.native_running);
+        assert!(!state.native_foreground);
+        assert!(!state.desired_running);
+        assert_eq!(state.durable_state, "stopped");
+        assert_eq!(state.service_label, None);
+        assert_eq!(state.foreground_service_type, None);
+        assert_eq!(state.notification_id, None);
+        assert_eq!(state.notification_channel_id, None);
+        assert!(!state.recovery_pending);
+        assert_eq!(state.recovery_reason, None);
+        assert_eq!(state.last_platform_error, None);
+        assert_eq!(state.data_dir, "");
+    }
+
+    #[test]
+    fn android_service_state_serde_roundtrip() {
+        let state = AndroidServiceState {
+            native_running: true,
+            native_foreground: false,
+            desired_running: true,
+            durable_state: "starting".into(),
+            service_label: Some("test".into()),
+            foreground_service_type: None,
+            notification_id: None,
+            notification_channel_id: None,
+            recovery_pending: true,
+            recovery_reason: Some("boot".into()),
+            last_platform_error: Some("crash".into()),
+            data_dir: "/data/test".into(),
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let de: AndroidServiceState = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, state);
+    }
+
+    #[test]
+    fn android_service_state_optional_fields_absent_when_none() {
+        let state = AndroidServiceState {
+            native_running: false,
+            native_foreground: false,
+            desired_running: false,
+            durable_state: "unknown".into(),
+            service_label: None,
+            foreground_service_type: None,
+            notification_id: None,
+            notification_channel_id: None,
+            recovery_pending: false,
+            recovery_reason: None,
+            last_platform_error: None,
+            data_dir: "".into(),
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(!json.contains("serviceLabel"), "absent: {json}");
+        assert!(!json.contains("foregroundServiceType"), "absent: {json}");
+        assert!(!json.contains("notificationId"), "absent: {json}");
+        assert!(!json.contains("notificationChannelId"), "absent: {json}");
+        assert!(!json.contains("recoveryReason"), "absent: {json}");
+        assert!(!json.contains("lastPlatformError"), "absent: {json}");
+    }
+
+    // --- LifecycleStatus native state fields tests ---
+
+    #[test]
+    fn lifecycle_status_native_fields_serialize_when_present() {
+        let status = LifecycleStatus {
+            state: LifecycleState::Running,
+            desired_running: true,
+            recovery_enabled: true,
+            recovery_pending: false,
+            recovery_reason: None,
+            last_start_config: None,
+            last_platform_state: None,
+            last_platform_error: None,
+            last_error: None,
+            platform: Platform::Android,
+            capabilities: PlatformCapabilities {
+                platform: Platform::Android,
+                lifecycle_mode: LifecycleMode::AndroidForegroundService,
+                survives_app_close: LifecycleGuarantee::BestEffort,
+                survives_reboot: LifecycleGuarantee::BestEffort,
+                survives_force_quit: LifecycleGuarantee::Unsupported,
+                background_execution: LifecycleGuarantee::Guaranteed,
+                limitations: vec![],
+                required_setup: vec![],
+            },
+            issues: vec![],
+            native_running: Some(true),
+            native_foreground: Some(true),
+            adopted: Some(false),
+            degraded: Some(false),
+            degraded_reason: Some("native running but Rust idle".into()),
+            data_dir: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"nativeRunning\":true"), "{json}");
+        assert!(json.contains("\"nativeForeground\":true"), "{json}");
+        assert!(json.contains("\"adopted\":false"), "{json}");
+        assert!(json.contains("\"degraded\":false"), "{json}");
+        assert!(
+            json.contains("\"degradedReason\":\"native running but Rust idle\""),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn lifecycle_status_native_fields_deserialize_from_json() {
+        let json = r#"{
+            "state": "running",
+            "desiredRunning": true,
+            "recoveryEnabled": true,
+            "recoveryPending": false,
+            "platform": "android",
+            "capabilities": {
+                "platform": "android",
+                "lifecycleMode": "androidForegroundService",
+                "survivesAppClose": "bestEffort",
+                "survivesReboot": "bestEffort",
+                "survivesForceQuit": "unsupported",
+                "backgroundExecution": "guaranteed",
+                "limitations": [],
+                "requiredSetup": []
+            },
+            "issues": [],
+            "nativeRunning": true,
+            "nativeForeground": false,
+            "adopted": true,
+            "degraded": true,
+            "degradedReason": "split-brain detected"
+        }"#;
+        let status: LifecycleStatus = serde_json::from_str(json).unwrap();
+        assert_eq!(status.native_running, Some(true));
+        assert_eq!(status.native_foreground, Some(false));
+        assert_eq!(status.adopted, Some(true));
+        assert_eq!(status.degraded, Some(true));
+        assert_eq!(status.degraded_reason, Some("split-brain detected".into()));
     }
 }
