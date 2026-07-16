@@ -69,7 +69,7 @@ class Bgs19NotifierLocalizationTest {
 
         val notification = shadowOf(
             context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager,
-        ).getNotification(55001)
+        ).getNotification(ActionableMessageNotifier.chatTagFor("chat-ar"), 55001)
         assertNotNull(notification)
         val replyAction = notification!!.actions!![0]
         // Arabic "Reply" ⇒ "رد" (matches NotificationStrings ar table).
@@ -98,7 +98,7 @@ class Bgs19NotifierLocalizationTest {
 
         val notification = shadowOf(
             context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager,
-        ).getNotification(55002)
+        ).getNotification(ActionableMessageNotifier.chatTagFor("chat-fr"), 55002)
         assertNotNull(notification)
         assertEquals("Répondre", notification!!.actions!![0].title.toString())
         assertEquals("Marquer comme lu", notification.actions!![1].title.toString())
@@ -122,7 +122,7 @@ class Bgs19NotifierLocalizationTest {
 
         val notification = shadowOf(
             context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager,
-        ).getNotification(55003)
+        ).getNotification(ActionableMessageNotifier.chatTagFor("chat-en"), 55003)
         assertNotNull(notification)
         assertEquals("Reply", notification!!.actions!![0].title.toString())
         assertEquals("Mark as read", notification.actions!![1].title.toString())
