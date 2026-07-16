@@ -39,7 +39,7 @@ pub trait BackgroundService<R: Runtime>: Send + 'static {
     /// [`manager_loop`](crate::manager::manager_loop) on a SIGTERM/SIGINT, AFTER
     /// the bookkeeping `Stop`. The default is a no-op `Ok(())` so sibling/other
     /// services are unaffected (additive, non-breaking). A service that owns
-    /// process-wide state unreachable from `Drop` — e.g. the Sila `Core`, which
+    /// process-wide state unreachable from `Drop` — e.g. the host app core, which
     /// lives in `AppState` behind a separate crate boundary the plugin cannot
     /// name — overrides this to perform a BOUNDED drain (abort background tasks
     /// + an awaited network shutdown) instead of the abrupt `Drop` abort.

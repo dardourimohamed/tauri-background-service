@@ -246,7 +246,7 @@ export async function requestNotificationPermission(): Promise<void> {
  * Step 14).
  *
  * Opens the system `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` dialog so the
- * user can grant Sila an exemption from battery optimizations. The
+ * user can grant the app an exemption from battery optimizations. The
  * `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` permission is declared in the plugin
  * AndroidManifest.xml but was previously never requested (dead); this wires the
  * honest user-granted flow. No-op on non-Android targets (the Kotlin @Command

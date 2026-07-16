@@ -169,7 +169,7 @@ impl SetupValidator {
         if let Some(plist) = plist {
             // Scope the mode checks to the UIBackgroundModes array so a value
             // appearing elsewhere in the plist (e.g. the always-present
-            // `social.sila.bg-processing` scheduler identifier, which contains
+            // `app.example.bg-processing` scheduler identifier, which contains
             // the substring "processing") cannot mask a background mode that is
             // actually absent.
             let bg_modes_array = plist_array_after_key(plist, "UIBackgroundModes");
@@ -524,11 +524,11 @@ mod tests {
 
     const VALID_IOS_PLIST: &str = r#"<plist><dict>
     <key>CFBundleIdentifier</key>
-    <string>social.sila</string>
+    <string>app.example</string>
     <key>UIBackgroundModes</key>
     <array><string>fetch</string><string>processing</string></array>
     <key>BGTaskSchedulerPermittedIdentifiers</key>
-    <array><string>social.sila.bg-refresh</string><string>social.sila.bg-processing</string></array>
+    <array><string>app.example.bg-refresh</string><string>app.example.bg-processing</string></array>
 </dict></plist>"#;
 
     #[test]
@@ -567,9 +567,9 @@ mod tests {
     #[test]
     fn ios_checks_missing_background_modes_emits_error() {
         let bad = r#"<plist><dict>
-    <key>CFBundleIdentifier</key><string>social.sila</string>
+    <key>CFBundleIdentifier</key><string>app.example</string>
     <key>BGTaskSchedulerPermittedIdentifiers</key>
-    <array><string>social.sila.bg-refresh</string></array>
+    <array><string>app.example.bg-refresh</string></array>
 </dict></plist>"#;
         let report = SetupValidator::ios_checks_for_plist(Some(bad));
         assert!(!report.ok);
@@ -586,16 +586,16 @@ mod tests {
     #[test]
     fn ios_checks_missing_processing_mode_masked_by_identifier_emits_error() {
         // Regression: `processing` is absent from UIBackgroundModes, but the
-        // always-present `social.sila.bg-processing` scheduler identifier
+        // always-present `app.example.bg-processing` scheduler identifier
         // contains the substring "processing". A whole-plist substring search
         // would falsely treat the mode as present and report ok:true. The mode
         // check must be scoped to the UIBackgroundModes array.
         let bad = r#"<plist><dict>
-    <key>CFBundleIdentifier</key><string>social.sila</string>
+    <key>CFBundleIdentifier</key><string>app.example</string>
     <key>UIBackgroundModes</key>
     <array><string>fetch</string></array>
     <key>BGTaskSchedulerPermittedIdentifiers</key>
-    <array><string>social.sila.bg-refresh</string><string>social.sila.bg-processing</string></array>
+    <array><string>app.example.bg-refresh</string><string>app.example.bg-processing</string></array>
 </dict></plist>"#;
         let report = SetupValidator::ios_checks_for_plist(Some(bad));
         assert!(
@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn ios_checks_missing_bg_identifiers_emits_error() {
         let bad = r#"<plist><dict>
-    <key>CFBundleIdentifier</key><string>social.sila</string>
+    <key>CFBundleIdentifier</key><string>app.example</string>
     <key>UIBackgroundModes</key>
     <array><string>fetch</string><string>processing</string></array>
 </dict></plist>"#;
@@ -638,7 +638,7 @@ mod tests {
     <key>UIBackgroundModes</key>
     <array><string>fetch</string><string>processing</string></array>
     <key>BGTaskSchedulerPermittedIdentifiers</key>
-    <array><string>social.sila.bg-refresh</string></array>
+    <array><string>app.example.bg-refresh</string></array>
 </dict></plist>"#;
         let report = SetupValidator::ios_checks_for_plist(Some(mismatch));
         assert!(!report.ok);
@@ -651,7 +651,7 @@ mod tests {
     #[test]
     fn ios_checks_errors_have_error_severity_in_issues() {
         let bad = r#"<plist><dict>
-    <key>CFBundleIdentifier</key><string>social.sila</string>
+    <key>CFBundleIdentifier</key><string>app.example</string>
     <key>UIBackgroundModes</key><array><string>fetch</string></array>
 </dict></plist>"#;
         let report = SetupValidator::ios_checks_for_plist(Some(bad));

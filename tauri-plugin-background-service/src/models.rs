@@ -3654,7 +3654,7 @@ mod tests {
     /// while the service is desired-running with one refresh task started but not
     /// yet completed. `lastScheduleError`/`lastTaskCompletedAt`/
     /// `lastCompletionReason` are `NSNull()` (no run has completed yet).
-    const SWIFT_DESIRED_STATE_PAYLOAD: &str = r#"{"desiredRunning":true,"lastStartConfig":"{\"label\":\"Sila\"}","lastScheduleError":null,"lastTaskKind":"refresh","lastTaskStartedAt":1719500000.5,"lastTaskCompletedAt":null,"lastCompletionReason":null,"notificationGranted":null}"#;
+    const SWIFT_DESIRED_STATE_PAYLOAD: &str = r#"{"desiredRunning":true,"lastStartConfig":"{\"label\":\"App\"}","lastScheduleError":null,"lastTaskKind":"refresh","lastTaskStartedAt":1719500000.5,"lastTaskCompletedAt":null,"lastCompletionReason":null,"notificationGranted":null}"#;
 
     #[test]
     fn ios_scheduling_status_parses_exact_swift_payload() {
@@ -3675,7 +3675,7 @@ mod tests {
         assert!(status.desired_running);
         assert_eq!(
             status.last_start_config.as_deref(),
-            Some("{\"label\":\"Sila\"}")
+            Some("{\"label\":\"App\"}")
         );
         assert_eq!(status.last_schedule_error, None);
         assert_eq!(status.last_task_kind.as_deref(), Some("refresh"));
@@ -4391,8 +4391,8 @@ mod tests {
         let json = r#"{
             "androidForegroundServiceTypes": ["remoteMessaging", "dataSync"],
             "androidOnTimeout": "notifyUser",
-            "androidNotificationChannelId": "sila_bg_service",
-            "androidNotificationChannelName": "Sila Background Service",
+            "androidNotificationChannelId": "bg_service",
+            "androidNotificationChannelName": "Background Service",
             "androidShowStopAction": true,
             "iosSafetyTimeoutSecs": 28.0,
             "iosEarliestRefreshBeginMinutes": 15.0,
@@ -4405,10 +4405,10 @@ mod tests {
             vec!["remoteMessaging", "dataSync"]
         );
         assert_eq!(config.android_on_timeout, "notifyUser");
-        assert_eq!(config.android_notification_channel_id, "sila_bg_service");
+        assert_eq!(config.android_notification_channel_id, "bg_service");
         assert_eq!(
             config.android_notification_channel_name,
-            "Sila Background Service"
+            "Background Service"
         );
         assert!(config.android_show_stop_action);
         assert_eq!(config.ios_safety_timeout_secs, 28.0);
@@ -4442,21 +4442,21 @@ mod tests {
             "nativeForeground": true,
             "desiredRunning": true,
             "durableState": "running",
-            "serviceLabel": "Sila Service",
+            "serviceLabel": "App Service",
             "foregroundServiceType": "remoteMessaging",
             "notificationId": 9001,
             "notificationChannelId": "bg_service",
             "recoveryPending": false,
             "recoveryReason": null,
             "lastPlatformError": null,
-            "dataDir": "/data/data/com.sila.app"
+            "dataDir": "/data/data/com.example.app"
         }"#;
         let state: AndroidServiceState = serde_json::from_str(json).unwrap();
         assert!(state.native_running);
         assert!(state.native_foreground);
         assert!(state.desired_running);
         assert_eq!(state.durable_state, "running");
-        assert_eq!(state.service_label, Some("Sila Service".into()));
+        assert_eq!(state.service_label, Some("App Service".into()));
         assert_eq!(
             state.foreground_service_type,
             Some("remoteMessaging".into())
@@ -4466,7 +4466,7 @@ mod tests {
         assert!(!state.recovery_pending);
         assert_eq!(state.recovery_reason, None);
         assert_eq!(state.last_platform_error, None);
-        assert_eq!(state.data_dir, "/data/data/com.sila.app");
+        assert_eq!(state.data_dir, "/data/data/com.example.app");
     }
 
     #[test]

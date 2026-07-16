@@ -139,7 +139,7 @@ pub fn headless_main_with_desired_state<F, R>(
     factory: F,
     app: AppHandle<R>,
     desired_state_backend: Option<Arc<dyn DesiredStateBackend>>,
-    // BGS-05 re-fix (Critic Blocker 2 — Leg A/Leg B coordination): the Sila
+    // BGS-05 re-fix (Critic Blocker 2 — Leg A/Leg B coordination): the host app
     // app's live consent decision (`consent.enabled && consent.auto_unlock`),
     // threaded into the manager loop's boot Start-replay guard. Fail-closed:
     // callers without a consent policy pass `false` (no replay). See manager_loop
