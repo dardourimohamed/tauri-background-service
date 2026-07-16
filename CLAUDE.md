@@ -18,8 +18,12 @@ tauri-plugin-background-service/     ← Plugin crate
 │   ├── models.rs                    ← StartConfig, PluginConfig, PluginEvent, ServiceContext, AutoStartConfig, StopReason, NativeLifecycleEvent, LifecycleState, LifecycleStatus, Severity, ValidationIssue
 │   ├── error.rs                     ← ServiceError enum
 │   ├── service_trait.rs             ← BackgroundService<R> trait (object-safe)
-│   ├── notifier.rs                  ← Notifier wrapper over tauri-plugin-notification
+│   ├── notifier.rs                  ← Notifier + NotifierPolicy + NotifySink (over tauri-plugin-notification)
+│   ├── capabilities.rs              ← Platform capability detection (LifecycleMode, LifecycleGuarantee)
+│   ├── desired_state.rs             ← DesiredState / FileDesiredStateBackend (auto-recovery across restarts)
+│   ├── validator.rs                 ← Setup validation (ValidationIssue, LifecycleStatus)
 │   └── mobile.rs                    ← Mobile lifecycle (iOS BGTask / Android foreground service)
+│   └── desktop/                     ← `desktop-service` feature: headless, service_manager (systemd/launchd/Windows), IPC + transport (Unix socket / Windows named pipe)
 ├── guest-js/
 │   └── index.ts                     ← TypeScript API: startService, stopService, isServiceRunning, onPluginEvent
 ├── android/                         ← Kotlin: LifecycleService, foreground notification
@@ -86,7 +90,7 @@ Key mechanisms:
 
 ## Constraints
 
-1. **DO NOT add business logic** to the plugin — it is a lifecycle manager only.
+1. **The plugin is a lifecycle manager plus pluggable integration seams — it must not embed host-app business logic.** It manages background-service lifecycle across Android/iOS/desktop and exposes *opt-in, injectable* seams for call/telecom (Android `BackgroundCall*`, iOS `BackgroundCallKit`) and notification surfaces. Host apps inject their own bridge (`HeadlessBridge.nativeLibName`, `performCallAction`, `pushTokenSink`); the shipped defaults are no-ops and the plugin carries **no native library**. Do not hardcode app-specific identifiers, URIs, library names, or native-symbol bindings.
 2. **DO NOT remove `#[non_exhaustive]`** from any public enum — preserves API evolution.
 3. **Lock Mutex briefly**: create token, store it, drop the lock, THEN spawn the task. Never hold the lock across `.await` or `spawn`.
 4. **`CancellationToken` must always be in `tokio::select!`** in any `run()` implementation — cooperative cancellation is the only shutdown path.
@@ -111,4 +115,6 @@ Key mechanisms:
 | `tokio-util` 0.7 | `CancellationToken` |
 | `async-trait` 0.1 | Object-safe async trait |
 | `serde` / `serde_json` | JSON serialization for IPC |
-| `thiserror` 1 | Error derive |
+| `thiserror` 2 | Error derive |
+| `backon` ~1.6 | Retry backoff (optional, `desktop-service` feature) |
+| `service-manager` 0.11 | Managed OS service install/control (optional, `desktop-service` feature) |

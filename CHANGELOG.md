@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-16
+
+First stable release. The production implementation matured inside a host app
+is now the standalone published plugin. The plugin ships **no native library**;
+apps that bridge to their own native core do so via pluggable seams with
+no-op defaults.
+
+### Breaking
+- **`AutoStartConfig` removed.** Replaced by the `DesiredState` /
+  `FileDesiredStateBackend` recovery machinery (`enable_auto_restart` /
+  `disable_auto_restart` / `configure_recovery`, `get_desired_service_state`).
+  Migrate any `AutoStartConfig` usage to the desired-state API — see
+  `docs/migration-guide.md`.
+- **Android native core renamed + decoupled.** `HeadlessCoreBridge` →
+  `HeadlessBridge` (JNI symbols are now
+  `Java_app_tauri_backgroundservice_HeadlessBridge_*`); `SilaConnectionService`
+  → `BackgroundCallConnectionService`. The library name is configurable via
+  `HeadlessBridge.nativeLibName` (default `"app_core"`); a missing library no
+  longer crashes — `ensureLoaded()` returns a typed
+  `native_library_load_failed` result and the lifecycle-only path is unaffected.
+- **iOS `SilaNativeFFI` removed.** The four `@_silgen_name("sila_*")` link-time
+  symbols are gone — SwiftPM now links for any host app, not only one linking a
+  specific cdylib. CallKit perform-actions route through an injectable
+  `BackgroundCallKitController.performCallAction` (no-op default); PushKit
+  tokens route through `BackgroundServicePlugin.pushTokenSink` (no-op default).
+- Status-bar drawable `ic_stat_sila` → `ic_stat_bg_service` (neutral glyph).
+
+### Added
+- **`desktop-service` feature:** managed OS service (systemd/launchd/Windows
+  service) via `service-manager`, headless entry points
+  `headless_main` / `headless_main_with_desired_state` (now incl. Windows),
+  hardened IPC client/server and transport (Unix socket + Windows named pipe),
+  and a desired-state file backend for auto-recovery across restarts.
+- **Notification permission / battery / full-screen-intent APIs:**
+  `get_notification_permission_status`, `request_notification_permission`,
+  `request_battery_exemption`, `can_use_full_screen_intent`,
+  `open_full_screen_intent_settings` (Rust commands + JS helpers).
+- **iOS status surface:** `IOSSchedulingStatus`, `IOSDesiredStateStatus`,
+  `PendingTaskInfo`, native scheduling/desired-state status commands.
+- **Native lifecycle bridge:** `startNativeLifecycleBridge()` and
+  `onPlatformError()` JS helpers; `native_lifecycle_event` plumbing.
+- **Notifier policy:** `NotifierPolicy` / `NotifySink` for OS-aware notification
+  suppression (timeout/recovery).
+- **Pluggable call/telecom/CallKit seams** (Android `BackgroundCall*`, iOS
+  `BackgroundCallKit`) with `performCallAction` / `pushTokenSink` injection
+  points and a documented JNI-symbol contract.
+- **JS call-action bridge:** `startNativeCallActionBridge()`,
+  `NativeCallAction`, `NativeCallActionKind`.
+
+### Changed
+- `LICENSE` is now included in the npm tarball (`guest-js/LICENSE`).
+- `thiserror` → 2; optional deps `service-manager 0.11`, `backon ~1.6`.
+
 ## [0.7.1] - 2026-05-20
 
 ### Changed
