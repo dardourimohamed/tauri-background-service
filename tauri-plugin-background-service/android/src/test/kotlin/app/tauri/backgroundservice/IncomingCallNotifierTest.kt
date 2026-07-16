@@ -175,7 +175,7 @@ class IncomingCallNotifierTest {
         //     ActionableMessageNotifier to the dedicated message channel.
         HeadlessCoreBridge.showMessage("chat-7", "msg-7", "Alice")
         val msgId = ActionableMessageNotifier.notificationIdFor("chat-7")
-        val msgNotif = shadowOf(nm).getNotification(msgId)
+        val msgNotif = shadowOf(nm).getNotification(ActionableMessageNotifier.chatTagFor("chat-7"), msgId)
         assertNotNull("Headless message upcall must post a message notification", msgNotif)
         assertEquals(
             "Headless message posts to the dedicated message channel",

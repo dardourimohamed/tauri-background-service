@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.util.Log
+import androidx.annotation.VisibleForTesting
 import androidx.core.app.NotificationCompat
 import androidx.core.app.Person
 import androidx.core.app.RemoteInput
@@ -159,7 +160,8 @@ object ActionableMessageNotifier {
     }
 
     /** NTF-13: stable per-chat tag derived from chatId ("chat:<chatId>"). */
-    private fun chatTagFor(chatId: String): String = "chat:$chatId"
+    @VisibleForTesting
+    internal fun chatTagFor(chatId: String): String = "chat:$chatId"
 
     /**
      * NTF-13: per-chat group summary, posted under (chatTag, SUMMARY_NOTIFICATION_ID)
