@@ -5,7 +5,7 @@ import android.content.Context
 data class DurableState(
     val desiredRunning: Boolean = false,
     val lastServiceLabel: String = "",
-    val lastServiceType: String = "dataSync",
+    val lastServiceType: String = "remoteMessaging",
     val lastStartEpochMs: Long = 0L,
     val lastHeartbeatEpochMs: Long = 0L,
     val lastNativeState: String = "unknown",
@@ -13,6 +13,13 @@ data class DurableState(
     val restartAttempt: Int = 0,
     val recoveryPending: Boolean = false,
     val recoveryReason: String? = null,
+    // BGS-21 (doc-08 Step 12): discriminator for notification-permission status.
+    // Android `shouldShowRequestPermissionRationale` is FALSE for both never-asked
+    // and permanently-denied, so the status mapping cannot distinguish them without
+    // a persisted "have we ever asked" flag. Default false (fresh install = never
+    // asked). MUST be wired in BOTH load() and save() or it compiles yet never
+    // round-trips across reboot — a silent defect.
+    val hasAskedNotificationPermission: Boolean = false,
 ) {
     companion object {
         private const val PREFS_NAME = "tauri_bg_service_state"
@@ -27,13 +34,14 @@ data class DurableState(
         private const val KEY_RESTART_ATTEMPT = "restart_attempt"
         private const val KEY_RECOVERY_PENDING = "recovery_pending"
         private const val KEY_RECOVERY_REASON = "recovery_reason"
+        private const val KEY_HAS_ASKED_NOTIFICATION = "has_asked_notification"
 
         fun load(context: Context): DurableState {
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             return DurableState(
                 desiredRunning = prefs.getBoolean(KEY_DESIRED_RUNNING, false),
                 lastServiceLabel = prefs.getString(KEY_LAST_SERVICE_LABEL, "") ?: "",
-                lastServiceType = prefs.getString(KEY_LAST_SERVICE_TYPE, "dataSync") ?: "dataSync",
+                lastServiceType = prefs.getString(KEY_LAST_SERVICE_TYPE, "remoteMessaging") ?: "remoteMessaging",
                 lastStartEpochMs = prefs.getLong(KEY_LAST_START_EPOCH_MS, 0L),
                 lastHeartbeatEpochMs = prefs.getLong(KEY_LAST_HEARTBEAT_EPOCH_MS, 0L),
                 lastNativeState = prefs.getString(KEY_LAST_NATIVE_STATE, "unknown") ?: "unknown",
@@ -41,11 +49,16 @@ data class DurableState(
                 restartAttempt = prefs.getInt(KEY_RESTART_ATTEMPT, 0),
                 recoveryPending = prefs.getBoolean(KEY_RECOVERY_PENDING, false),
                 recoveryReason = prefs.getString(KEY_RECOVERY_REASON, null),
+                hasAskedNotificationPermission = prefs.getBoolean(KEY_HAS_ASKED_NOTIFICATION, false),
             )
         }
 
         fun save(context: Context, state: DurableState) {
             val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            // commit() (synchronous), not apply(): a foreground-start failure
+            // persists lastPlatformError and then self-stops immediately, so the
+            // write must flush before the process is torn down or the UI loses
+            // the reason the service died (spec-compliance W1 / R-W1.3, NFR-1).
             prefs.edit()
                 .putBoolean(KEY_DESIRED_RUNNING, state.desiredRunning)
                 .putString(KEY_LAST_SERVICE_LABEL, state.lastServiceLabel)
@@ -57,7 +70,8 @@ data class DurableState(
                 .putInt(KEY_RESTART_ATTEMPT, state.restartAttempt)
                 .putBoolean(KEY_RECOVERY_PENDING, state.recoveryPending)
                 .putString(KEY_RECOVERY_REASON, state.recoveryReason)
-                .apply()
+                .putBoolean(KEY_HAS_ASKED_NOTIFICATION, state.hasAskedNotificationPermission)
+                .commit()
         }
 
         fun clear(context: Context) {

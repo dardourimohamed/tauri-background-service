@@ -1,363 +1,212 @@
 import XCTest
-@testable import TauriPluginBackgroundService
+@testable import tauri_plugin_background_service
 
-/// Tests for iOS scheduling result reporting and desired-state persistence.
+/// Real plugin-behavior tests that don't fit a step-specific suite: the pure D2
+/// adaptive-schedule policy, `TaskOutcome` parsing, and the L5 callId/callerName
+/// hygiene on `showIncomingCall`/`cancelIncomingCall`. Each one exercises actual
+/// plugin code (a static function, an initializer, or a command driven through the
+/// `InvokeCapture` seam).
 ///
-/// These tests verify the UserDefaults persistence layer and scheduling result
-/// mapping. Run with `xcodebuild test` on macOS with an iOS simulator target.
-///
-/// Note: BGTaskScheduler.submit() will fail in test environments unless the
-/// test bundle includes the required Info.plist entries. Tests that depend on
-/// scheduling success/failure use a mocked scheduling layer.
+/// Step 18 / H11 purged this file's former UserDefaults-echo-only and commented-out
+/// pseudo tests (they only set/read `UserDefaults` or a local closure without
+/// touching plugin code, giving false confidence). The behaviors they gestured at
+/// are proven for real elsewhere: desired-state persistence in
+/// `DesiredStateMirrorTests`, the split scheduling status in
+/// `SchedulingStatusContractTests` / `StatusFactTests`, pending-task lifecycle in
+/// `PendingTaskLifecycleTests`, schedule-error hygiene in `CompletionHygieneTests`,
+/// and the exactly-once completion guard in `ExactlyOnceCompletionTests`.
 final class BackgroundServicePluginTests: XCTestCase {
 
-    private var plugin: BackgroundServicePlugin!
+    // MARK: - Adaptive Processing Schedule (pure function, D2)
 
-    override func setUp() {
-        super.setUp()
-        // Clear all desired-state keys before each test
-        let defaults = UserDefaults.standard
-        defaults.removeObject(forKey: "ios_desired_running")
-        defaults.removeObject(forKey: "ios_last_start_config")
-        defaults.removeObject(forKey: "ios_last_schedule_error")
-        defaults.removeObject(forKey: "ios_last_task_kind")
-        defaults.removeObject(forKey: "ios_last_task_started_at")
-        defaults.removeObject(forKey: "ios_last_task_completed_at")
+    /// Convenience wrapper: most cases only vary kind/outcome/previous/multiplier.
+    private func adaptive(
+        configured: Double = 15.0,
+        ceilingMultiplier: Double = 4.0,
+        lastTaskKind: String? = "processing",
+        lastOutcome: BackgroundServicePlugin.TaskOutcome,
+        previous: Double
+    ) -> Double {
+        return BackgroundServicePlugin.adaptiveProcessingBeginMinutes(
+            configured: configured,
+            ceilingMultiplier: ceilingMultiplier,
+            lastStartedAt: nil,
+            lastCompletedAt: nil,
+            lastTaskKind: lastTaskKind,
+            lastOutcome: lastOutcome,
+            previous: previous
+        )
     }
 
-    override func tearDown() {
-        UserDefaults.standard.removePersistentDomain(forName: Bundle.main.bundleIdentifier ?? "test")
-        super.tearDown()
+    func testAdaptive_expiredBacksOff() {
+        // Expired run → back off 1.5×: 15 * 1.5 = 22.5, well below the 60 ceiling
+        let result = adaptive(lastOutcome: .expired, previous: 15.0)
+        XCTAssertEqual(result, 22.5, accuracy: 0.0001)
     }
 
-    // MARK: - Desired State Persistence
-
-    func testDesiredStateKeys_storesCorrectKeys() {
-        let defaults = UserDefaults.standard
-        defaults.set(true, forKey: "ios_desired_running")
-        defaults.set("{\"label\":\"test\"}", forKey: "ios_last_start_config")
-        defaults.set("some error", forKey: "ios_last_schedule_error")
-        defaults.set("refresh", forKey: "ios_last_task_kind")
-        defaults.set(1000.0, forKey: "ios_last_task_started_at")
-        defaults.set(2000.0, forKey: "ios_last_task_completed_at")
-
-        XCTAssertTrue(defaults.bool(forKey: "ios_desired_running"))
-        XCTAssertEqual(defaults.string(forKey: "ios_last_start_config"), "{\"label\":\"test\"}")
-        XCTAssertEqual(defaults.string(forKey: "ios_last_schedule_error"), "some error")
-        XCTAssertEqual(defaults.string(forKey: "ios_last_task_kind"), "refresh")
-        XCTAssertEqual(defaults.double(forKey: "ios_last_task_started_at"), 1000.0)
-        XCTAssertEqual(defaults.double(forKey: "ios_last_task_completed_at"), 2000.0)
+    func testAdaptive_expiredClampsToCeiling() {
+        // 50 * 1.5 = 75 exceeds the ceiling (15 * 4 = 60) → clamp
+        let result = adaptive(lastOutcome: .expired, previous: 50.0)
+        XCTAssertEqual(result, 60.0, accuracy: 0.0001)
     }
 
-    func testDesiredState_clearCompletedAtOnStart() {
-        let defaults = UserDefaults.standard
-        defaults.set(2000.0, forKey: "ios_last_task_completed_at")
-
-        // Simulating startKeepalive clearing completed_at
-        defaults.set(true, forKey: "ios_desired_running")
-        defaults.removeObject(forKey: "ios_last_task_completed_at")
-
-        XCTAssertNil(defaults.object(forKey: "ios_last_task_completed_at"))
-        XCTAssertTrue(defaults.bool(forKey: "ios_desired_running"))
+    func testAdaptive_completedTightens() {
+        // Completed run → tighten 1.5×: 45 / 1.5 = 30, above the 15 floor
+        let result = adaptive(lastOutcome: .completedNaturally, previous: 45.0)
+        XCTAssertEqual(result, 30.0, accuracy: 0.0001)
     }
 
-    func testDesiredState_persistsRunningFalseOnStop() {
-        let defaults = UserDefaults.standard
-        defaults.set(true, forKey: "ios_desired_running")
-
-        // Simulating stopKeepalive
-        defaults.set(false, forKey: "ios_desired_running")
-        let completedAt = Date().timeIntervalSince1970
-        defaults.set(completedAt, forKey: "ios_last_task_completed_at")
-
-        XCTAssertFalse(defaults.bool(forKey: "ios_desired_running"))
-        XCTAssertNotNil(defaults.object(forKey: "ios_last_task_completed_at"))
+    func testAdaptive_completedClampsToFloor() {
+        // 18 / 1.5 = 12 is below the configured floor (15) → clamp
+        let result = adaptive(lastOutcome: .completedNaturally, previous: 18.0)
+        XCTAssertEqual(result, 15.0, accuracy: 0.0001)
     }
 
-    // MARK: - Scheduling Result Structure
-
-    /// Verify the scheduling result has the expected shape when both succeed.
-    func testSchedulingResult_bothScheduled() {
-        // This would be tested by calling startKeepalive with valid config
-        // and verifying the resolved value contains:
-        // { refreshScheduled: true, processingScheduled: true, refreshError: null, processingError: null }
-        //
-        // In a real test environment with BGTaskScheduler mock:
-        // let result = plugin.scheduleNext()
-        // XCTAssertTrue(result.refreshScheduled)
-        // XCTAssertTrue(result.processingScheduled)
-        // XCTAssertNil(result.refreshError)
-        // XCTAssertNil(result.processingError)
-
-        // Structural verification: the result type exists with expected fields
-        let defaults = UserDefaults.standard
-        defaults.set(true, forKey: "ios_desired_running")
-        XCTAssertTrue(defaults.bool(forKey: "ios_desired_running"))
+    func testAdaptive_unknownHolds() {
+        // Unknown outcome → previous value held unchanged
+        let result = adaptive(lastOutcome: .unknown, previous: 30.0)
+        XCTAssertEqual(result, 30.0, accuracy: 0.0001)
     }
 
-    /// Verify partial success: one scheduled, one failed.
-    func testSchedulingResult_partialSuccess() {
-        // In a test with mocked BGTaskScheduler where refresh succeeds but processing fails:
-        // let result = plugin.scheduleNext()
-        // XCTAssertTrue(result.refreshScheduled)
-        // XCTAssertFalse(result.processingScheduled)
-        // XCTAssertNil(result.refreshError)
-        // XCTAssertNotNil(result.processingError)
-
-        // Verify the error key is set when there's a schedule error
-        let defaults = UserDefaults.standard
-        defaults.set("BGTaskScheduler error", forKey: "ios_last_schedule_error")
-        XCTAssertEqual(defaults.string(forKey: "ios_last_schedule_error"), "BGTaskScheduler error")
+    func testAdaptive_noPreviousUsesConfigured() {
+        // No persisted adaptive value: caller passes configured as previous;
+        // unknown outcome holds it → configured comes back out.
+        let result = adaptive(lastOutcome: .unknown, previous: 15.0)
+        XCTAssertEqual(result, 15.0, accuracy: 0.0001)
     }
 
-    /// Verify both-fail triggers schedulerUnavailable rejection.
-    func testSchedulingResult_bothFail_rejectsWithSchedulerUnavailable() {
-        // When both BGTaskScheduler.submit() calls fail, startKeepalive should
-        // call invoke.reject(error: "schedulerUnavailable") instead of resolve.
-        //
-        // This test requires a mock Invoke to capture the rejection:
-        // class MockInvoke: Invoke {
-        //     var rejectedWithError: String?
-        //     override func reject(error: String?) { rejectedWithError = error }
-        // }
-        // let mockInvoke = MockInvoke()
-        // plugin.startKeepalive(mockInvoke)
-        // XCTAssertEqual(mockInvoke.rejectedWithError, "schedulerUnavailable")
-
-        // Verify desired state is still persisted even on failure
-        let defaults = UserDefaults.standard
-        defaults.set(true, forKey: "ios_desired_running")
-        defaults.set("both failed", forKey: "ios_last_schedule_error")
-        XCTAssertTrue(defaults.bool(forKey: "ios_desired_running"))
-        XCTAssertEqual(defaults.string(forKey: "ios_last_schedule_error"), "both failed")
+    func testAdaptive_refreshKindDoesNotMove() {
+        // A refresh-kind run never moves the processing value, even on expiry
+        let result = adaptive(lastTaskKind: "refresh", lastOutcome: .expired, previous: 30.0)
+        XCTAssertEqual(result, 30.0, accuracy: 0.0001)
     }
 
-    // MARK: - Task Handler Persistence
-
-    func testTaskHandler_persistsRefreshTaskKind() {
-        let defaults = UserDefaults.standard
-        defaults.set("refresh", forKey: "ios_last_task_kind")
-        let startTime = Date().timeIntervalSince1970
-        defaults.set(startTime, forKey: "ios_last_task_started_at")
-
-        XCTAssertEqual(defaults.string(forKey: "ios_last_task_kind"), "refresh")
-        XCTAssertNotNil(defaults.object(forKey: "ios_last_task_started_at"))
+    func testAdaptive_nilKindDoesNotMove() {
+        // No recorded task kind → hold previous
+        let result = adaptive(lastTaskKind: nil, lastOutcome: .expired, previous: 30.0)
+        XCTAssertEqual(result, 30.0, accuracy: 0.0001)
     }
 
-    func testTaskHandler_persistsProcessingTaskKind() {
-        let defaults = UserDefaults.standard
-        defaults.set("processing", forKey: "ios_last_task_kind")
-        let startTime = Date().timeIntervalSince1970
-        defaults.set(startTime, forKey: "ios_last_task_started_at")
+    // MARK: - Adaptive Guards (clamp + NaN, mandated by Step 6 review)
 
-        XCTAssertEqual(defaults.string(forKey: "ios_last_task_kind"), "processing")
-        XCTAssertNotNil(defaults.object(forKey: "ios_last_task_started_at"))
+    func testAdaptive_multiplierBelowOneClampsCeilingToConfigured() {
+        // multiplier <= 1 would put the ceiling below the floor; the effective
+        // ceiling must clamp to configured. Expired from the floor stays at it.
+        let result = adaptive(ceilingMultiplier: 0.5, lastOutcome: .expired, previous: 15.0)
+        XCTAssertEqual(result, 15.0, accuracy: 0.0001)
     }
 
-    // MARK: - Expiration Persistence
-
-    func testExpiration_persistsCompletedAt() {
-        let defaults = UserDefaults.standard
-        let before = Date().timeIntervalSince1970
-
-        // Simulate expiration handler persisting completed_at
-        let completedAt = Date().timeIntervalSince1970
-        defaults.set(completedAt, forKey: "ios_last_task_completed_at")
-
-        let after = Date().timeIntervalSince1970
-        let stored = defaults.double(forKey: "ios_last_task_completed_at")
-        XCTAssertGreaterThanOrEqual(stored, before)
-        XCTAssertLessThanOrEqual(stored, after)
+    func testAdaptive_multiplierExactlyOneClampsCeilingToConfigured() {
+        let result = adaptive(ceilingMultiplier: 1.0, lastOutcome: .expired, previous: 15.0)
+        XCTAssertEqual(result, 15.0, accuracy: 0.0001)
     }
 
-    // MARK: - getSchedulingStatus
-
-    func testGetSchedulingStatus_returnsStoredValues() {
-        let defaults = UserDefaults.standard
-        defaults.set(true, forKey: "ios_desired_running")
-        defaults.set("{\"label\":\"test\"}", forKey: "ios_last_start_config")
-        defaults.removeObject(forKey: "ios_last_schedule_error")
-        defaults.set("refresh", forKey: "ios_last_task_kind")
-        let now = Date().timeIntervalSince1970
-        defaults.set(now, forKey: "ios_last_task_started_at")
-        defaults.removeObject(forKey: "ios_last_task_completed_at")
-
-        // Verify all values are readable from UserDefaults
-        // In a real test with mock Invoke:
-        // let mockInvoke = MockInvoke()
-        // plugin.getSchedulingStatus(mockInvoke)
-        // XCTAssertEqual(mockInvoke.resolvedValue?["desiredRunning"] as? Bool, true)
-        // XCTAssertEqual(mockInvoke.resolvedValue?["lastStartConfig"] as? String, "{\"label\":\"test\"}")
-        // XCTAssertNil(mockInvoke.resolvedValue?["lastScheduleError"] as? NSNull)
-        // XCTAssertEqual(mockInvoke.resolvedValue?["lastTaskKind"] as? String, "refresh")
-
-        XCTAssertTrue(defaults.bool(forKey: "ios_desired_running"))
-        XCTAssertEqual(defaults.string(forKey: "ios_last_start_config"), "{\"label\":\"test\"}")
-        XCTAssertNil(defaults.string(forKey: "ios_last_schedule_error"))
-        XCTAssertEqual(defaults.string(forKey: "ios_last_task_kind"), "refresh")
+    func testAdaptive_negativeMultiplierClampsCeilingToConfigured() {
+        let result = adaptive(ceilingMultiplier: -3.0, lastOutcome: .expired, previous: 40.0)
+        XCTAssertEqual(result, 15.0, accuracy: 0.0001)
     }
 
-    func testGetSchedulingStatus_defaultValues() {
-        let defaults = UserDefaults.standard
-        // No values set — should return defaults
-        XCTAssertFalse(defaults.bool(forKey: "ios_desired_running"))
-        XCTAssertNil(defaults.string(forKey: "ios_last_start_config"))
-        XCTAssertNil(defaults.string(forKey: "ios_last_schedule_error"))
-        XCTAssertNil(defaults.string(forKey: "ios_last_task_kind"))
+    func testAdaptive_nanMultiplierClampsCeilingToConfigured() {
+        // NaN must not poison the persisted adaptive value
+        let result = adaptive(ceilingMultiplier: .nan, lastOutcome: .expired, previous: 15.0)
+        XCTAssertEqual(result, 15.0, accuracy: 0.0001)
     }
 
-    // MARK: - Schedule Error Persistence
-
-    func testScheduleError_persistedOnPartialFailure() {
-        let defaults = UserDefaults.standard
-        // Simulate refresh succeeded but processing failed
-        defaults.set("Processing task rejected", forKey: "ios_last_schedule_error")
-        XCTAssertEqual(defaults.string(forKey: "ios_last_schedule_error"), "Processing task rejected")
+    func testAdaptive_nanPreviousFallsBackToConfigured() {
+        // NaN previous is treated as "no previous" → start from configured
+        let result = adaptive(lastOutcome: .expired, previous: .nan)
+        XCTAssertEqual(result, 22.5, accuracy: 0.0001)
     }
 
-    func testScheduleError_clearedOnSuccess() {
-        let defaults = UserDefaults.standard
-        defaults.set("old error", forKey: "ios_last_schedule_error")
-
-        // On successful scheduling, error should be cleared
-        defaults.removeObject(forKey: "ios_last_schedule_error")
-        XCTAssertNil(defaults.string(forKey: "ios_last_schedule_error"))
+    func testAdaptive_infinitePreviousFallsBackToConfigured() {
+        let result = adaptive(lastOutcome: .expired, previous: .infinity)
+        XCTAssertEqual(result, 22.5, accuracy: 0.0001)
     }
 
-    // MARK: - Start Config Persistence
-
-    func testStartConfig_persistedAsJSON() {
-        let config: [String: Any] = [
-            "label": "MyService",
-            "foregroundServiceType": "dataSync",
-            "iosSafetyTimeoutSecs": 15.0
-        ]
-        if let data = try? JSONSerialization.data(withJSONObject: config, options: []),
-           let json = String(data: data, encoding: .utf8) {
-            let defaults = UserDefaults.standard
-            defaults.set(json, forKey: "ios_last_start_config")
-
-            let stored = defaults.string(forKey: "ios_last_start_config")
-            XCTAssertNotNil(stored)
-            XCTAssertTrue(stored!.contains("label"))
-            XCTAssertTrue(stored!.contains("MyService"))
-        }
+    func testAdaptive_nonPositivePreviousFallsBackToConfigured() {
+        let result = adaptive(lastOutcome: .unknown, previous: -7.0)
+        XCTAssertEqual(result, 15.0, accuracy: 0.0001)
     }
 
-    // MARK: - Pending Task Info
-
-    func testPendingTaskInfo_storedOnRefreshTask() {
-        // Simulate what handleBackgroundTask does: store pending info
-        let defaults = UserDefaults.standard
-        defaults.set("refresh", forKey: "ios_last_task_kind")
-        let now = Date().timeIntervalSince1970
-        defaults.set(now, forKey: "ios_last_task_started_at")
-
-        // In a real test with mock BGTask:
-        // plugin.handleBackgroundTask(mockRefreshTask)
-        // let result = plugin.getPendingBgTask(mockInvoke)
-        // XCTAssertEqual(result["taskKind"] as? String, "refresh")
-        // XCTAssertEqual(result["identifier"] as? String, "app.bg-refresh")
-        // XCTAssertNotNil(result["receivedAt"])
-
-        // Verify the task kind was persisted
-        XCTAssertEqual(defaults.string(forKey: "ios_last_task_kind"), "refresh")
+    func testAdaptive_nanConfiguredFallsBackToDefault() {
+        // Invalid configured floor falls back to the 15-minute scheduler default
+        let result = adaptive(configured: .nan, lastOutcome: .expired, previous: 15.0)
+        XCTAssertEqual(result, 22.5, accuracy: 0.0001)
     }
 
-    func testPendingTaskInfo_storedOnProcessingTask() {
-        let defaults = UserDefaults.standard
-        defaults.set("processing", forKey: "ios_last_task_kind")
-        let now = Date().timeIntervalSince1970
-        defaults.set(now, forKey: "ios_last_task_started_at")
-
-        XCTAssertEqual(defaults.string(forKey: "ios_last_task_kind"), "processing")
+    func testAdaptive_zeroConfiguredFallsBackToDefault() {
+        let result = adaptive(configured: 0.0, lastOutcome: .unknown, previous: 15.0)
+        XCTAssertEqual(result, 15.0, accuracy: 0.0001)
     }
 
-    func testClearPendingBgTask_clearsInfo() {
-        // Simulate storing pending info then clearing
-        let defaults = UserDefaults.standard
-        defaults.set("refresh", forKey: "ios_last_task_kind")
-
-        // In a real test:
-        // plugin.pendingTaskInfo = PendingTaskInfo(...)
-        // XCTAssertNotNil(plugin.pendingTaskInfo)
-        // plugin.clearPendingBgTask(mockInvoke)
-        // XCTAssertNil(plugin.pendingTaskInfo)
-
-        // Verify the concept: clearing removes the stored reference
-        defaults.removeObject(forKey: "ios_last_task_kind")
-        XCTAssertNil(defaults.string(forKey: "ios_last_task_kind"))
+    func testAdaptive_allInvalidInputsStillFiniteResult() {
+        // Worst case: every numeric input invalid — result must stay finite
+        // and land on the default floor (NaN multiplier collapses the ceiling
+        // to the floor), never NaN.
+        let result = adaptive(
+            configured: .nan, ceilingMultiplier: .nan,
+            lastOutcome: .expired, previous: .nan
+        )
+        XCTAssertTrue(result.isFinite)
+        XCTAssertEqual(result, 15.0, accuracy: 0.0001)
     }
 
-    func testPendingTaskInfo_receivedAt_timestamp() {
-        let before = Date().timeIntervalSince1970
-        let receivedAt = Date().timeIntervalSince1970
-        let after = Date().timeIntervalSince1970
+    // MARK: - Task Outcome Parsing
 
-        XCTAssertGreaterThanOrEqual(receivedAt, before)
-        XCTAssertLessThanOrEqual(receivedAt, after)
+    func testTaskOutcome_parsesCompleted() {
+        XCTAssertEqual(BackgroundServicePlugin.TaskOutcome(persisted: "completed"), .completedNaturally)
     }
 
-    // MARK: - Completion Safety
-
-    func testCompletionSafety_flagPreventsDoubleCompletion() {
-        // Verify the concept: a boolean flag prevents double calls
-        var taskCompleted = false
-        var completionCount = 0
-
-        func completeTask() {
-            guard !taskCompleted else { return }
-            taskCompleted = true
-            completionCount += 1
-        }
-
-        completeTask()
-        completeTask()  // Should be a no-op
-        completeTask()  // Should be a no-op
-
-        XCTAssertEqual(completionCount, 1, "setTaskCompleted should be called exactly once")
+    func testTaskOutcome_parsesExpired() {
+        XCTAssertEqual(BackgroundServicePlugin.TaskOutcome(persisted: "expired"), .expired)
     }
 
-    func testCompletionSafety_flagResetForNewTask() {
-        var taskCompleted = false
-
-        // First task
-        taskCompleted = false  // Set by handler on new task
-        XCTAssertFalse(taskCompleted)
-
-        // Complete first task
-        taskCompleted = true
-        XCTAssertTrue(taskCompleted)
-
-        // Cleanup resets
-        taskCompleted = false
-        XCTAssertFalse(taskCompleted)
-
-        // Second task resets again
-        taskCompleted = false
-        XCTAssertFalse(taskCompleted)
+    func testTaskOutcome_nilIsUnknown() {
+        XCTAssertEqual(BackgroundServicePlugin.TaskOutcome(persisted: nil), .unknown)
     }
 
-    // MARK: - Foreground/Background Transitions
-
-    func testBackgroundTransition_schedulesWhenDesired() {
-        let defaults = UserDefaults.standard
-        defaults.set(true, forKey: "ios_desired_running")
-
-        // When going to background with desired_running=true and no active BGTask,
-        // scheduleNext() should be called.
-        // In a real test:
-        // plugin.appDidEnterBackground()
-        // Verify scheduleNext was called (mock BGTaskScheduler)
-
-        XCTAssertTrue(defaults.bool(forKey: "ios_desired_running"))
+    func testTaskOutcome_unrecognizedIsUnknown() {
+        XCTAssertEqual(BackgroundServicePlugin.TaskOutcome(persisted: "garbage"), .unknown)
     }
 
-    func testBackgroundTransition_doesNotScheduleWhenNotDesired() {
-        let defaults = UserDefaults.standard
-        defaults.set(false, forKey: "ios_desired_running")
+    // MARK: - L5: callId / callerName hygiene in showIncomingCall / cancelIncomingCall
 
-        // When desired_running=false, should not schedule on background
-        XCTAssertFalse(defaults.bool(forKey: "ios_desired_running"))
+    private static let validCallId = "018f3a2b5c4d6e7f019e4b6c7d8e9f0a"
+
+    func testShowIncomingCall_rejectsEmptyCallId() {
+        let plugin = BackgroundServicePlugin()
+        let capture = InvokeCapture()
+        plugin.showIncomingCall(
+            capture.makeInvoke(args: "{\"callId\":\"\",\"callerName\":\"Alice\",\"isVideo\":false}"))
+        XCTAssertEqual(capture.rejectCount, 1, "empty callId never rings")
+        XCTAssertEqual(capture.resolveCount, 0)
+    }
+
+    func testShowIncomingCall_rejectsNonHexCallId() {
+        let plugin = BackgroundServicePlugin()
+        let capture = InvokeCapture()
+        // 32 chars but not hex.
+        plugin.showIncomingCall(
+            capture.makeInvoke(args: "{\"callId\":\"zzzz3a2b5c4d6e7f019e4b6c7d8e9f0a\",\"callerName\":\"Alice\",\"isVideo\":false}"))
+        XCTAssertEqual(capture.rejectCount, 1, "non-hex callId never rings")
+        XCTAssertEqual(capture.resolveCount, 0)
+    }
+
+    func testShowIncomingCall_rejectsEmptyCallerName() {
+        let plugin = BackgroundServicePlugin()
+        let capture = InvokeCapture()
+        plugin.showIncomingCall(
+            capture.makeInvoke(args: "{\"callId\":\"\(Self.validCallId)\",\"callerName\":\"\",\"isVideo\":false}"))
+        XCTAssertEqual(capture.rejectCount, 1, "empty callerName is rejected")
+        XCTAssertEqual(capture.resolveCount, 0)
+    }
+
+    func testCancelIncomingCall_rejectsNonHexCallId() {
+        let plugin = BackgroundServicePlugin()
+        let capture = InvokeCapture()
+        plugin.cancelIncomingCall(
+            capture.makeInvoke(args: "{\"callId\":\"not-a-valid-id\"}"))
+        XCTAssertEqual(capture.rejectCount, 1, "malformed callId on cancel is rejected")
+        XCTAssertEqual(capture.resolveCount, 0)
     }
 }

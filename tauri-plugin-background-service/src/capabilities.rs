@@ -58,7 +58,7 @@ impl CapabilityProvider {
                 "BGProcessingTask has variable execution window (minutes to hours)".into(),
             ],
             required_setup: vec![
-                "UIBackgroundModes in Info.plist (background-fetch, background-processing)".into(),
+                "UIBackgroundModes in Info.plist (fetch, processing)".into(),
                 "BGTaskSchedulerPermittedIdentifiers in Info.plist".into(),
             ],
         }
@@ -192,6 +192,28 @@ impl CapabilityProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Expected platform for the current desktop host, computed from the same
+    /// `cfg` flags `detect_platform`/`desktop_platform` use. `detect_platform`
+    /// is host-dependent, so tests must not hardcode a single `Platform`.
+    fn host_platform() -> Platform {
+        #[cfg(target_os = "linux")]
+        {
+            Platform::Linux
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Platform::Macos
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Platform::Windows
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        {
+            Platform::Unknown
+        }
+    }
 
     // --- Android capabilities ---
 
@@ -459,26 +481,26 @@ mod tests {
         assert_eq!(caps.survives_app_close, LifecycleGuarantee::Unsupported);
     }
 
-    // --- detect_platform (runs on Linux) ---
+    // --- detect_platform (host-dependent: expected platform from `cfg`) ---
 
     #[test]
     fn detect_platform_desktop_default_is_in_process() {
         let (platform, mode) = CapabilityProvider::detect_platform(None);
-        assert_eq!(platform, Platform::Linux);
+        assert_eq!(platform, host_platform());
         assert_eq!(mode, LifecycleMode::DesktopInProcess);
     }
 
     #[test]
     fn detect_platform_desktop_os_service_mode() {
         let (platform, mode) = CapabilityProvider::detect_platform(Some("osService"));
-        assert_eq!(platform, Platform::Linux);
+        assert_eq!(platform, host_platform());
         assert_eq!(mode, LifecycleMode::DesktopOsService);
     }
 
     #[test]
     fn detect_platform_desktop_in_process_explicit() {
         let (platform, mode) = CapabilityProvider::detect_platform(Some("inProcess"));
-        assert_eq!(platform, Platform::Linux);
+        assert_eq!(platform, host_platform());
         assert_eq!(mode, LifecycleMode::DesktopInProcess);
     }
 }

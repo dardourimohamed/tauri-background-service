@@ -5,8 +5,8 @@
 //!
 //! # Platform Support
 //!
-//! - **OS service mode (IPC)**: Unix-only (Linux, macOS). The IPC transport
-//!   uses Unix domain sockets. Windows named pipe support is not yet implemented.
+//! - **OS service mode (IPC)**: all desktop platforms. The IPC transport uses
+//!   Unix domain sockets on Linux/macOS and named pipes on Windows.
 //! - **Service install/uninstall**: All desktop platforms via the `service-manager` crate.
 //!
 //! Only available when the `desktop-service` Cargo feature is enabled.
@@ -15,14 +15,15 @@ pub mod env_checks;
 pub mod service_manager;
 pub mod transport;
 
-// Unix-only IPC modules.
-#[cfg(unix)]
+// IPC modules, generic over the platform transport (Unix domain sockets or
+// Windows named pipes).
+#[cfg(any(unix, windows))]
 pub mod headless;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod ipc;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod ipc_client;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod ipc_server;
 
 // Platform-specific transport implementation (submodule of transport).

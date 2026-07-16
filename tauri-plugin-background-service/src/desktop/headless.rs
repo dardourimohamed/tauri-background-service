@@ -22,13 +22,16 @@
 //! }
 //! ```
 
+use std::sync::Arc;
+
 use tauri::{AppHandle, Listener, Runtime};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::desired_state::DesiredStateBackend;
 use crate::desktop::ipc::{socket_path, IpcEvent};
 use crate::desktop::ipc_server::IpcServer;
-use crate::manager::manager_loop;
+use crate::manager::{manager_loop, ManagerCommand, ServiceManagerHandle};
 use crate::models::PluginEvent;
 #[cfg(test)]
 use crate::models::StopReason;
@@ -70,6 +73,48 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
     })
 }
 
+/// Entry point for the headless sidecar binary (no desired-state backend).
+///
+/// Thin delegator over [`headless_main_with_desired_state`] passing `None` for
+/// the desired-state backend (no boot Start-replay). Preserved for plugin API
+/// compatibility — the documented `headless_main(factory, app)` call shape and
+/// existing consumers keep working unchanged.
+pub fn headless_main<F, R>(factory: F, app: AppHandle<R>)
+where
+    F: Fn() -> Box<dyn BackgroundService<R>> + Send + Sync + 'static,
+    R: Runtime,
+{
+    // No desired-state backend ⇒ no boot replay regardless; consent=false is
+    // the fail-closed default for this back-compat wrapper.
+    headless_main_with_desired_state(factory, app, None, false);
+}
+
+/// Run the daemon's graceful SIGTERM/SIGINT shutdown path (BGS-31, doc-08 Step 9).
+///
+/// Sends `ManagerCommand::Stop` (stop-reason policy, desired-state bookkeeping,
+/// `lifecycle_state → Stopped`) AND `ManagerCommand::ShutdownGracefully`
+/// (bounded Core-level drain via the service's `shutdown_gracefully` hook), and
+/// awaits both replies before the caller cancels the IPC `CancellationToken`.
+/// Factored out of the signal-handler arm so the host-verifiable `bgs31` test
+/// can drive the SAME code path the real handler runs — a real SIGTERM is not
+/// deliverable in a unit test. Tolerates `NotRunning` (a daemon that never
+/// started a service has nothing to stop) and any `ShutdownGracefully` error
+/// (logged): the bookkeeping + drain are best-effort before exit, never fatal.
+pub async fn graceful_sigterm_shutdown<R: Runtime>(cmd_tx: &mpsc::Sender<ManagerCommand<R>>) {
+    let handle = ServiceManagerHandle::new(cmd_tx.clone());
+    // Stop: drive the existing manager_loop Stop arm so stop-reason policy,
+    // desired-state bookkeeping, and lifecycle_state→Stopped all run (the path
+    // the old SIGTERM arm SKIPPED). NotRunning ⇒ nothing was running; tolerate.
+    if let Err(e) = handle.stop().await {
+        log::warn!("graceful_sigterm_shutdown: Stop returned {e:?}");
+    }
+    // ShutdownGracefully: bounded Core drain (background_tasks + awaited
+    // network shutdown) instead of the abrupt process-exit Drop abort.
+    if let Err(e) = handle.shutdown_gracefully().await {
+        log::warn!("graceful_sigterm_shutdown: ShutdownGracefully returned {e:?}");
+    }
+}
+
 /// Entry point for the headless sidecar binary.
 ///
 /// Parses `--service-label <label>` from CLI arguments, constructs the service
@@ -90,8 +135,17 @@ fn parse_args(args: &[String]) -> Result<ParsedArgs, String> {
 /// - `--service-label` is missing or invalid
 /// - The tokio runtime fails to initialize
 /// - The IPC socket fails to bind
-pub fn headless_main<F, R>(factory: F, app: AppHandle<R>)
-where
+pub fn headless_main_with_desired_state<F, R>(
+    factory: F,
+    app: AppHandle<R>,
+    desired_state_backend: Option<Arc<dyn DesiredStateBackend>>,
+    // BGS-05 re-fix (Critic Blocker 2 — Leg A/Leg B coordination): the Sila
+    // app's live consent decision (`consent.enabled && consent.auto_unlock`),
+    // threaded into the manager loop's boot Start-replay guard. Fail-closed:
+    // callers without a consent policy pass `false` (no replay). See manager_loop
+    // for why this is belt-and-suspenders alongside the F3 builder gate.
+    consent_allows_auto_unlock: bool,
+) where
     F: Fn() -> Box<dyn BackgroundService<R>> + Send + Sync + 'static,
     R: Runtime,
 {
@@ -123,7 +177,16 @@ where
             0.0,
             false,
             false,
+            4.0,
+            desired_state_backend,
+            vec!["remoteMessaging".into()],
+            false,
+            crate::notifier::NotifierPolicy::default(),
             None,
+            // BGS-05 Leg B: thread the headless AppHandle so the manager loop
+            // can replay a Start on boot from the persisted desired-state.
+            Some(app.clone()),
+            consent_allows_auto_unlock,
         ));
 
         let path = match socket_path(&label) {
@@ -135,6 +198,11 @@ where
         };
         // Clone app handle for event relay listener before moving into IpcServer.
         let app_for_events = app.clone();
+        // BGS-31 (doc-08 Step 9): clone cmd_tx before it is moved into
+        // IpcServer::bind so the SIGTERM/SIGINT handler can drive the graceful
+        // ManagerCommand::Stop + ShutdownGracefully path (the IPC server owns
+        // the original sender for the lifetime of the run loop).
+        let cmd_tx_for_signal = cmd_tx.clone();
         let server = match IpcServer::bind(path, cmd_tx, app) {
             Ok(s) => s,
             Err(e) => {
@@ -172,9 +240,18 @@ where
             tokio::select! {
                 _ = server.run(shutdown.clone()) => {}
                 _ = tokio::signal::ctrl_c() => {
+                    // BGS-31: graceful stop (Stop bookkeeping + bounded Core
+                    // drain) BEFORE the IPC token cancel, so SIGINT does not
+                    // tear the Core down purely by process-exit Drop abort.
+                    graceful_sigterm_shutdown(&cmd_tx_for_signal).await;
                     shutdown.cancel();
                 }
                 _ = sigterm.recv() => {
+                    // BGS-31: on SIGTERM (systemctl stop / package upgrade) run
+                    // the bookkeeping Stop + the bounded Core drain before the
+                    // IPC token cancel — peers see a clean disconnect instead of
+                    // an abrupt Drop abort mid-ingest.
+                    graceful_sigterm_shutdown(&cmd_tx_for_signal).await;
                     shutdown.cancel();
                 }
             }
@@ -184,6 +261,9 @@ where
             tokio::select! {
                 _ = server.run(shutdown.clone()) => {}
                 _ = tokio::signal::ctrl_c() => {
+                    // BGS-31: graceful stop (Stop bookkeeping + bounded Core
+                    // drain) BEFORE the IPC token cancel.
+                    graceful_sigterm_shutdown(&cmd_tx_for_signal).await;
                     shutdown.cancel();
                 }
             }

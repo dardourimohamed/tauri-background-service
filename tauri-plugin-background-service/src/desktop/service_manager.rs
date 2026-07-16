@@ -4,6 +4,17 @@
 //! and stop operations for OS-level services (systemd, launchd,
 //! Windows Service). Also provides helpers for parsing service mode and
 //! deriving service labels from the app identifier.
+//!
+//! # Service Level
+//!
+//! On Unix the service is installed at **user level** (systemd `--user`,
+//! launchd per-user agent). On Windows both `service-manager` backends
+//! (`sc.exe` and winsw) reject [`ServiceLevel::User`], so the service is
+//! installed as a **system-level SCM service**; per-user isolation comes from
+//! the daemon's data directory (resolved per-user by the app), not from the
+//! service level. SCM stores the service configuration in the registry, so
+//! `DesktopServiceManager::install` passes no unit-file contents on Windows
+//! (`build_contents()` returns `None` there).
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -51,6 +62,14 @@ pub(crate) struct InstallOptions {
     /// When set, `StandardOutPath` and `StandardErrorPath` are added to the
     /// launchd plist, pointing to `{log_path}/stdout.log` and `{log_path}/stderr.log`.
     pub log_path: Option<PathBuf>,
+    /// systemd `StartLimitBurst` in `[Unit]` — max restarts within
+    /// `start_limit_interval_secs` before systemd stops restarting the unit
+    /// (crash-loop backoff, BGS-05 Leg C). `None` ⇒ omit (no burst cap).
+    /// systemd-native; launchd has no equivalent.
+    pub start_limit_burst: Option<u32>,
+    /// systemd `StartLimitIntervalSec` in `[Unit]` — the rolling window over which
+    /// `start_limit_burst` is counted (BGS-05 Leg C). `None` ⇒ omit.
+    pub start_limit_interval_secs: Option<u32>,
 }
 
 /// Build systemd unit file contents with journal output and restart policy.
@@ -63,6 +82,8 @@ pub(crate) fn make_systemd_unit_contents(
     exec_path: &std::path::Path,
     autostart: bool,
     restart_delay_secs: Option<u32>,
+    start_limit_burst: Option<u32>,
+    start_limit_interval_secs: Option<u32>,
 ) -> String {
     use std::fmt::Write as _;
     let label_str = label.to_string();
@@ -71,6 +92,15 @@ pub(crate) fn make_systemd_unit_contents(
     let mut out = String::new();
     let _ = writeln!(out, "[Unit]");
     let _ = writeln!(out, "Description={label_str}");
+    // BGS-05 Leg C: crash-loop backoff. systemd counts restarts within this
+    // interval and stops restarting once `StartLimitBurst` is reached. Both go
+    // in `[Unit]` (systemd requirement). Omitted when None.
+    if let Some(burst) = start_limit_burst {
+        let _ = writeln!(out, "StartLimitBurst={burst}");
+    }
+    if let Some(interval) = start_limit_interval_secs {
+        let _ = writeln!(out, "StartLimitIntervalSec={interval}");
+    }
     let _ = writeln!(out, "[Service]");
     let _ = writeln!(out, "ExecStart={program} --service-label {label_str}");
     let _ = writeln!(out, "Restart=on-failure");
@@ -139,6 +169,20 @@ pub(crate) fn make_launchd_plist_contents(
     .to_string()
 }
 
+/// The service level for the current platform.
+///
+/// `User` on Unix (systemd `--user` / launchd agent); `System` on Windows,
+/// where both `service-manager` backends (sc.exe, winsw) reject
+/// `ServiceLevel::User` — see the module docs for the per-user data-dir
+/// strategy that compensates.
+pub(crate) fn service_level_for_platform() -> ServiceLevel {
+    if cfg!(windows) {
+        ServiceLevel::System
+    } else {
+        ServiceLevel::User
+    }
+}
+
 /// Manages an OS-level service lifecycle using the `service-manager` crate.
 ///
 /// Used in later steps to install/uninstall/start/stop OS-level services.
@@ -157,7 +201,7 @@ impl DesktopServiceManager {
         let mut manager = <dyn ServiceManager>::native()
             .map_err(|e| ServiceError::Platform(format!("No native service manager: {e}")))?;
         manager
-            .set_level(ServiceLevel::User)
+            .set_level(service_level_for_platform())
             .map_err(|e| ServiceError::Platform(format!("Failed to set service level: {e}")))?;
         Ok(Self {
             label: parsed_label,
@@ -191,6 +235,10 @@ impl DesktopServiceManager {
             .map_err(|e| ServiceError::ServiceInstall(e.to_string()))
     }
 
+    /// Unit-file contents for the install context, when the platform uses one.
+    ///
+    /// Windows is a deliberate no-op (`None`): SCM stores the service
+    /// configuration in the registry — there is no unit file to render.
     fn build_contents(&self, options: &InstallOptions) -> Option<String> {
         if cfg!(target_os = "linux") && options.journal_output {
             return Some(make_systemd_unit_contents(
@@ -198,6 +246,8 @@ impl DesktopServiceManager {
                 &self.exec_path,
                 options.autostart,
                 options.restart_delay_secs,
+                options.start_limit_burst,
+                options.start_limit_interval_secs,
             ));
         }
         if cfg!(target_os = "macos") {
@@ -274,6 +324,26 @@ mod tests {
         );
     }
 
+    // --- service_level_for_platform tests ---
+
+    #[cfg(unix)]
+    #[test]
+    fn service_level_is_user_on_unix() {
+        assert!(
+            matches!(service_level_for_platform(), ServiceLevel::User),
+            "Unix service managers (systemd, launchd) run Sila per-user"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_level_is_system_on_windows() {
+        assert!(
+            matches!(service_level_for_platform(), ServiceLevel::System),
+            "Windows SCM backends (sc.exe, winsw) reject ServiceLevel::User"
+        );
+    }
+
     // --- InstallOptions tests ---
 
     #[test]
@@ -283,6 +353,11 @@ mod tests {
         assert_eq!(opts.restart_delay_secs, None);
         assert!(!opts.journal_output);
         assert_eq!(opts.log_path, None);
+        // BGS-05 Leg C: the two crash-loop-backoff fields default to None so the
+        // prod caller is the sole site that opts in (mirrors Step-5's unchanged-
+        // default discipline). NV-MUT (flip the default to Some) REDs these.
+        assert_eq!(opts.start_limit_burst, None);
+        assert_eq!(opts.start_limit_interval_secs, None);
     }
 
     // --- make_systemd_unit_contents tests ---
@@ -291,7 +366,7 @@ mod tests {
     fn systemd_contents_autostart_true_has_install_section() {
         let label: ServiceLabel = "com.example.bg-service".parse().unwrap();
         let exec = PathBuf::from("/usr/bin/myapp");
-        let contents = make_systemd_unit_contents(&label, &exec, true, None);
+        let contents = make_systemd_unit_contents(&label, &exec, true, None, None, None);
         assert!(
             contents.contains("[Install]"),
             "should have [Install] section: {contents}"
@@ -306,7 +381,7 @@ mod tests {
     fn systemd_contents_autostart_false_no_install_section() {
         let label: ServiceLabel = "com.example.bg-service".parse().unwrap();
         let exec = PathBuf::from("/usr/bin/myapp");
-        let contents = make_systemd_unit_contents(&label, &exec, false, None);
+        let contents = make_systemd_unit_contents(&label, &exec, false, None, None, None);
         assert!(
             !contents.contains("[Install]"),
             "should NOT have [Install] section: {contents}"
@@ -321,7 +396,7 @@ mod tests {
     fn systemd_contents_has_journal_output() {
         let label: ServiceLabel = "com.example.bg-service".parse().unwrap();
         let exec = PathBuf::from("/usr/bin/myapp");
-        let contents = make_systemd_unit_contents(&label, &exec, false, None);
+        let contents = make_systemd_unit_contents(&label, &exec, false, None, None, None);
         assert!(
             contents.contains("StandardOutput=journal"),
             "should have StandardOutput=journal: {contents}"
@@ -336,7 +411,7 @@ mod tests {
     fn systemd_contents_restart_delay() {
         let label: ServiceLabel = "com.example.bg-service".parse().unwrap();
         let exec = PathBuf::from("/usr/bin/myapp");
-        let contents = make_systemd_unit_contents(&label, &exec, false, Some(5));
+        let contents = make_systemd_unit_contents(&label, &exec, false, Some(5), None, None);
         assert!(
             contents.contains("RestartSec=5"),
             "should have RestartSec=5: {contents}"
@@ -347,10 +422,55 @@ mod tests {
     fn systemd_contents_no_restart_delay_when_none() {
         let label: ServiceLabel = "com.example.bg-service".parse().unwrap();
         let exec = PathBuf::from("/usr/bin/myapp");
-        let contents = make_systemd_unit_contents(&label, &exec, false, None);
+        let contents = make_systemd_unit_contents(&label, &exec, false, None, None, None);
         assert!(
             !contents.contains("RestartSec"),
             "should NOT have RestartSec: {contents}"
+        );
+    }
+
+    // ── BGS-05 Leg C: crash-loop backoff (StartLimitBurst / StartLimitIntervalSec) ──
+
+    #[test]
+    fn bgs05_systemd_contents_has_start_limit_when_some() {
+        // The prod unit caps restarts at 5 per 60s (BGS-05 Leg C). Both lines
+        // land in `[Unit]` (systemd requirement). NV-MUT (drop either writeln)
+        // REDs this leg.
+        let label: ServiceLabel = "com.example.bg-service".parse().unwrap();
+        let exec = PathBuf::from("/usr/bin/myapp");
+        let contents = make_systemd_unit_contents(&label, &exec, false, None, Some(5), Some(60));
+        assert!(
+            contents.contains("StartLimitBurst=5"),
+            "should have StartLimitBurst=5: {contents}"
+        );
+        assert!(
+            contents.contains("StartLimitIntervalSec=60"),
+            "should have StartLimitIntervalSec=60: {contents}"
+        );
+        // Both must appear inside [Unit] (before [Service]).
+        let unit_end = contents.find("[Service]").unwrap_or(contents.len());
+        let unit_section = &contents[..unit_end];
+        assert!(
+            unit_section.contains("StartLimitBurst=5")
+                && unit_section.contains("StartLimitIntervalSec=60"),
+            "StartLimit lines must be in [Unit] (before [Service]): {contents}"
+        );
+    }
+
+    #[test]
+    fn bgs05_systemd_contents_no_start_limit_when_none() {
+        // Default (None): neither line is emitted (regression guard — preserves
+        // the pre-Step-6 unit shape for callers that pass None).
+        let label: ServiceLabel = "com.example.bg-service".parse().unwrap();
+        let exec = PathBuf::from("/usr/bin/myapp");
+        let contents = make_systemd_unit_contents(&label, &exec, false, None, None, None);
+        assert!(
+            !contents.contains("StartLimitBurst"),
+            "should NOT have StartLimitBurst: {contents}"
+        );
+        assert!(
+            !contents.contains("StartLimitIntervalSec"),
+            "should NOT have StartLimitIntervalSec: {contents}"
         );
     }
 
@@ -358,7 +478,7 @@ mod tests {
     fn systemd_contents_restart_on_failure() {
         let label: ServiceLabel = "com.example.bg-service".parse().unwrap();
         let exec = PathBuf::from("/usr/bin/myapp");
-        let contents = make_systemd_unit_contents(&label, &exec, false, None);
+        let contents = make_systemd_unit_contents(&label, &exec, false, None, None, None);
         assert!(
             contents.contains("Restart=on-failure"),
             "should have Restart=on-failure: {contents}"
@@ -369,7 +489,7 @@ mod tests {
     fn systemd_contents_exec_start_with_label() {
         let label: ServiceLabel = "com.example.bg-service".parse().unwrap();
         let exec = PathBuf::from("/usr/bin/myapp");
-        let contents = make_systemd_unit_contents(&label, &exec, false, None);
+        let contents = make_systemd_unit_contents(&label, &exec, false, None, None, None);
         assert!(
             contents.contains("ExecStart=/usr/bin/myapp --service-label com.example.bg-service"),
             "should have correct ExecStart: {contents}"
@@ -380,7 +500,7 @@ mod tests {
     fn systemd_contents_description_uses_label() {
         let label: ServiceLabel = "com.example.bg-service".parse().unwrap();
         let exec = PathBuf::from("/usr/bin/myapp");
-        let contents = make_systemd_unit_contents(&label, &exec, false, None);
+        let contents = make_systemd_unit_contents(&label, &exec, false, None, None, None);
         assert!(
             contents.contains("Description=com.example.bg-service"),
             "should have description: {contents}"
@@ -391,7 +511,7 @@ mod tests {
     fn systemd_contents_unit_and_service_sections() {
         let label: ServiceLabel = "com.example.bg-service".parse().unwrap();
         let exec = PathBuf::from("/usr/bin/myapp");
-        let contents = make_systemd_unit_contents(&label, &exec, false, None);
+        let contents = make_systemd_unit_contents(&label, &exec, false, None, None, None);
         assert!(
             contents.contains("[Unit]"),
             "should have [Unit]: {contents}"

@@ -15,11 +15,17 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::desktop::ipc::{encode_frame, IpcEvent, IpcMessage, IpcRequest, IpcResponse};
+use crate::desktop::ipc::{
+    encode_frame, version_mismatch_response, IpcEvent, IpcMessage, IpcRequest, IpcResponse,
+    PLUGIN_IPC_VERSION,
+};
+// Used only by the PROTO-14 wire-level assertion in the test module below.
+#[cfg(all(test, unix))]
+use crate::desktop::ipc::VERSION_MISMATCH_CODE;
 use crate::desktop::transport::{self, TransportListener, TransportReadHalf, TransportStream};
 use crate::error::ServiceError;
 use crate::manager::ManagerCommand;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::models::StopReason;
 
 /// Error type for reading IPC frames from a stream.
@@ -195,11 +201,12 @@ async fn handle_connection<R: Runtime>(
                         }
                     }
                     Some(Incoming::Error(msg)) => {
-                        let resp = IpcResponse {
-                            ok: false,
-                            data: None,
-                            error: Some(msg),
-                        };
+                        // [doc-09/PROTO-14]: a frame we could not decode
+                        // (unknown variant / future skew) becomes a STABLE
+                        // codeable "version_mismatch" signal — not an opaque
+                        // serde leak. The raw detail is logged server-side only.
+                        log::debug!("IPC decode error (possible version skew): {msg}");
+                        let resp = version_mismatch_response();
                         let resp_msg = IpcMessage::Response(resp);
                         let frame = match encode_frame(&resp_msg) {
                             Ok(f) => f,
@@ -304,11 +311,13 @@ async fn handle_request<R: Runtime>(
                     ok: true,
                     data: None,
                     error: None,
+                    code: None,
                 },
                 Ok(Err(e)) => IpcResponse {
                     ok: false,
                     data: None,
                     error: Some(e.to_string()),
+                    code: None,
                 },
                 Err(_) => error_response("manager dropped reply"),
             }
@@ -323,11 +332,13 @@ async fn handle_request<R: Runtime>(
                     ok: true,
                     data: None,
                     error: None,
+                    code: None,
                 },
                 Ok(Err(e)) => IpcResponse {
                     ok: false,
                     data: None,
                     error: Some(e.to_string()),
+                    code: None,
                 },
                 Err(_) => error_response("manager dropped reply"),
             }
@@ -346,6 +357,7 @@ async fn handle_request<R: Runtime>(
                     ok: true,
                     data: Some(serde_json::json!({ "running": running })),
                     error: None,
+                    code: None,
                 },
                 Err(_) => error_response("manager dropped reply"),
             }
@@ -364,6 +376,7 @@ async fn handle_request<R: Runtime>(
                     ok: true,
                     data: Some(serde_json::to_value(&status).unwrap_or_default()),
                     error: None,
+                    code: None,
                 },
                 Err(_) => error_response("manager dropped reply"),
             }
@@ -382,6 +395,7 @@ async fn handle_request<R: Runtime>(
                     ok: true,
                     data: None,
                     error: None,
+                    code: None,
                 },
                 Ok(Err(e)) => error_response(&e.to_string()),
                 Err(_) => error_response("manager dropped reply"),
@@ -401,6 +415,7 @@ async fn handle_request<R: Runtime>(
                     ok: true,
                     data: None,
                     error: None,
+                    code: None,
                 },
                 Ok(Err(e)) => error_response(&e.to_string()),
                 Err(_) => error_response("manager dropped reply"),
@@ -420,11 +435,13 @@ async fn handle_request<R: Runtime>(
                     ok: true,
                     data: Some(serde_json::to_value(&state).unwrap_or_default()),
                     error: None,
+                    code: None,
                 },
                 Ok(None) => IpcResponse {
                     ok: true,
                     data: None,
                     error: None,
+                    code: None,
                 },
                 Err(_) => error_response("manager dropped reply"),
             }
@@ -437,6 +454,7 @@ async fn handle_request<R: Runtime>(
                 ok: true,
                 data: Some(serde_json::to_value(&report).unwrap_or_default()),
                 error: None,
+                code: None,
             }
         }
         IpcRequest::GetLifecycleStatus => {
@@ -456,10 +474,19 @@ async fn handle_request<R: Runtime>(
                     ok: true,
                     data: Some(serde_json::to_value(&status).unwrap_or_default()),
                     error: None,
+                    code: None,
                 },
                 Err(_) => error_response("manager dropped reply"),
             }
         }
+        // [doc-09/PROTO-14]: proactive version handshake. Echo this service's
+        // protocol version so the GUI can detect skew before routing commands.
+        IpcRequest::Hello { version: _ } => IpcResponse {
+            ok: true,
+            data: Some(serde_json::json!({ "version": PLUGIN_IPC_VERSION })),
+            error: None,
+            code: None,
+        },
     }
 }
 
@@ -469,10 +496,12 @@ fn error_response(msg: &str) -> IpcResponse {
         ok: false,
         data: None,
         error: Some(msg.to_string()),
+        code: None,
     }
 }
 
-#[cfg(test)]
+// Tests drive a real Unix socket via test_helpers (cfg(all(test, unix))).
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::desktop::test_helpers::{
@@ -629,6 +658,15 @@ mod tests {
         let resp = read_response(&mut stream).await;
         assert!(!resp.ok, "should be error response");
         assert!(resp.error.is_some(), "should have error message");
+        // [doc-09/PROTO-14]: the production decode-error chokepoint must emit
+        // the STABLE mismatch code on the wire (drives the same
+        // version_mismatch_response() the load-bearing unit test pins), not an
+        // opaque serde string.
+        assert_eq!(
+            resp.code.as_deref(),
+            Some(VERSION_MISMATCH_CODE),
+            "malformed/skew frame must carry the stable mismatch code on the wire"
+        );
 
         // Connection should still be open — send a valid request
         send_request(&mut stream, &IpcRequest::IsRunning).await;

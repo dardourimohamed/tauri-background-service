@@ -135,7 +135,10 @@ export type PluginEvent =
   | { type: 'stopped';  reason: string }
   | { type: 'error';    message: string };
 
-/** iOS background task scheduling status. */
+/**
+ * iOS background task scheduling *submit-result* status — the outcome of the
+ * most recent scheduling attempt. Returned by `getSchedulingStatus`.
+ */
 export interface IOSSchedulingStatus {
   /** Whether a BGAppRefreshTask was successfully scheduled. */
   refreshScheduled: boolean;
@@ -145,6 +148,39 @@ export interface IOSSchedulingStatus {
   refreshError?: string;
   /** Error from BGProcessingTask scheduling, if any. */
   processingError?: string;
+}
+
+/**
+ * iOS persisted *desired-state* status. Returned by `getDesiredStateStatus`.
+ * The persisted half of the scheduling-status split (mirrors the Rust
+ * `IOSDesiredStateStatus` DTO).
+ */
+export interface IOSDesiredStateStatus {
+  /** Whether the user desires the service running (persisted across launches). */
+  desiredRunning: boolean;
+  /** JSON-serialized StartConfig of the last successful start, if any. */
+  lastStartConfig?: string;
+  /** Kind of the most recent BGTask: "refresh" or "processing". */
+  lastTaskKind?: string;
+  /** Wall-clock seconds when the most recent BGTask started, if any. */
+  lastTaskStartedAt?: number;
+  /** Wall-clock seconds when the most recent BGTask completed, if any. */
+  lastTaskCompletedAt?: number;
+  /** Last persisted scheduling error, if any. */
+  lastScheduleError?: string;
+  /**
+   * Durable reason the most recent BGTask run ended ("completed" | "expired").
+   * Unlike the one-shot adaptation outcome, this survives the next reschedule,
+   * so the "why did the last run end?" status fact is always reportable (M7).
+   */
+  lastCompletionReason?: string;
+  /**
+   * Whether notification authorization was granted on iOS (M4). The deferred
+   * authorization request (service start, not plugin load) forwards its decision
+   * here so the Notifier can degrade when notifications are denied. Absent until
+   * the first notification-requiring intent has requested authorization.
+   */
+  notificationGranted?: boolean;
 }
 
 /** Information about a pending iOS background task that launched the app. */
@@ -170,6 +206,55 @@ export async function startService(config: StartConfig = {}): Promise<void> {
 /** Stop the service and cancel the shutdown token. */
 export async function stopService(): Promise<void> {
   await invoke('plugin:background-service|stop');
+}
+
+// ─── Notification Permission (Android, BGS-21 / doc-08 Step 12) ──────────
+// These route to the Kotlin getNotificationPermissionStatus /
+// requestNotificationPermission @Command methods via the Rust bridge
+// (run_mobile_plugin). On non-Android targets the Rust command returns the
+// "granted" default / no-ops, so the UI always gets a usable answer.
+
+/** Android notification-permission status (BGS-21, doc-08 Step 12). */
+export type NotificationPermissionStatus = 'granted' | 'denied' | 'notDetermined';
+
+/**
+ * Query the notification-permission status.
+ *
+ * Returns `"granted"` / `"denied"` / `"notDetermined"` on Android (forwarded
+ * from the Kotlin `getNotificationPermissionStatus` @Command). Returns
+ * `"granted"` on non-Android targets — iOS authorizes at launch via
+ * `UNUserNotificationCenter` (not via a plugin command) and desktop has no
+ * `POST_NOTIFICATIONS` analogue.
+ */
+export async function getNotificationPermissionStatus(): Promise<NotificationPermissionStatus> {
+  return invoke<NotificationPermissionStatus>(
+    'plugin:background-service|get_notification_permission_status'
+  );
+}
+
+/**
+ * Request notification permission (Android). Issues the system
+ * `POST_NOTIFICATIONS` prompt on API 33+ and is a no-op below API 33 / on
+ * non-Android targets.
+ */
+export async function requestNotificationPermission(): Promise<void> {
+  await invoke('plugin:background-service|request_notification_permission');
+}
+
+/**
+ * Request the Android battery-optimization (Doze) exemption (BGS-22, doc-08
+ * Step 14).
+ *
+ * Opens the system `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` dialog so the
+ * user can grant Sila an exemption from battery optimizations. The
+ * `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` permission is declared in the plugin
+ * AndroidManifest.xml but was previously never requested (dead); this wires the
+ * honest user-granted flow. No-op on non-Android targets (the Kotlin @Command
+ * does not exist; iOS/desktop have no Doze analogue). There is no status
+ * return: the exemption is OS-only.
+ */
+export async function requestBatteryExemption(): Promise<void> {
+  await invoke('plugin:background-service|request_battery_exemption');
 }
 
 /** Returns true if the Rust service is currently running. */
@@ -224,11 +309,21 @@ export async function getPlatformCapabilities(): Promise<PlatformCapabilities> {
 }
 
 /**
- * Query the iOS scheduling status from the native layer.
- * Returns scheduling results on iOS, or a default status on other platforms.
+ * Query the iOS scheduling *submit-result* status from the native layer.
+ * Returns the most recent scheduling attempt's result on iOS, or a default
+ * (nothing scheduled) status on other platforms.
  */
 export async function getSchedulingStatus(): Promise<IOSSchedulingStatus> {
   return invoke<IOSSchedulingStatus>('plugin:background-service|get_scheduling_status');
+}
+
+/**
+ * Query the iOS persisted *desired-state* status from the native layer.
+ * Returns the persisted desired state on iOS, or a default (not desired) status
+ * on other platforms.
+ */
+export async function getDesiredStateStatus(): Promise<IOSDesiredStateStatus> {
+  return invoke<IOSDesiredStateStatus>('plugin:background-service|get_desired_state_status');
 }
 
 /**
@@ -238,6 +333,22 @@ export async function getSchedulingStatus(): Promise<IOSSchedulingStatus> {
  */
 export async function getPendingBgTask(): Promise<PendingTaskInfo | null> {
   return invoke<PendingTaskInfo | null>('plugin:background-service|get_pending_bg_task');
+}
+
+/**
+ * Whether the app may post a full-screen intent (NTF-16). Android returns the
+ * current grant; other platforms return a default `{ canUse: true }` so the
+ * re-grant affordance never shows off-Android.
+ */
+export async function canUseFullScreenIntent(): Promise<{ canUse: boolean }> {
+  return invoke<{ canUse: boolean }>('plugin:background-service|can_use_full_screen_intent');
+}
+
+/**
+ * Open the OS settings page to re-grant USE_FULL_SCREEN_INTENT (NTF-16).
+ */
+export async function openFullScreenIntentSettings(): Promise<void> {
+  return invoke<void>('plugin:background-service|open_full_screen_intent_settings');
 }
 
 /**
@@ -263,6 +374,117 @@ export async function onPluginEvent(
     unlisten();
     pluginListener?.unregister();
   };
+}
+
+/**
+ * Bridge Android native lifecycle events to the Rust backend.
+ *
+ * On Android, the native plugin emits `native-lifecycle-event` for
+ * notification stop and timeout events. This function forwards them
+ * to the `native_lifecycle_event` Rust command so the manager loop
+ * can update the service actor state.
+ *
+ * On non-Android platforms, the listener setup fails gracefully and
+ * a no-op unlisten function is returned.
+ */
+export async function startNativeLifecycleBridge(): Promise<UnlistenFn> {
+  try {
+    const listener = await addPluginListener(
+      'background-service',
+      'native-lifecycle-event',
+      (payload: any) => {
+        invoke('plugin:background-service|native_lifecycle_event', {
+          event: payload,
+        });
+      }
+    );
+    return () => listener.unregister();
+  } catch {
+    return () => {};
+  }
+}
+
+/**
+ * Subscribe to native platform-error pushes (Android).
+ *
+ * The native plugin emits `platform-error` when a foreground-start fails or an
+ * FGS-type is rejected (spec-compliance W1 / R-W1.3). The payload carries the
+ * durable platform-error string so the UI can surface the failure instead of
+ * the service self-stopping silently (NFR-1). On non-Android platforms the
+ * listener setup fails gracefully and a no-op unlisten is returned.
+ */
+export async function onPlatformError(
+  handler: (error: string) => void
+): Promise<UnlistenFn> {
+  try {
+    const listener = await addPluginListener(
+      'background-service',
+      'platform-error',
+      (payload: any) => {
+        const message =
+          typeof payload?.error === 'string'
+            ? payload.error
+            : String(payload?.error ?? '');
+        handler(message);
+      }
+    );
+    return () => listener.unregister();
+  } catch {
+    return () => {};
+  }
+}
+
+/** Which CallKit perform-action fired (H7). `ended` is a hang-up of a live call;
+ *  `rejected` is a decline of a still-ringing call. */
+export type NativeCallActionKind = 'answered' | 'ended' | 'rejected';
+
+/** A native iOS CallKit perform-action bridged to the app. */
+export interface NativeCallAction {
+  /** The original 32-hex Rust `call_id` for the session. */
+  callId: string;
+  kind: NativeCallActionKind;
+}
+
+/**
+ * Bridge native iOS CallKit perform-actions to a handler so the app can drive
+ * the Rust call control plane.
+ *
+ * The iOS plugin emits `call_answered` / `call_ended` / `call_rejected` (H7) with
+ * a `{ callId }` payload when the user taps Answer / End / Decline on the system
+ * CallKit UI. This mirrors `startNativeLifecycleBridge`; the consumer (a UI hook)
+ * maps each to the matching `answer_call` / `end_call` / `reject_call` core
+ * command — the Android twin reaches the core JNI-direct instead.
+ *
+ * Valid only while the webview is live (foreground / background-active — the
+ * states iOS CallKit reaches without PushKit); a suspended app uses the
+ * documented missed-call path. On non-iOS the listener setup fails gracefully
+ * and the registered listeners are simply absent.
+ */
+export async function startNativeCallActionBridge(
+  handler: (action: NativeCallAction) => void
+): Promise<UnlistenFn> {
+  const events: Array<[string, NativeCallActionKind]> = [
+    ['call_answered', 'answered'],
+    ['call_ended', 'ended'],
+    ['call_rejected', 'rejected'],
+  ];
+  const listeners: PluginListener[] = [];
+  for (const [event, kind] of events) {
+    try {
+      listeners.push(
+        await addPluginListener('background-service', event, (payload: any) => {
+          const callId =
+            typeof payload?.callId === 'string'
+              ? payload.callId
+              : String(payload?.callId ?? '');
+          if (callId) handler({ callId, kind });
+        })
+      );
+    } catch {
+      // Listener unavailable on non-iOS platforms — skip this event.
+    }
+  }
+  return () => listeners.forEach(l => l.unregister());
 }
 
 // ─── Desktop OS Service Management ────────────────────────────────────

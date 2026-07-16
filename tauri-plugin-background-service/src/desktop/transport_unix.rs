@@ -58,6 +58,18 @@ pub async fn connect(path: &PathBuf) -> Result<TransportStream, ServiceError> {
         .map_err(|e| ServiceError::Ipc(format!("connect failed: {e}")))
 }
 
+/// Pure allow/deny decision for a peer UID against our own UID.
+///
+/// Returns `true` iff `peer_uid == my_uid`. Extracted as a pure two-argument
+/// function (deterministic, no hidden I/O) so that BOTH the Linux
+/// (`SO_PEERCRED`) and macOS (`getpeereid`) arms of [`peer_cred_check`] route
+/// the decision through ONE site. Each arm only extracts `peer_uid` via its
+/// platform syscall; the equality check is centralized here so the two arms
+/// can never drift out of sync (symmetric-wiring hazard).
+fn peer_uid_allowed(peer_uid: libc::uid_t, my_uid: libc::uid_t) -> bool {
+    peer_uid == my_uid
+}
+
 /// Check that the peer on the given stream has the same UID as the current
 /// process. Rejects connections from different users.
 ///
@@ -84,7 +96,7 @@ pub fn peer_cred_check(stream: &TransportStream) -> bool {
             creds.uid
         };
         let my_uid = unsafe { libc::getuid() };
-        if peer_uid != my_uid {
+        if !peer_uid_allowed(peer_uid, my_uid) {
             log::warn!("IPC connection rejected: uid mismatch ({peer_uid} != {my_uid})");
             return false;
         }
@@ -100,7 +112,7 @@ pub fn peer_cred_check(stream: &TransportStream) -> bool {
             return false;
         }
         let my_uid = unsafe { libc::getuid() };
-        if peer_uid != my_uid {
+        if !peer_uid_allowed(peer_uid, my_uid) {
             log::warn!("IPC connection rejected: uid mismatch ({peer_uid} != {my_uid})");
             return false;
         }
@@ -108,6 +120,7 @@ pub fn peer_cred_check(stream: &TransportStream) -> bool {
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
+        let _ = stream;
         log::warn!("IPC: no peer credential check available on this platform");
     }
 
@@ -133,4 +146,37 @@ pub async fn accept(listener: &mut TransportListener) -> Result<TransportStream,
 /// [`tokio::io::split`] (not `into_split`) for cross-platform compatibility.
 pub fn split(stream: TransportStream) -> (TransportReadHalf, TransportWriteHalf) {
     tokio::io::split(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// BGS-29: the control socket must reject a foreign UID.
+    ///
+    /// `peer_uid_allowed` is platform-independent integer equality, so this
+    /// single test pins the allow/deny decision for BOTH the Linux
+    /// (SO_PEERCRED) and macOS (getpeereid) arms — each arm only extracts
+    /// `peer_uid` via its platform syscall; the decision is centralized in
+    /// `peer_uid_allowed`. `wrapping_add`/`wrapping_sub` avoid a root/0
+    /// collision and u32 overflow.
+    #[test]
+    fn bgs29_control_socket_rejects_foreign_uid() {
+        let my_uid: libc::uid_t = unsafe { libc::getuid() };
+        // Same-UID connection is allowed.
+        assert!(
+            peer_uid_allowed(my_uid, my_uid),
+            "same-UID peer must be allowed"
+        );
+        // A foreign UID (my_uid + 1) is rejected.
+        assert!(
+            !peer_uid_allowed(my_uid.wrapping_add(1), my_uid),
+            "foreign UID (my_uid + 1) must be rejected"
+        );
+        // A different foreign UID (my_uid - 1) is also rejected.
+        assert!(
+            !peer_uid_allowed(my_uid.wrapping_sub(1), my_uid),
+            "foreign UID (my_uid - 1) must be rejected"
+        );
+    }
 }

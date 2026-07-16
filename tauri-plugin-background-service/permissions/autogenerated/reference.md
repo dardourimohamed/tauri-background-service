@@ -13,6 +13,16 @@ Default permissions for the background service plugin
 - `allow-disable-auto-restart`
 - `allow-get-desired-service-state`
 - `allow-validate-setup`
+- `allow-get-lifecycle-status`
+- `allow-configure-recovery`
+- `allow-native-lifecycle-event`
+- `allow-get-scheduling-status`
+- `allow-get-pending-bg-task`
+- `allow-get-notification-permission-status`
+- `allow-request-notification-permission`
+- `allow-request-battery-exemption`
+- `allow-can-use-full-screen-intent`
+- `allow-open-full-screen-intent-settings`
 - `allow-install-service`
 - `allow-uninstall-service`
 - `allow-start-os-service`
@@ -28,6 +38,32 @@ Default permissions for the background service plugin
 <th>Description</th>
 </tr>
 
+
+<tr>
+<td>
+
+`background-service:allow-can-use-full-screen-intent`
+
+</td>
+<td>
+
+Enables the can_use_full_screen_intent command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`background-service:deny-can-use-full-screen-intent`
+
+</td>
+<td>
+
+Denies the can_use_full_screen_intent command without any pre-configured scope.
+
+</td>
+</tr>
 
 <tr>
 <td>
@@ -155,6 +191,32 @@ Enables the get_lifecycle_status command without any pre-configured scope.
 <td>
 
 Denies the get_lifecycle_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`background-service:allow-get-notification-permission-status`
+
+</td>
+<td>
+
+Enables the get_notification_permission_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`background-service:deny-get-notification-permission-status`
+
+</td>
+<td>
+
+Denies the get_notification_permission_status command without any pre-configured scope.
 
 </td>
 </tr>
@@ -363,6 +425,84 @@ Enables the native_lifecycle_event command without any pre-configured scope.
 <td>
 
 Denies the native_lifecycle_event command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`background-service:allow-open-full-screen-intent-settings`
+
+</td>
+<td>
+
+Enables the open_full_screen_intent_settings command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`background-service:deny-open-full-screen-intent-settings`
+
+</td>
+<td>
+
+Denies the open_full_screen_intent_settings command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`background-service:allow-request-battery-exemption`
+
+</td>
+<td>
+
+Enables the request_battery_exemption command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`background-service:deny-request-battery-exemption`
+
+</td>
+<td>
+
+Denies the request_battery_exemption command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`background-service:allow-request-notification-permission`
+
+</td>
+<td>
+
+Enables the request_notification_permission command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`background-service:deny-request-notification-permission`
+
+</td>
+<td>
+
+Denies the request_notification_permission command without any pre-configured scope.
 
 </td>
 </tr>

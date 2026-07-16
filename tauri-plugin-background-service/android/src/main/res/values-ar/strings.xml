@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Arabic platform-owned notification strings (NTF-12, doc-06). -->
+<resources>
+    <string name="sila_notif_reply">رد</string>
+    <string name="sila_notif_mark_read">تعليم كمقروء</string>
+    <string name="sila_notif_reply_input_label">رد</string>
+    <string name="sila_notif_call_answer">رد</string>
+    <string name="sila_notif_call_answer_video">رد (فيديو)</string>
+    <string name="sila_notif_call_decline">رفض</string>
+    <string name="sila_notif_call_incoming_voice">مكالمة صوتية واردة</string>
+    <string name="sila_notif_call_incoming_video">مكالمة فيديو واردة</string>
+    <!-- NTF-04 (الخطوة 7ب): واجهة إشعار يُعاد عرضه عند فشل مؤقت في الرد
+         (نص الرد الذي كتبه المستخدم يُحفظ في المتن). -->
+    <string name="sila_notif_reply_pending_title">رد معلّق</string>
+    <string name="sila_notif_reply_pending_body">اضغط لإعادة المحاولة.</string>
+</resources>

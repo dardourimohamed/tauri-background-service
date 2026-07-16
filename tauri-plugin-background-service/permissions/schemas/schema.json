@@ -295,6 +295,18 @@
       "type": "string",
       "oneOf": [
         {
+          "description": "Enables the can_use_full_screen_intent command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-can-use-full-screen-intent",
+          "markdownDescription": "Enables the can_use_full_screen_intent command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the can_use_full_screen_intent command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-can-use-full-screen-intent",
+          "markdownDescription": "Denies the can_use_full_screen_intent command without any pre-configured scope."
+        },
+        {
           "description": "Enables the configure_recovery command without any pre-configured scope.",
           "type": "string",
           "const": "allow-configure-recovery",
@@ -353,6 +365,18 @@
           "type": "string",
           "const": "deny-get-lifecycle-status",
           "markdownDescription": "Denies the get_lifecycle_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the get_notification_permission_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-notification-permission-status",
+          "markdownDescription": "Enables the get_notification_permission_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_notification_permission_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-notification-permission-status",
+          "markdownDescription": "Denies the get_notification_permission_status command without any pre-configured scope."
         },
         {
           "description": "Enables the get_os_service_status command without any pre-configured scope.",
@@ -451,6 +475,42 @@
           "markdownDescription": "Denies the native_lifecycle_event command without any pre-configured scope."
         },
         {
+          "description": "Enables the open_full_screen_intent_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-open-full-screen-intent-settings",
+          "markdownDescription": "Enables the open_full_screen_intent_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the open_full_screen_intent_settings command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-open-full-screen-intent-settings",
+          "markdownDescription": "Denies the open_full_screen_intent_settings command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the request_battery_exemption command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-request-battery-exemption",
+          "markdownDescription": "Enables the request_battery_exemption command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the request_battery_exemption command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-request-battery-exemption",
+          "markdownDescription": "Denies the request_battery_exemption command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the request_notification_permission command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-request-notification-permission",
+          "markdownDescription": "Enables the request_notification_permission command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the request_notification_permission command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-request-notification-permission",
+          "markdownDescription": "Denies the request_notification_permission command without any pre-configured scope."
+        },
+        {
           "description": "Enables the restart_os_service command without any pre-configured scope.",
           "type": "string",
           "const": "allow-restart-os-service",
@@ -547,10 +607,10 @@
           "markdownDescription": "Denies the validate_setup command without any pre-configured scope."
         },
         {
-          "description": "Default permissions for the background service plugin\n#### This default permission set includes:\n\n- `allow-start`\n- `allow-stop`\n- `allow-is-running`\n- `allow-get-service-state`\n- `allow-get-platform-capabilities`\n- `allow-enable-auto-restart`\n- `allow-disable-auto-restart`\n- `allow-get-desired-service-state`\n- `allow-validate-setup`\n- `allow-install-service`\n- `allow-uninstall-service`\n- `allow-start-os-service`\n- `allow-stop-os-service`\n- `allow-restart-os-service`\n- `allow-get-os-service-status`",
+          "description": "Default permissions for the background service plugin\n#### This default permission set includes:\n\n- `allow-start`\n- `allow-stop`\n- `allow-is-running`\n- `allow-get-service-state`\n- `allow-get-platform-capabilities`\n- `allow-enable-auto-restart`\n- `allow-disable-auto-restart`\n- `allow-get-desired-service-state`\n- `allow-validate-setup`\n- `allow-get-lifecycle-status`\n- `allow-configure-recovery`\n- `allow-native-lifecycle-event`\n- `allow-get-scheduling-status`\n- `allow-get-pending-bg-task`\n- `allow-get-notification-permission-status`\n- `allow-request-notification-permission`\n- `allow-request-battery-exemption`\n- `allow-can-use-full-screen-intent`\n- `allow-open-full-screen-intent-settings`\n- `allow-install-service`\n- `allow-uninstall-service`\n- `allow-start-os-service`\n- `allow-stop-os-service`\n- `allow-restart-os-service`\n- `allow-get-os-service-status`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for the background service plugin\n#### This default permission set includes:\n\n- `allow-start`\n- `allow-stop`\n- `allow-is-running`\n- `allow-get-service-state`\n- `allow-get-platform-capabilities`\n- `allow-enable-auto-restart`\n- `allow-disable-auto-restart`\n- `allow-get-desired-service-state`\n- `allow-validate-setup`\n- `allow-install-service`\n- `allow-uninstall-service`\n- `allow-start-os-service`\n- `allow-stop-os-service`\n- `allow-restart-os-service`\n- `allow-get-os-service-status`"
+          "markdownDescription": "Default permissions for the background service plugin\n#### This default permission set includes:\n\n- `allow-start`\n- `allow-stop`\n- `allow-is-running`\n- `allow-get-service-state`\n- `allow-get-platform-capabilities`\n- `allow-enable-auto-restart`\n- `allow-disable-auto-restart`\n- `allow-get-desired-service-state`\n- `allow-validate-setup`\n- `allow-get-lifecycle-status`\n- `allow-configure-recovery`\n- `allow-native-lifecycle-event`\n- `allow-get-scheduling-status`\n- `allow-get-pending-bg-task`\n- `allow-get-notification-permission-status`\n- `allow-request-notification-permission`\n- `allow-request-battery-exemption`\n- `allow-can-use-full-screen-intent`\n- `allow-open-full-screen-intent-settings`\n- `allow-install-service`\n- `allow-uninstall-service`\n- `allow-start-os-service`\n- `allow-stop-os-service`\n- `allow-restart-os-service`\n- `allow-get-os-service-status`"
         }
       ]
     }

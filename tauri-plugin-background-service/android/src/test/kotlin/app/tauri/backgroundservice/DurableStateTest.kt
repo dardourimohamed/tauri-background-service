@@ -30,12 +30,18 @@ class DurableStateTest {
     // ── Defaults ──────────────────────────────────────────────────────────
 
     @Test
+    fun default_lastServiceType_isRemoteMessaging() {
+        val state = DurableState()
+        assertEquals("remoteMessaging", state.lastServiceType)
+    }
+
+    @Test
     fun load_defaults_areCorrect() {
         val state = DurableState.load(context)
 
         assertFalse(state.desiredRunning)
         assertEquals("", state.lastServiceLabel)
-        assertEquals("dataSync", state.lastServiceType)
+        assertEquals("remoteMessaging", state.lastServiceType)
         assertEquals(0L, state.lastStartEpochMs)
         assertEquals(0L, state.lastHeartbeatEpochMs)
         assertEquals("unknown", state.lastNativeState)
@@ -60,12 +66,28 @@ class DurableStateTest {
             restartAttempt = 3,
             recoveryPending = true,
             recoveryReason = "boot_fgs_type_restricted",
+            hasAskedNotificationPermission = true,
         )
 
         DurableState.save(context, original)
         val loaded = DurableState.load(context)
 
         assertEquals(original, loaded)
+    }
+
+    // ── BGS-21: hasAskedNotificationPermission round-trip ─────────────────
+
+    @Test
+    fun bgs21_hasAskedNotificationPermission_persistsRoundTrip() {
+        // BGS-21 (doc-08 Step 12): without BOTH a getBoolean in load() and a
+        // putBoolean in save() the flag compiles (default false) but never
+        // round-trips across reboot — a silent defect. This pinned round-trip
+        // (true AND false) proves both load+save lines are wired.
+        DurableState.save(context, DurableState(hasAskedNotificationPermission = true))
+        assertTrue(DurableState.load(context).hasAskedNotificationPermission)
+
+        DurableState.save(context, DurableState(hasAskedNotificationPermission = false))
+        assertFalse(DurableState.load(context).hasAskedNotificationPermission)
     }
 
     // ── Round-trip: nullable fields are null ───────────────────────────────
