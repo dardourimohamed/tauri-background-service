@@ -4,7 +4,7 @@ import android.content.Context
 
 /**
  * NTF-04 (Step 7b): the result of deciding what to do with a notification action
- * after the headless Core reports back. Distilled from a [HeadlessCoreResult] by
+ * after the headless Core reports back. Distilled from a [HeadlessBridgeResult] by
  * [decideNotificationOutcome]; applied to the OS notification by
  * [handleNotificationActionResult].
  */
@@ -27,14 +27,14 @@ sealed class NotificationActionOutcome {
 
 /**
  * NTF-04 (Step 7b): PURE discriminator. Decides a [NotificationActionOutcome] from
- * a [HeadlessCoreResult] and the user's replyText. No Android, no JNI — directly
+ * a [HeadlessBridgeResult] and the user's replyText. No Android, no JNI — directly
  * unit-testable with constructed results (see NotificationActionOutcomeTest).
  *
  * `recoverable` is AMBIGUOUS (7a-FINALIZER CARRY-FORWARD #1, verified first-hand
- * against HeadlessCoreBridge.kt + tauri/src/headless_core.rs @ 819c2394): the
+ * against HeadlessBridge.kt + tauri/src/headless_core.rs @ 819c2394): the
  * Rust HeadlessCoreReport sets recoverable=true ONLY for a locked/dead Core a
  * retry may satisfy (=> RE-PRESENT, preserving the reply). But the Kotlin
- * HeadlessCoreResult.failure() synthetic ALSO hardcodes recoverable=true for
+ * HeadlessBridgeResult.failure() synthetic ALSO hardcodes recoverable=true for
  * PERMANENT pre-JNI env failures (native_library_load_failed /
  * data_dir_unavailable / invalid_headless_core_response), and it is the ONLY
  * emitter of a `code` field. So:
@@ -50,10 +50,10 @@ sealed class NotificationActionOutcome {
  * (NOT org.json.JSONObject) so this function is a genuinely PURE JVM predicate —
  * no Android, no JNI — directly unit-testable without Robolectric (the OOM-safe
  * fallback surface). The Rust HeadlessCoreReport has no `code` field (serde never
- * emits one), so only HeadlessCoreResult.failure()'s synthetic carries the key.
+ * emits one), so only HeadlessBridgeResult.failure()'s synthetic carries the key.
  */
 fun decideNotificationOutcome(
-    result: HeadlessCoreResult,
+    result: HeadlessBridgeResult,
     replyText: String,
 ): NotificationActionOutcome {
     // Success or a Rust-permanent verdict (recoverable == false, e.g. the empty
@@ -105,7 +105,7 @@ internal fun handleNotificationActionResult(
  * action intent carries only ids + route uri — NOT the original title/body/icon
  * (CHANGES #4, Builder decision: payload fidelity). The user's typed replyText is
  * preserved in the body (AC3) so it is not lost; the route is reconstructed from
- * the ids (the same sila://chat route the GUI forwarder uses), so tapping re-opens
+ * the ids (the same bg-service://chat route the GUI forwarder uses), so tapping re-opens
  * the conversation. An empty replyText (a re-presented mark-read) falls back to a
  * localized "tap to retry" body.
  */
@@ -117,15 +117,15 @@ private fun rePresentNotification(
     notificationId: Int,
 ) {
     val body = outcome.replyText.takeIf { it.isNotEmpty() }
-        ?: context.getString(R.string.sila_notif_reply_pending_body)
+        ?: context.getString(R.string.bg_service_notif_reply_pending_body)
     ActionableMessageNotifier.showMessageNotification(
         context = context,
         notificationId = notificationId,
         chatId = chatId,
         messageId = messageId,
-        title = context.getString(R.string.sila_notif_reply_pending_title),
+        title = context.getString(R.string.bg_service_notif_reply_pending_title),
         body = body,
-        routeUri = "sila://chat?chat_id=$chatId&message_id=$messageId",
+        routeUri = "bg-service://chat?chat_id=$chatId&message_id=$messageId",
         smallIcon = NotificationIconResolver.resolve(context),
         launchIntent = context.packageManager.getLaunchIntentForPackage(context.packageName),
     )

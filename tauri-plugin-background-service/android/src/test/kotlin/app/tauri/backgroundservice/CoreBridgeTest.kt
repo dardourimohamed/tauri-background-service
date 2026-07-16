@@ -102,10 +102,10 @@ class CoreBridgeTest {
     }
 
     @Test
-    fun `HeadlessCoreBridge networkChanged fails gracefully without native lib`() {
-        // On the JVM there is no sila_lib, so ensureLoaded() fails; the wrapper
+    fun `HeadlessBridge networkChanged fails gracefully without native lib`() {
+        // On the JVM there is no native core library, so ensureLoaded() fails; the wrapper
         // must return the same load-failure shape as start/stop, never throw.
-        val result = HeadlessCoreBridge.networkChanged()
+        val result = HeadlessBridge.networkChanged()
         assertFalse(result.ok)
         assertEquals("failed", result.state)
         assertTrue(

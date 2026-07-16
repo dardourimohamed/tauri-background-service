@@ -11,7 +11,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 
-data class HeadlessCoreResult(
+data class HeadlessBridgeResult(
     val ok: Boolean,
     val state: String,
     val message: String?,
@@ -25,10 +25,10 @@ data class HeadlessCoreResult(
         get() = ok && (state == "running" || state == "setup_idle" || state == "locked_idle")
 
     companion object {
-        fun fromJson(json: String): HeadlessCoreResult {
+        fun fromJson(json: String): HeadlessBridgeResult {
             return try {
                 val obj = JSONObject(json)
-                HeadlessCoreResult(
+                HeadlessBridgeResult(
                     ok = obj.optBoolean("ok", false),
                     state = obj.optString("state", "failed"),
                     message = obj.optString("message").ifEmpty { null },
@@ -40,7 +40,7 @@ data class HeadlessCoreResult(
             }
         }
 
-        fun failure(code: String, message: String): HeadlessCoreResult {
+        fun failure(code: String, message: String): HeadlessBridgeResult {
             val json = JSONObject().apply {
                 put("ok", false)
                 put("state", "failed")
@@ -48,14 +48,29 @@ data class HeadlessCoreResult(
                 put("message", message)
                 put("recoverable", true)
             }.toString()
-            return HeadlessCoreResult(false, "failed", message, true, json)
+            return HeadlessBridgeResult(false, "failed", message, true, json)
         }
     }
 }
 
-object HeadlessCoreBridge {
+object HeadlessBridge {
     @Volatile private var loaded = false
     @Volatile private var loadError: String? = null
+
+    /**
+     * Name of the host app's native (Rust cdylib) core to dlopen for headless
+     * lifecycle / call / message bridging. The plugin ships NO native library;
+     * a host app that bridges to a native core sets this
+     * (`HeadlessBridge.nativeLibName = "app_core"`) AND exports the JNI symbols
+     * `Java_app_tauri_backgroundservice_HeadlessBridge_*`
+     * (`startCore`/`stopCore`/`notifyNetworkChanged`/`callAction`/`notificationAction`).
+     *
+     * When the library is absent — the default for consumers that don't bridge
+     * to a native core — [ensureLoaded] fails gracefully and every entry point
+     * returns a typed `native_library_load_failed` result; the lifecycle-only
+     * path (foreground service + Rust `BackgroundService<R>` task) is unaffected.
+     */
+    @Volatile var nativeLibName: String = "app_core"
 
     // PRODUCT DECISION: headless message notifications carry a generic body (doc
     // 08, BGS-07). The webview/JS i18n catalog is absent on the force-stopped /
@@ -83,29 +98,29 @@ object HeadlessCoreBridge {
         replyText: String,
     ): String
 
-    fun start(context: Context, reason: String): HeadlessCoreResult {
-        ensureLoaded()?.let { return HeadlessCoreResult.failure("native_library_load_failed", it) }
+    fun start(context: Context, reason: String): HeadlessBridgeResult {
+        ensureLoaded()?.let { return HeadlessBridgeResult.failure("native_library_load_failed", it) }
         val dataDir = dataDir(context)
         if (!ensureDataDir(dataDir)) {
-            return HeadlessCoreResult.failure(
+            return HeadlessBridgeResult.failure(
                 "data_dir_unavailable",
                 "Failed to create data directory: ${dataDir.absolutePath}",
             )
         }
-        return HeadlessCoreResult.fromJson(startCore(dataDir.absolutePath, reason))
+        return HeadlessBridgeResult.fromJson(startCore(dataDir.absolutePath, reason))
     }
 
-    fun stop(context: Context, reason: String): HeadlessCoreResult {
-        ensureLoaded()?.let { return HeadlessCoreResult.failure("native_library_load_failed", it) }
-        return HeadlessCoreResult.fromJson(stopCore(dataDir(context).absolutePath, reason))
+    fun stop(context: Context, reason: String): HeadlessBridgeResult {
+        ensureLoaded()?.let { return HeadlessBridgeResult.failure("native_library_load_failed", it) }
+        return HeadlessBridgeResult.fromJson(stopCore(dataDir(context).absolutePath, reason))
     }
 
     // Named networkChanged because the external above already takes the
     // notifyNetworkChanged JNI name (the symbol is the Rust-side contract).
     // May throw UnsatisfiedLinkError when the loaded lib predates the export.
-    fun networkChanged(): HeadlessCoreResult {
-        ensureLoaded()?.let { return HeadlessCoreResult.failure("native_library_load_failed", it) }
-        return HeadlessCoreResult.fromJson(notifyNetworkChanged())
+    fun networkChanged(): HeadlessBridgeResult {
+        ensureLoaded()?.let { return HeadlessBridgeResult.failure("native_library_load_failed", it) }
+        return HeadlessBridgeResult.fromJson(notifyNetworkChanged())
     }
 
     /**
@@ -118,12 +133,12 @@ object HeadlessCoreBridge {
      *
      * Named `performCallAction` (not `callAction`) because the external above
      * already takes the `callAction` JNI name — the symbol is the Rust-side
-     * contract (`Java_..._HeadlessCoreBridge_callAction`), mirroring the
+     * contract (`Java_..._HeadlessBridge_callAction`), mirroring the
      * `notifyNetworkChanged`/`networkChanged` split.
      */
-    fun performCallAction(callId: String, action: String): HeadlessCoreResult {
-        ensureLoaded()?.let { return HeadlessCoreResult.failure("native_library_load_failed", it) }
-        return HeadlessCoreResult.fromJson(callAction(callId, action))
+    fun performCallAction(callId: String, action: String): HeadlessBridgeResult {
+        ensureLoaded()?.let { return HeadlessBridgeResult.failure("native_library_load_failed", it) }
+        return HeadlessBridgeResult.fromJson(callAction(callId, action))
     }
 
     /**
@@ -141,16 +156,16 @@ object HeadlessCoreBridge {
         chatId: String,
         messageId: String,
         replyText: String,
-    ): HeadlessCoreResult {
-        ensureLoaded()?.let { return HeadlessCoreResult.failure("native_library_load_failed", it) }
+    ): HeadlessBridgeResult {
+        ensureLoaded()?.let { return HeadlessBridgeResult.failure("native_library_load_failed", it) }
         val dataDir = dataDir(context)
         if (!ensureDataDir(dataDir)) {
-            return HeadlessCoreResult.failure(
+            return HeadlessBridgeResult.failure(
                 "data_dir_unavailable",
                 "Failed to create data directory: ${dataDir.absolutePath}",
             )
         }
-        return HeadlessCoreResult.fromJson(
+        return HeadlessBridgeResult.fromJson(
             notificationAction(dataDir.absolutePath, action, chatId, messageId, replyText)
         )
     }
@@ -170,7 +185,7 @@ object HeadlessCoreBridge {
     fun showIncomingCall(callId: String, callerName: String, hasVideo: Boolean) {
         val context = applicationContext()
         if (context == null) {
-            android.util.Log.w("HeadlessCoreBridge", "showIncomingCall: no application context")
+            android.util.Log.w("HeadlessBridge", "showIncomingCall: no application context")
             return
         }
         IncomingCallNotifier.showIncomingCall(
@@ -201,7 +216,7 @@ object HeadlessCoreBridge {
     fun showMessage(chatId: String, messageId: String, sender: String) {
         val context = applicationContext()
         if (context == null) {
-            android.util.Log.w("HeadlessCoreBridge", "showMessage: no application context")
+            android.util.Log.w("HeadlessBridge", "showMessage: no application context")
             return
         }
         ActionableMessageNotifier.showMessageNotification(
@@ -214,7 +229,7 @@ object HeadlessCoreBridge {
             // and none may cross the JNI boundary).
             title = sender,
             body = HEADLESS_MESSAGE_BODY,
-            routeUri = "sila://chat?chat_id=${Uri.encode(chatId)}&message_id=${Uri.encode(messageId)}",
+            routeUri = "bg-service://chat?chat_id=${Uri.encode(chatId)}&message_id=${Uri.encode(messageId)}",
             smallIcon = NotificationIconResolver.resolve(context),
             launchIntent = context.packageManager.getLaunchIntentForPackage(context.packageName),
         )
@@ -233,7 +248,7 @@ object HeadlessCoreBridge {
     fun cancelIncomingCall(callId: String) {
         val context = applicationContext()
         if (context == null) {
-            android.util.Log.w("HeadlessCoreBridge", "cancelIncomingCall: no application context")
+            android.util.Log.w("HeadlessBridge", "cancelIncomingCall: no application context")
             return
         }
         IncomingCallNotifier.cancel(context, callId)
@@ -261,7 +276,7 @@ object HeadlessCoreBridge {
             }
         } catch (e: Throwable) {
             android.util.Log.w(
-                "HeadlessCoreBridge",
+                "HeadlessBridge",
                 "cancelIncomingCall FGS revert failed: ${e.message}",
             )
         }
@@ -285,7 +300,7 @@ object HeadlessCoreBridge {
             if (loaded) return null
             loadError?.let { return it }
             return try {
-                System.loadLibrary("sila_lib")
+                System.loadLibrary(nativeLibName)
                 loaded = true
                 null
             } catch (e: Throwable) {

@@ -68,7 +68,7 @@ class Bgs19LifecycleStringsTest {
     @After
     fun tearDown() {
         context.applicationInfo.dataDir = savedDataDir ?: realDataDir
-        LifecycleService.bridgeProvider = { HeadlessCoreBridgeImpl() }
+        LifecycleService.bridgeProvider = { HeadlessBridgeImpl() }
         LifecycleService.coreStartExecutor = LifecycleService.DEFAULT_CORE_START_EXECUTOR
         LifecycleService.coreStopExecutor = LifecycleService.DEFAULT_CORE_STOP_EXECUTOR
         LifecycleService.isRunning = false

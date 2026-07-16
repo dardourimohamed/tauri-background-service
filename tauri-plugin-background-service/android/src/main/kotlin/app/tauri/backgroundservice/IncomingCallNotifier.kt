@@ -66,8 +66,8 @@ object IncomingCallNotifier {
     private val ringTimeouts = ConcurrentHashMap<String, () -> Unit>()
 
     /** Deep-link extra carried on the launch intent into the webview. */
-    const val EXTRA_CALL_ID = "sila.call_id"
-    const val EXTRA_CALL_ACTION = "sila.call_action"
+    const val EXTRA_CALL_ID = "bg_service.call_id"
+    const val EXTRA_CALL_ACTION = "bg_service.call_action"
     const val ACTION_ANSWER = "answer"
     const val ACTION_DECLINE = "decline"
 

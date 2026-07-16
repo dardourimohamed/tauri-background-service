@@ -24,11 +24,11 @@ class NotificationHelperTest {
 
     @Test
     fun notificationIconResolver_prefersStatIconOverSyncFallback() {
-        // NTF-15: with the ic_stat_sila drawable shipped, the no-arg resolve()
-        // reaches L17 (resolveNamed("ic_stat_sila")) and returns it instead of
+        // NTF-15: with the ic_stat_bg_service drawable shipped, the no-arg resolve()
+        // reaches L17 (resolveNamed("ic_stat_bg_service")) and returns it instead of
         // falling through to the launcher / sync fallback.
-        val expected = context.resources.getIdentifier("ic_stat_sila", "drawable", context.packageName)
-        assertTrue("ic_stat_sila drawable should exist", expected != 0)
+        val expected = context.resources.getIdentifier("ic_stat_bg_service", "drawable", context.packageName)
+        assertTrue("ic_stat_bg_service drawable should exist", expected != 0)
 
         val resolved = NotificationIconResolver.resolve(context)
 
@@ -40,20 +40,20 @@ class NotificationHelperTest {
     fun notificationIconResolver_configuredPathWinsOverStatFallback() {
         // NTF-15: the CONFIGURED path (BackgroundServicePlugin.resolveSmallIcon +
         // LifecycleService.notifSmallIcon) consults resolveNamed(configuredName)
-        // at L16 BEFORE the L17 "ic_stat_sila" fallback. This is why the config
-        // flip (ic_launcher -> ic_stat_sila) is load-bearing: with ic_stat_sila
+        // at L16 BEFORE the L17 "ic_stat_bg_service" fallback. This is why the config
+        // flip (ic_launcher -> ic_stat_bg_service) is load-bearing: with ic_stat_bg_service
         // present at L17, configuring "ic_launcher" must STILL resolve to
         // ic_launcher — proving L16 is consulted first and would otherwise keep
         // returning the launcher for the plugin's main notification surfaces.
         val launcher = context.resources.getIdentifier("ic_launcher", "drawable", context.packageName)
         assertTrue("test launcher icon fixture should exist", launcher != 0)
-        val statIcon = context.resources.getIdentifier("ic_stat_sila", "drawable", context.packageName)
-        assertTrue("ic_stat_sila drawable should exist", statIcon != 0)
+        val statIcon = context.resources.getIdentifier("ic_stat_bg_service", "drawable", context.packageName)
+        assertTrue("ic_stat_bg_service drawable should exist", statIcon != 0)
 
-        // L16 production path post-flip (BSP + LifecycleService configure ic_stat_sila):
-        assertEquals(statIcon, NotificationIconResolver.resolve(context, "ic_stat_sila"))
-        // L16 wins over L17: ic_stat_sila IS present at L17, yet configuring
-        // "ic_launcher" resolves to ic_launcher, not ic_stat_sila.
+        // L16 production path post-flip (BSP + LifecycleService configure ic_stat_bg_service):
+        assertEquals(statIcon, NotificationIconResolver.resolve(context, "ic_stat_bg_service"))
+        // L16 wins over L17: ic_stat_bg_service IS present at L17, yet configuring
+        // "ic_launcher" resolves to ic_launcher, not ic_stat_bg_service.
         assertEquals(launcher, NotificationIconResolver.resolve(context, "ic_launcher"))
     }
 
@@ -111,7 +111,7 @@ class NotificationHelperTest {
         val notification = NotificationHelper.buildForegroundNotification(
             context = context,
             channelId = "bg_keepalive",
-            title = "Sila",
+            title = "App",
             text = "Service running",
             smallIcon = android.R.drawable.stat_notify_sync,
             pendingIntent = null,
@@ -120,7 +120,7 @@ class NotificationHelperTest {
         )
 
         val extras = notification.extras
-        assertEquals("Sila", extras.getString(Notification.EXTRA_TITLE))
+        assertEquals("App", extras.getString(Notification.EXTRA_TITLE))
         assertEquals("Service running", extras.getString(Notification.EXTRA_TEXT))
     }
 
@@ -133,7 +133,7 @@ class NotificationHelperTest {
         val notification = NotificationHelper.buildForegroundNotification(
             context = context,
             channelId = "bg_keepalive",
-            title = "Sila",
+            title = "App",
             text = "Running",
             smallIcon = android.R.drawable.stat_notify_sync,
             pendingIntent = null,
@@ -150,7 +150,7 @@ class NotificationHelperTest {
         val notification = NotificationHelper.buildForegroundNotification(
             context = context,
             channelId = "bg_keepalive",
-            title = "Sila",
+            title = "App",
             text = "Running",
             smallIcon = android.R.drawable.stat_notify_sync,
             pendingIntent = null,
@@ -169,14 +169,14 @@ class NotificationHelperTest {
         val notification = NotificationHelper.buildTimeoutNotification(
             context = context,
             channelId = "bg_service_timeout",
-            title = "Sila",
+            title = "App",
             text = "Background service timed out: Syncing",
             smallIcon = android.R.drawable.stat_notify_sync,
             pendingIntent = null,
         )
 
         val extras = notification.extras
-        assertEquals("Sila", extras.getString(Notification.EXTRA_TITLE))
+        assertEquals("App", extras.getString(Notification.EXTRA_TITLE))
         assertEquals("Background service timed out: Syncing", extras.getString(Notification.EXTRA_TEXT))
     }
 
@@ -188,14 +188,14 @@ class NotificationHelperTest {
         val notification = NotificationHelper.buildRecoveryNotification(
             context = context,
             channelId = "bg_service_recovery",
-            title = "Sila",
+            title = "App",
             text = "Tap to resume: Syncing",
             smallIcon = android.R.drawable.stat_notify_sync,
             pendingIntent = null,
         )
 
         val extras = notification.extras
-        assertEquals("Sila", extras.getString(Notification.EXTRA_TITLE))
+        assertEquals("App", extras.getString(Notification.EXTRA_TITLE))
         assertEquals("Tap to resume: Syncing", extras.getString(Notification.EXTRA_TEXT))
     }
 

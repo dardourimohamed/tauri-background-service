@@ -64,7 +64,7 @@
              OS call UI, audio focus, and Bluetooth routing follow the system
              call path while the webview is closed. Requires MANAGE_OWN_CALLS. -->
         <service
-            android:name=".SilaConnectionService"
+            android:name=".BackgroundCallConnectionService"
             android:exported="false"
             android:permission="android.permission.BIND_TELECOM_CONNECTION_SERVICE">
             <intent-filter>

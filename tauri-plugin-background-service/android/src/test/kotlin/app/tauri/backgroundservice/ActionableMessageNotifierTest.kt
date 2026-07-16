@@ -54,7 +54,7 @@ class ActionableMessageNotifierTest {
             messageId = "msg-1",
             title = "Alice",
             body = "hello",
-            routeUri = "sila://chat?chat_id=chat-1&message_id=msg-1",
+            routeUri = "bg-service://chat?chat_id=chat-1&message_id=msg-1",
             smallIcon = android.R.drawable.sym_def_app_icon,
             launchIntent = Intent(Intent.ACTION_MAIN).setPackage(context.packageName),
         )
@@ -78,10 +78,10 @@ class ActionableMessageNotifierTest {
 
         val contentIntent = shadowOf(notification.contentIntent).savedIntent
         assertEquals(Intent.ACTION_VIEW, contentIntent.action)
-        assertEquals("sila://chat?chat_id=chat-1&message_id=msg-1", contentIntent.data.toString())
+        assertEquals("bg-service://chat?chat_id=chat-1&message_id=msg-1", contentIntent.data.toString())
         assertTrue(contentIntent.categories?.contains(Intent.CATEGORY_BROWSABLE) == true)
         assertEquals(
-            "sila://chat?chat_id=chat-1&message_id=msg-1",
+            "bg-service://chat?chat_id=chat-1&message_id=msg-1",
             contentIntent.getStringExtra(ActionableMessageNotifier.EXTRA_ROUTE_URI),
         )
 
@@ -122,7 +122,7 @@ class ActionableMessageNotifierTest {
             messageId = "msg-1",
             title = "Alice",
             body = "first",
-            routeUri = "sila://chat?chat_id=chat-1&message_id=msg-1",
+            routeUri = "bg-service://chat?chat_id=chat-1&message_id=msg-1",
             smallIcon = android.R.drawable.sym_def_app_icon,
             launchIntent = null,
         )
@@ -133,7 +133,7 @@ class ActionableMessageNotifierTest {
             messageId = "msg-2",
             title = "Alice",
             body = "second",
-            routeUri = "sila://chat?chat_id=chat-1&message_id=msg-2",
+            routeUri = "bg-service://chat?chat_id=chat-1&message_id=msg-2",
             smallIcon = android.R.drawable.sym_def_app_icon,
             launchIntent = null,
         )
@@ -163,7 +163,7 @@ class ActionableMessageNotifierTest {
             messageId = "msg-1",
             title = "Alice",
             body = "hi",
-            routeUri = "sila://chat?chat_id=chat-1&message_id=msg-1",
+            routeUri = "bg-service://chat?chat_id=chat-1&message_id=msg-1",
             smallIcon = android.R.drawable.sym_def_app_icon,
             launchIntent = null,
         )
@@ -174,7 +174,7 @@ class ActionableMessageNotifierTest {
             messageId = "msg-9",
             title = "Bob",
             body = "yo",
-            routeUri = "sila://chat?chat_id=chat-2&message_id=msg-9",
+            routeUri = "bg-service://chat?chat_id=chat-2&message_id=msg-9",
             smallIcon = android.R.drawable.sym_def_app_icon,
             launchIntent = null,
         )
@@ -200,7 +200,7 @@ class ActionableMessageNotifierTest {
             messageId = "msg-1",
             title = "Alice",
             body = "hello",
-            routeUri = "sila://chat?chat_id=chat-1&message_id=msg-1",
+            routeUri = "bg-service://chat?chat_id=chat-1&message_id=msg-1",
             smallIcon = android.R.drawable.sym_def_app_icon,
             launchIntent = null,
         )
@@ -235,7 +235,7 @@ class ActionableMessageNotifierTest {
             messageId = "m",
             title = "Alice",
             body = "hello",
-            routeUri = "sila://chat?chat_id=chat-A&message_id=m",
+            routeUri = "bg-service://chat?chat_id=chat-A&message_id=m",
             smallIcon = android.R.drawable.sym_def_app_icon,
             launchIntent = null,
         )
@@ -247,7 +247,7 @@ class ActionableMessageNotifierTest {
             messageId = "m",
             title = "Bob",
             body = "yo",
-            routeUri = "sila://chat?chat_id=chat-B&message_id=m",
+            routeUri = "bg-service://chat?chat_id=chat-B&message_id=m",
             smallIcon = android.R.drawable.sym_def_app_icon,
             launchIntent = null,
         )

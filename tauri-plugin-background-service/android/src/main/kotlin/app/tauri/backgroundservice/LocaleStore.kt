@@ -12,7 +12,7 @@ import java.io.File
  * runs without the webview — message action labels, boot-recovery text) honors the
  * user's chosen locale. Mirrors the Rust `locale_store::LocaleRecord::load`.
  *
- * The data dir matches `HeadlessCoreBridge.dataDir`
+ * The data dir matches `HeadlessBridge.dataDir`
  * (`applicationInfo.dataDir` + `"data"`), which is the same path Rust's
  * `BaseDirectory::AppData`/`"data"` resolves to on Android (one app, one UID, one
  * data dir) — so the Kotlin read sees exactly what the Rust write persists. A

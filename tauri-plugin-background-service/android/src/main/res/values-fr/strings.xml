@@ -1,16 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- French platform-owned notification strings (NTF-12, doc-06). -->
 <resources>
-    <string name="sila_notif_reply">Répondre</string>
-    <string name="sila_notif_mark_read">Marquer comme lu</string>
-    <string name="sila_notif_reply_input_label">Répondre</string>
-    <string name="sila_notif_call_answer">Répondre</string>
-    <string name="sila_notif_call_answer_video">Répondre (vidéo)</string>
-    <string name="sila_notif_call_decline">Refuser</string>
-    <string name="sila_notif_call_incoming_voice">Appel vocal entrant</string>
-    <string name="sila_notif_call_incoming_video">Appel vidéo entrant</string>
+    <string name="bg_service_notif_reply">Répondre</string>
+    <string name="bg_service_notif_mark_read">Marquer comme lu</string>
+    <string name="bg_service_notif_reply_input_label">Répondre</string>
+    <string name="bg_service_notif_call_answer">Répondre</string>
+    <string name="bg_service_notif_call_answer_video">Répondre (vidéo)</string>
+    <string name="bg_service_notif_call_decline">Refuser</string>
+    <string name="bg_service_notif_call_incoming_voice">Appel vocal entrant</string>
+    <string name="bg_service_notif_call_incoming_video">Appel vidéo entrant</string>
     <!-- NTF-04 (Step 7b) : surface de notification représentée pour un échec
          de réponse récupérable (la replyText saisie est reportée dans le corps). -->
-    <string name="sila_notif_reply_pending_title">Réponse en attente</string>
-    <string name="sila_notif_reply_pending_body">Appuyez pour réessayer.</string>
+    <string name="bg_service_notif_reply_pending_title">Réponse en attente</string>
+    <string name="bg_service_notif_reply_pending_body">Appuyez pour réessayer.</string>
 </resources>

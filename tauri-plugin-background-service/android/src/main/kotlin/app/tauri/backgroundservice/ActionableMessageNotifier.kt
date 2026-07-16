@@ -15,12 +15,12 @@ object ActionableMessageNotifier {
     private const val TAG = "ActionableMessageNotifier"
     const val MESSAGE_CHANNEL_ID = "messages"
 
-    const val EXTRA_NOTIFICATION_ID = "sila.notification_id"
-    const val EXTRA_CHAT_ID = "sila.chat_id"
-    const val EXTRA_MESSAGE_ID = "sila.message_id"
-    const val EXTRA_ACTION = "sila.notification_action"
-    const val EXTRA_ROUTE_URI = "sila.route_uri"
-    const val REMOTE_INPUT_KEY = "sila.reply_text"
+    const val EXTRA_NOTIFICATION_ID = "bg_service.notification_id"
+    const val EXTRA_CHAT_ID = "bg_service.chat_id"
+    const val EXTRA_MESSAGE_ID = "bg_service.message_id"
+    const val EXTRA_ACTION = "bg_service.notification_action"
+    const val EXTRA_ROUTE_URI = "bg_service.route_uri"
+    const val REMOTE_INPUT_KEY = "bg_service.reply_text"
 
     const val ACTION_REPLY = "reply"
     const val ACTION_MARK_READ = "mark_read"

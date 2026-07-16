@@ -42,7 +42,7 @@ class AndroidServiceStateTest {
 
         val durableState = DurableState(
             desiredRunning = true,
-            lastServiceLabel = "Sila BG",
+            lastServiceLabel = "App BG",
             lastServiceType = "remoteMessaging",
             lastNativeState = "running",
         )
@@ -59,7 +59,7 @@ class AndroidServiceStateTest {
         assertTrue("nativeForeground should be true", state.nativeForeground)
         assertTrue("desiredRunning should be true", state.desiredRunning)
         assertEquals("running", state.durableState)
-        assertEquals("Sila BG", state.serviceLabel)
+        assertEquals("App BG", state.serviceLabel)
         assertEquals("remoteMessaging", state.foregroundServiceType)
         assertEquals(9001, state.notificationId!!)
         assertEquals("bg_service", state.notificationChannelId)
@@ -98,14 +98,14 @@ class AndroidServiceStateTest {
             nativeForeground = true,
             desiredRunning = true,
             durableState = "running",
-            serviceLabel = "Sila BG",
+            serviceLabel = "App BG",
             foregroundServiceType = "remoteMessaging",
             notificationId = 9001,
             notificationChannelId = "bg_service",
             recoveryPending = false,
             recoveryReason = null,
             lastPlatformError = null,
-            dataDir = "/data/data/com.sila.app",
+            dataDir = "/data/data/com.example.app",
         )
 
         val json = original.toJSON()
@@ -128,7 +128,7 @@ class AndroidServiceStateTest {
             recoveryPending = false,
             recoveryReason = null,
             lastPlatformError = null,
-            dataDir = "/data/data/com.sila.app",
+            dataDir = "/data/data/com.example.app",
         )
 
         val json = original.toJSON()
@@ -144,14 +144,14 @@ class AndroidServiceStateTest {
             nativeForeground = false,
             desiredRunning = true,
             durableState = "core_start_failed",
-            serviceLabel = "Sila",
+            serviceLabel = "App",
             foregroundServiceType = "remoteMessaging",
             notificationId = null,
             notificationChannelId = null,
             recoveryPending = true,
             recoveryReason = "os_restart",
             lastPlatformError = "fgs_restricted: not allowed",
-            dataDir = "/data/data/com.sila.app",
+            dataDir = "/data/data/com.example.app",
         )
 
         val json = original.toJSON()

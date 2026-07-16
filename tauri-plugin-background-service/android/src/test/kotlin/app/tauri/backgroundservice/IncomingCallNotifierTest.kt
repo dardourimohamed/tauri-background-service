@@ -173,7 +173,7 @@ class IncomingCallNotifierTest {
         //     stored with no notification (BGS-07). The Rust→Kotlin `showMessage`
         //     upcall resolves the process Application context and posts via
         //     ActionableMessageNotifier to the dedicated message channel.
-        HeadlessCoreBridge.showMessage("chat-7", "msg-7", "Alice")
+        HeadlessBridge.showMessage("chat-7", "msg-7", "Alice")
         val msgId = ActionableMessageNotifier.notificationIdFor("chat-7")
         val msgNotif = shadowOf(nm).getNotification(ActionableMessageNotifier.chatTagFor("chat-7"), msgId)
         assertNotNull("Headless message upcall must post a message notification", msgNotif)
@@ -186,11 +186,11 @@ class IncomingCallNotifierTest {
         // (2) RING CANCEL on CallEnded: the forwarder cancels the CallStyle ring
         //     for an ended/abandoned call (dropped entirely by the ring-only
         //     forwarder — the exact gap BGS-07 closes).
-        HeadlessCoreBridge.showIncomingCall("call-7", "Bob", false)
+        HeadlessBridge.showIncomingCall("call-7", "Bob", false)
         val ringId = IncomingCallNotifier.notificationIdFor("call-7")
         assertNotNull("Ring posted before cancel", shadowOf(nm).getNotification(ringId))
 
-        HeadlessCoreBridge.cancelIncomingCall("call-7")
+        HeadlessBridge.cancelIncomingCall("call-7")
         assertNull(
             "CallEnded must cancel the headless CallStyle ring",
             shadowOf(nm).getNotification(ringId),

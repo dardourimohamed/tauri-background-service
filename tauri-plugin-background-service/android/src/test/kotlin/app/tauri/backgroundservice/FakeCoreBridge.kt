@@ -29,13 +29,13 @@ class FakeCoreBridge(
     /** When set, [notifyNetworkChanged] throws it (e.g. UnsatisfiedLinkError). */
     var networkChangedError: Throwable? = null
 
-    private val startResult: HeadlessCoreResult = when (result) {
+    private val startResult: HeadlessBridgeResult = when (result) {
         "running", "setup_idle", "locked_idle" -> {
             val json = JSONObject().apply {
                 put("ok", true)
                 put("state", result)
             }.toString()
-            HeadlessCoreResult(ok = true, state = result, message = null, recoverable = true, rawJson = json)
+            HeadlessBridgeResult(ok = true, state = result, message = null, recoverable = true, rawJson = json)
         }
         "failed" -> {
             val json = JSONObject().apply {
@@ -44,27 +44,27 @@ class FakeCoreBridge(
                 put("message", "FakeCoreBridge configured failure")
                 put("recoverable", true)
             }.toString()
-            HeadlessCoreResult(ok = false, state = "failed", message = "FakeCoreBridge configured failure", recoverable = true, rawJson = json)
+            HeadlessBridgeResult(ok = false, state = "failed", message = "FakeCoreBridge configured failure", recoverable = true, rawJson = json)
         }
         else -> throw IllegalArgumentException("Unknown FakeCoreBridge state: $result. Use: running, setup_idle, locked_idle, failed")
     }
 
-    override fun start(context: Context, reason: String): HeadlessCoreResult {
+    override fun start(context: Context, reason: String): HeadlessBridgeResult {
         lastStartReason = reason
         return startResult
     }
 
-    override fun stop(context: Context, reason: String): HeadlessCoreResult {
+    override fun stop(context: Context, reason: String): HeadlessBridgeResult {
         stopThread = Thread.currentThread()
         lastStopReason = reason
         val json = JSONObject().apply {
             put("ok", true)
             put("state", "stopped")
         }.toString()
-        return HeadlessCoreResult(ok = true, state = "stopped", message = null, recoverable = true, rawJson = json)
+        return HeadlessBridgeResult(ok = true, state = "stopped", message = null, recoverable = true, rawJson = json)
     }
 
-    override fun notifyNetworkChanged(): HeadlessCoreResult {
+    override fun notifyNetworkChanged(): HeadlessBridgeResult {
         networkChangedCount++
         networkChangedError?.let { throw it }
         val json = JSONObject().apply {
@@ -74,6 +74,6 @@ class FakeCoreBridge(
             put("peersFlushed", 0)
             put("controlFlushed", true)
         }.toString()
-        return HeadlessCoreResult(ok = true, state = "running", message = null, recoverable = true, rawJson = json)
+        return HeadlessBridgeResult(ok = true, state = "running", message = null, recoverable = true, rawJson = json)
     }
 }

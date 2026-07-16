@@ -38,7 +38,7 @@ class LifecycleService : Service() {
         @Volatile var autoRestarting = false
 
         @VisibleForTesting
-        internal var bridgeProvider: () -> CoreBridge = { HeadlessCoreBridgeImpl() }
+        internal var bridgeProvider: () -> CoreBridge = { HeadlessBridgeImpl() }
 
         // Core start must run off the main looper in production (ANR / start-ACK
         // deadlock when the caller blocks the main thread); tests inject an
@@ -51,7 +51,7 @@ class LifecycleService : Service() {
         internal var coreStartExecutor: (String, () -> Unit) -> Unit = DEFAULT_CORE_START_EXECUTOR
 
         // Core stop must run off the main looper too (BGS-20, doc-08 Step 11):
-        // ACTION_STOP → bridge.stop → HeadlessCoreBridge.stop → lib.rs block_on(
+        // ACTION_STOP → bridge.stop → HeadlessBridge.stop → lib.rs block_on(
         // stop_headless_core) does a storage flush + network teardown that ANRs
         // if it runs inline on the main thread while the user taps Stop from the
         // notification. Mirrors the start path's coreStartExecutor discipline;
@@ -133,7 +133,7 @@ class LifecycleService : Service() {
             // survives webview absence or callback failures.
             DurableState.save(this, buildStopState(DurableState.load(this)))
             // Run the Rust core stop OFF the main thread. The JNI hop
-            // (bridge.stop → HeadlessCoreBridge.stop → lib.rs block_on(
+            // (bridge.stop → HeadlessBridge.stop → lib.rs block_on(
             // stop_headless_core)) does a storage flush + network teardown that
             // ANRs if it runs inline on the main looper while the user taps
             // Stop from the notification (BGS-20, doc-08 Step 11). Fire-and-
@@ -141,7 +141,7 @@ class LifecycleService : Service() {
             // coreStartExecutor discipline; the cheap main-thread teardown
             // below (event emit, prefs edit, stopForeground, stopSelf) runs
             // immediately and does not block onStartCommand's return on the stop.
-            coreStopExecutor("sila-core-stop") {
+            coreStopExecutor("bg-core-stop") {
                 bridge.stop(this, "android_service_stop")
             }
             // Notify Rust actor that the user pressed stop on the notification.
@@ -223,7 +223,7 @@ class LifecycleService : Service() {
         // the caller is itself blocking the main thread (e.g. Tauri setup).
         // The ACK registry supports asynchronous completion.
         Log.i("LifecycleService", "Scheduling bridge.start(reason=$startReason) on worker thread")
-        coreStartExecutor("sila-core-start") {
+        coreStartExecutor("bg-core-start") {
             val coreResult = bridge.start(this, startReason)
             Log.i("LifecycleService", "bridge.start result: accepted=${coreResult.accepted}, json=${coreResult.rawJson}")
             if (!coreResult.accepted) {
@@ -355,7 +355,7 @@ class LifecycleService : Service() {
         isForeground = true
 
         // Core start off the main thread (see onStartCommand normal-start path).
-        coreStartExecutor("sila-core-restart") {
+        coreStartExecutor("bg-core-restart") {
             val coreResult = bridge.start(this, "sticky_restart")
             if (!coreResult.accepted) {
                 isForeground = false

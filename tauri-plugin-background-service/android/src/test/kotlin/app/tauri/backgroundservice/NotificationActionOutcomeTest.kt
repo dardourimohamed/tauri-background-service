@@ -9,7 +9,7 @@ import org.junit.Test
  * Robolectric, no JNI, no Android (OOM-safe; runnable under fleet collapse).
  *
  * Pins the recoverable/permanent discriminator + the anti-loop gate (the Kotlin
- * HeadlessCoreResult.failure() synthetics hardcode recoverable=true for PERMANENT
+ * HeadlessBridgeResult.failure() synthetics hardcode recoverable=true for PERMANENT
  * pre-JNI env failures — re-presenting on the naive "recoverable==true" rule
  * alone LOOPS FOREVER; `code` present in rawJson <=> synthetic <=> PERMANENT) +
  * replyText preservation at the decision layer (AC3 layer 1; the notification
@@ -21,7 +21,7 @@ class NotificationActionOutcomeTest {
 
     @Test
     fun success_cancels() {
-        val result = HeadlessCoreResult(
+        val result = HeadlessBridgeResult(
             ok = true,
             state = "running",
             message = null,
@@ -37,7 +37,7 @@ class NotificationActionOutcomeTest {
     @Test
     fun rustPermanent_notRecoverable_cancels() {
         // Mirrors headless_core.rs:313 empty-reply verdict: recoverable == false.
-        val result = HeadlessCoreResult(
+        val result = HeadlessBridgeResult(
             ok = false,
             state = "failed",
             message = "empty notification reply",
@@ -54,7 +54,7 @@ class NotificationActionOutcomeTest {
     fun rustRecoverable_noCode_rePresentsPreservingReplyText() {
         // Mirrors headless_core.rs:292/:301 "core not running" verdict:
         // recoverable == true, NO `code` field (Rust never emits one).
-        val result = HeadlessCoreResult(
+        val result = HeadlessBridgeResult(
             ok = false,
             state = "failed",
             message = "core not running; cannot dispatch notification action",
@@ -93,7 +93,7 @@ class NotificationActionOutcomeTest {
     }
 
     /**
-     * Mirrors the exact HeadlessCoreResult HeadlessCoreBridge.failure() emits for
+     * Mirrors the exact HeadlessBridgeResult HeadlessBridge.failure() emits for
      * a pre-JNI permanent env failure (ok=false, recoverable=true, rawJson carries
      * the `"code":` key). Built via the public constructor (NOT failure()) so this
      * stays a PURE JVM test — failure() builds its rawJson through org.json's
@@ -102,8 +102,8 @@ class NotificationActionOutcomeTest {
      * failure()-emitted shape itself is exercised under Robolectric in
      * NotificationActionRePresentTest.permanentSyntheticCode_cancels_antiLoop.
      */
-    private fun syntheticPermanent(code: String, message: String): HeadlessCoreResult =
-        HeadlessCoreResult(
+    private fun syntheticPermanent(code: String, message: String): HeadlessBridgeResult =
+        HeadlessBridgeResult(
             ok = false,
             state = "failed",
             message = message,
