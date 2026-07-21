@@ -63,7 +63,13 @@ pub(crate) fn stable_notification_id(id: &str) -> i32 {
         hash ^= u32::from(*byte);
         hash = hash.wrapping_mul(0x0100_0193);
     }
-    hash as i32
+    // Mask into `[1, i32::MAX]`. The FNV-1a `u32` space is roughly half
+    // negative when narrowed via `as i32`, which collides with platform
+    // conventions (Android `NotificationManager` ids are non-negative and
+    // 0 is treated as "no id" by some surfaces). Masking the sign bit and
+    // setting the low bit keeps the id positive, nonzero, and still
+    // deterministic.
+    ((hash & 0x7FFF_FFFF) as i32) | 1
 }
 
 /// Which plugin-side lifecycle notifications are enabled (spec 01 D1).
@@ -117,6 +123,7 @@ impl<R: Runtime> NotifySink for Notifier<R> {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::models::PluginConfig;
@@ -136,12 +143,6 @@ mod tests {
         n.show_with_id("bg-timeout", "title", "body");
     }
 
-    /// Compile-time test: Notifier is usable as a NotifySink trait object.
-    #[allow(dead_code)]
-    fn notifier_is_notify_sink<R: Runtime>(n: Notifier<R>) -> std::sync::Arc<dyn NotifySink> {
-        std::sync::Arc::new(n)
-    }
-
     #[test]
     fn stable_notification_id_is_deterministic() {
         assert_eq!(
@@ -152,6 +153,44 @@ mod tests {
             stable_notification_id("bg-timeout"),
             stable_notification_id("bg-recovery")
         );
+    }
+
+    // CORE-06: stable ids must be non-negative and nonzero across a broad
+    // sample of inputs (the previous `u32 as i32` cast produced negative ids
+    // for ~50% of inputs).
+    #[test]
+    fn stable_notification_id_is_always_positive_and_nonzero() {
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..1024u32 {
+            let key = format!("bg-key-{i}");
+            let id = stable_notification_id(&key);
+            assert!(id > 0, "id for {key} must be positive, got {id}");
+            // Determinism: same input still maps to a single id.
+            assert_eq!(id, stable_notification_id(&key));
+            seen.insert(id);
+        }
+        // Separation: 1024 distinct inputs must produce many distinct ids.
+        assert!(
+            seen.len() > 900,
+            "expected wide separation, got {} distinct ids",
+            seen.len()
+        );
+    }
+
+    /// Regression guard for the specific representative ids cited in CORE-06.
+    /// Pins the exact masked values so future changes to the hash surface
+    /// intentionally. Values computed from FNV-1a 32-bit.
+    #[test]
+    fn stable_notification_id_representative_values_are_pinned() {
+        // FNV-1a("bg-timeout")      = 0x4E26122C → masked = 0x4E26122D.
+        // FNV-1a("bg-recovery")     = 0xBD4CC8B2 → masked = 0x3D4CC8B3.
+        assert_eq!(stable_notification_id("bg-timeout"), 0x4E26_122D);
+        assert_eq!(stable_notification_id("bg-recovery"), 0x3D4C_C8B3);
+        // Both representative ids must be strictly positive and distinct.
+        let a = stable_notification_id("bg-timeout");
+        let b = stable_notification_id("bg-recovery");
+        assert!(a > 0 && b > 0);
+        assert_ne!(a, b);
     }
 
     // ── NotifierPolicy::derive — DEC-002 suppression matrix ──────────

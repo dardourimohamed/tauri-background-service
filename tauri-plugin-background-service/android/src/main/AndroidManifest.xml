@@ -15,8 +15,18 @@
     <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- POST_NOTIFICATIONS: the foreground service's persistent notification
+         must be allowed to post (Android 13+); the FGS itself is exempt, but
+         user-facing notifications (recovery, timeout, message, ring) are not. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- AND-09: REQUEST_IGNORE_BATTERY_OPTIMIZATIONS is intentionally NOT
+         declared by this library. It is Play-policy-restricted, so it must be
+         opted in by the HOST application in its own manifest. The Tauri
+         `requestBatteryExemption` command still launches the system
+         ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS dialog; the host-declared
+         permission is what authorizes that dialog (without it the dialog throws
+         SecurityException at runtime). See docs/android.md
+         "Battery optimization exemption". -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application>

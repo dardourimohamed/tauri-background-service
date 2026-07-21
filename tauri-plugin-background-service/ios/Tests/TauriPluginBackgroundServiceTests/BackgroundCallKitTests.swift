@@ -10,48 +10,6 @@ import AVFoundation
 /// (`BackgroundCallKitController`) is exercised on-device in the verify-calls runbook (Step 20).
 final class BackgroundCallKitTests: XCTestCase {
 
-    // MARK: - F3 degraded-mode decision
-
-    func testDeliveryAction_foregroundRings() {
-        XCTAssertEqual(
-            BackgroundCallDecision.deliveryAction(appState: .foreground, offerHasVideo: false),
-            .ring(hasVideo: false)
-        )
-        XCTAssertEqual(
-            BackgroundCallDecision.deliveryAction(appState: .foreground, offerHasVideo: true),
-            .ring(hasVideo: true)
-        )
-    }
-
-    func testDeliveryAction_backgroundActiveRings() {
-        XCTAssertEqual(
-            BackgroundCallDecision.deliveryAction(appState: .backgroundActive, offerHasVideo: true),
-            .ring(hasVideo: true)
-        )
-    }
-
-    func testDeliveryAction_suspendedDefersToControlOutbox() {
-        // F3(c): a suspended app cannot ring; the caller gets Unreachable (T1) + a
-        // missed-call control-outbox record. The hasVideo flag is irrelevant here.
-        XCTAssertEqual(
-            BackgroundCallDecision.deliveryAction(appState: .suspended, offerHasVideo: false),
-            .deferToControlOutbox
-        )
-        XCTAssertEqual(
-            BackgroundCallDecision.deliveryAction(appState: .suspended, offerHasVideo: true),
-            .deferToControlOutbox
-        )
-    }
-
-    func testDeliveryAction_videoFlagRoundTripsIntoRing() {
-        // The has-video flag must propagate into the ring action (drives the CXCallUpdate
-        // + audio-session routing). Probe: it is never dropped.
-        for hasVideo in [false, true] {
-            let action = BackgroundCallDecision.deliveryAction(appState: .foreground, offerHasVideo: hasVideo)
-            XCTAssertEqual(action, .ring(hasVideo: hasVideo))
-        }
-    }
-
     // MARK: - Audio-session configuration
 
     func testAudioConfig_audioCallUsesVoiceChatNoSpeaker() {

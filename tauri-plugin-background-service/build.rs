@@ -11,6 +11,7 @@ const COMMANDS: &[&str] = &[
     "enable_auto_restart",
     "disable_auto_restart",
     "get_desired_service_state",
+    "get_desired_state_status",
     "native_lifecycle_event",
     "validate_setup",
     "get_lifecycle_status",

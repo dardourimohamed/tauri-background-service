@@ -1,6 +1,6 @@
 # Desktop Platform Guide
 
-This guide covers desktop-specific behavior for the background service plugin (Linux, macOS, Windows).
+This guide covers desktop-specific behavior for the background service plugin (Linux, macOS, Windows). The OS-service daemon mode is **Unix-only** (Linux systemd user service, macOS launchd agent); Windows is supported in-process only.
 
 ## In-Process Mode (Default)
 
@@ -132,10 +132,14 @@ Enable the `desktop-service` feature in your app's `Cargo.toml`:
 
 ```toml
 [dependencies]
-tauri-plugin-background-service = { version = "0.7", features = ["desktop-service"] }
+tauri-plugin-background-service = { version = "1.0", features = ["desktop-service"] }
 ```
 
-This pulls in the `service-manager` crate and adds two additional Tauri commands: `install_service` and `uninstall_service`.
+This pulls in the `service-manager` crate and adds six Unix OS-service Tauri
+commands (`install_service`, `uninstall_service`, `start_os_service`,
+`stop_os_service`, `restart_os_service`, `get_os_service_status`). Windows
+remains in-process; the OS-service commands return an unsupported-platform
+error there.
 
 ### Configuration
 
@@ -232,7 +236,7 @@ In `osService` mode, the plugin uses a **sidecar + IPC** architecture:
 
 ```
 GUI process (Tauri app):
-  → IpcClient connects to Unix socket / Windows named pipe
+  → IpcClient connects to the Unix domain socket
   → Sends IpcRequest (Start/Stop/IsRunning)
   → Receives IpcResponse + IpcEvent
 
@@ -297,7 +301,7 @@ import {
 | `uninstallService()` | Remove the OS-level service. Stops the service if running, then removes the unit/plist file. |
 | `startOsService()` | Start the OS service. On Unix, delegates to the service manager (`systemctl --user start` / `launchctl load`). |
 | `stopOsService()` | Stop the OS service. On Unix, delegates to the service manager (`systemctl --user stop` / `launchctl unload`). |
-| `restartOsService()` | Restart the OS service. Best-effort stop, then start. |
+| `restartOsService()` | Restart the OS service. Stop-then-start: propagates any stop error, waits boundedly for the IPC disconnect / native stopped status, then starts (or returns a timeout). |
 | `getOsServiceStatus()` | Query the current OS service status: label, mode, install state, IPC connection, socket path, and last error. |
 
 #### Usage
@@ -360,7 +364,7 @@ type OsServiceInstallState = 'notInstalled' | 'installed' | 'running';
 |----------|----------------|-----------|-------|
 | Linux | systemd (user unit) | Yes | Requires `loginctl enable-linger` for services to survive logout. |
 | macOS | launchd (user agent) | Yes | Incompatible with App Sandbox. |
-| Windows | — | **No** | Returns `ServiceError::Platform("Windows OS-service mode is not yet supported")`. Use in-process mode on Windows. |
+| Windows | — | **No (in-process only)** | OS-service daemon support was removed; the six OS-service commands return an unsupported-platform error. Use in-process mode on Windows. |
 
 ### Permissions
 
@@ -387,15 +391,18 @@ Add the desktop service permissions to your capabilities:
 |----------|----------------|-------------|
 | Linux | systemd (user unit) | `$XDG_RUNTIME_DIR/{label}.sock` |
 | macOS | launchd (user agent) | `/tmp/{label}.sock` |
-| Windows | Windows Service | `\\.\pipe\{label}` |
+
+> Windows has no OS-service socket — it is in-process only.
 
 ## IPC Transport Layer
 
-In `osService` mode, the GUI process communicates with the sidecar via an IPC transport layer using length-prefixed JSON frames over Unix sockets (Linux/macOS) or Windows named pipes.
+In `osService` mode, the GUI process communicates with the sidecar via an IPC
+transport layer using length-prefixed JSON frames over a **Unix domain socket**
+(Linux/macOS). There is no Windows transport — Windows is in-process only.
 
 ### Protocol
 
-- **Framing:** Length-prefixed JSON frames (4-byte little-endian length prefix + JSON payload)
+- **Framing:** Length-prefixed JSON frames (**4-byte big-endian** `u32` length prefix + JSON payload)
 - **Max frame size:** 16 MB
 - **Encoding:** UTF-8 JSON
 
@@ -409,4 +416,14 @@ In `osService` mode, the GUI process communicates with the sidecar via an IPC tr
 
 ### Persistent Client
 
-The IPC client maintains a persistent connection with exponential backoff reconnect. If the sidecar is temporarily unavailable, the client retries automatically without dropping pending requests.
+The IPC client maintains a persistent connection with reconnect backoff (via
+the `backon` crate). Reconnect is **bounded** — there is no infinite backoff,
+and pending requests are subject to a timeout rather than queuing forever. The
+local `desired_running` mirror is updated only on successful `Start`/`Stop`
+replies, so a disconnect after a successful start surfaces as `recoveryPending`
+and a disconnect after a successful stop surfaces as `stopped`.
+
+> **No daemon notification sink.** The headless sidecar does not post user
+> notifications itself. Notifications route through `tauri-plugin-notification`
+> in the GUI process (the `Notifier` is only wired in the app process); the
+> daemon side has no notification surface.

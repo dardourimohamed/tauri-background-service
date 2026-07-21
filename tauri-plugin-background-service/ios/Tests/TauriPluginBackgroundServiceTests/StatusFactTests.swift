@@ -14,6 +14,7 @@ final class StatusFactTests: XCTestCase {
 
     private var plugin: BackgroundServicePlugin!
     private var scheduler: FakeBGTaskScheduler!
+    private var suite: UserDefaults!
 
     private let outcomeKey = "ios_last_task_outcome"
     private let completionReasonKey = "ios_last_completion_reason"
@@ -23,28 +24,18 @@ final class StatusFactTests: XCTestCase {
         plugin = BackgroundServicePlugin()
         scheduler = FakeBGTaskScheduler()
         plugin.scheduler = scheduler
-        clearKeys()
+        // IOS-CLEAN-01: isolated suite so this class cannot leak state.
+        suite = TestDefaults.makeIsolatedSuite()
+        plugin.defaults = suite
+        TestDefaults.clearAll(on: suite)
     }
 
     override func tearDown() {
-        clearKeys()
+        TestDefaults.clearAll(on: suite)
         plugin = nil
         scheduler = nil
+        suite = nil
         super.tearDown()
-    }
-
-    private func clearKeys() {
-        let d = UserDefaults.standard
-        for key in [
-            "ios_desired_running", "ios_last_schedule_error", "ios_last_start_config",
-            "ios_last_task_kind", "ios_last_task_started_at", "ios_last_task_completed_at",
-            "ios_last_refresh_scheduled", "ios_last_processing_scheduled",
-            "ios_last_refresh_error", "ios_last_processing_error",
-            "ios_last_task_outcome", "ios_last_completion_reason",
-            "ios_adaptive_processing_begin_minutes",
-        ] {
-            d.removeObject(forKey: key)
-        }
     }
 
     // MARK: - M7 (req 3): persistTaskOutcome writes a durable reason too
@@ -52,7 +43,7 @@ final class StatusFactTests: XCTestCase {
     func testPersistTaskOutcome_writesBothConsumableOutcomeAndDurableReason() {
         plugin.persistTaskOutcome("expired")
 
-        let d = UserDefaults.standard
+        let d = suite
         XCTAssertEqual(d.string(forKey: outcomeKey), "expired",
                        "the consumable adaptation outcome is written")
         XCTAssertEqual(d.string(forKey: completionReasonKey), "expired",
@@ -65,11 +56,11 @@ final class StatusFactTests: XCTestCase {
         // A task just ended naturally: both keys carry "completed".
         plugin.persistTaskOutcome("completed")
         // Desired-running so a background transition reschedules (runs scheduleNext).
-        UserDefaults.standard.set(true, forKey: "ios_desired_running")
+        suite.set(true, forKey: "ios_desired_running")
 
         plugin.appDidEnterBackground()
 
-        let d = UserDefaults.standard
+        let d = suite
         XCTAssertNil(d.string(forKey: outcomeKey),
                      "scheduleNext() consumes the one-shot adaptation outcome")
         XCTAssertEqual(d.string(forKey: completionReasonKey), "completed",
@@ -104,7 +95,7 @@ final class StatusFactTests: XCTestCase {
     // MARK: - M7 (req 2): split scheduling errors are reported per task type
 
     func testGetSchedulingStatus_reportsRefreshAndProcessingErrorsIndependently() {
-        UserDefaults.standard.set(true, forKey: "ios_desired_running")
+        suite.set(true, forKey: "ios_desired_running")
         // Fail only the processing identifier; refresh succeeds.
         scheduler.shouldFailSubmit = { $0.identifier.hasSuffix(".bg-processing") }
 

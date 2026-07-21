@@ -2,6 +2,57 @@
 
 Complete reference for the Rust and TypeScript APIs provided by `tauri-plugin-background-service`.
 
+## Current TypeScript exports
+
+The TypeScript API is the single source of truth in
+`guest-js/index.ts`. Every export below is documented in the
+[TypeScript API](#typescript-api) section.
+
+**Functions**
+
+| Function | Returns | Notes |
+|----------|---------|-------|
+| `startService(config?)` | `Promise<void>` | Start the service actor. |
+| `stopService()` | `Promise<void>` | Cooperative stop. |
+| `isServiceRunning()` | `Promise<boolean>` | Quick running check. |
+| `getLifecycleStatus()` | `Promise<LifecycleStatus>` | Full status snapshot (preferred). |
+| `configureRecovery(options)` | `Promise<void>` | `{ enabled, config? }` — persisted recovery intent. |
+| `getServiceState()` | `Promise<ServiceStatus>` | **Deprecated** — use `getLifecycleStatus()`. |
+| `getPlatformCapabilities()` | `Promise<PlatformCapabilities>` | Honest per-platform capabilities. |
+| `getSchedulingStatus()` | `Promise<IOSSchedulingStatus>` | iOS scheduling submit-result. |
+| `getDesiredStateStatus()` | `Promise<IOSDesiredStateStatus>` | iOS persisted desired-state. |
+| `getPendingBgTask()` | `Promise<PendingTaskInfo \| null>` | iOS pending BGTask info. |
+| `onPluginEvent(handler)` | `Promise<UnlistenFn>` | Built-in lifecycle events. |
+| `startNativeLifecycleBridge()` | `Promise<UnlistenFn>` | Forward Android native lifecycle events. |
+| `onPlatformError(handler)` | `Promise<UnlistenFn>` | Subscribe to native platform errors. |
+| `startNativeCallActionBridge(handler)` | `Promise<UnlistenFn>` | Bridge iOS CallKit actions. |
+| `getNotificationPermissionStatus()` | `Promise<NotificationPermissionStatus>` | Android notification permission. |
+| `requestNotificationPermission()` | `Promise<NotificationPermissionStatus>` | Android `POST_NOTIFICATIONS` prompt. |
+| `requestBatteryExemption()` | `Promise<void>` | Android Doze exemption dialog. |
+| `canUseFullScreenIntent()` | `Promise<{ canUse: boolean }>` | Android full-screen-intent grant. |
+| `openFullScreenIntentSettings()` | `Promise<void>` | Open FSI re-grant settings. |
+| `installService()` | `Promise<void>` | Desktop OS-service (Unix). |
+| `uninstallService()` | `Promise<void>` | Desktop OS-service (Unix). |
+| `startOsService()` | `Promise<void>` | Desktop OS-service (Unix). |
+| `stopOsService()` | `Promise<void>` | Desktop OS-service (Unix). |
+| `restartOsService()` | `Promise<void>` | Desktop OS-service (Unix). |
+| `getOsServiceStatus()` | `Promise<OsServiceStatus>` | Desktop OS-service status. |
+| `enableAutoRestart(config?)` | `Promise<void>` | **Deprecated** — use `configureRecovery({ enabled: true, config })`. |
+| `disableAutoRestart()` | `Promise<void>` | **Deprecated** — use `configureRecovery({ enabled: false })`. |
+| `getDesiredServiceState()` | `Promise<DesiredServiceState \| null>` | **Deprecated** — use `getLifecycleStatus()`. |
+| `validateBackgroundServiceSetup()` | `Promise<SetupValidationReport>` | Platform setup validation. |
+| `normalizeBackgroundServiceError(error)` | `BackgroundServiceError` | Opt-in typed-error helper (sync). |
+
+**Types**
+
+`Platform`, `LifecycleMode`, `LifecycleGuarantee`, `PlatformCapabilities`,
+`StartConfig`, `ServiceState`, `LifecycleState`, `Severity`, `ValidationIssue`,
+`StopReason`, `LifecycleStatus`, `ServiceStatus`, `PluginEvent`,
+`IOSSchedulingStatus`, `IOSDesiredStateStatus`, `PendingTaskInfo`,
+`NotificationPermissionStatus`, `NativeCallActionKind`, `NativeCallAction`,
+`OsServiceInstallState`, `OsServiceStatus`, `DesiredServiceState`, `SetupIssue`,
+`SetupValidationReport`, `BackgroundServiceErrorCode`, `BackgroundServiceError`.
+
 ---
 
 ## Rust API
@@ -90,7 +141,7 @@ pub struct ServiceContext<R: Runtime> {
 | `app` | `tauri::AppHandle<R>` | All | Emit events to the JS UI layer, access managed state. |
 | `shutdown` | `CancellationToken` | All | Cancelled when `stopService()` is called. Always use in `tokio::select!` within `run()`. |
 | `service_label` | `String` | Mobile only | Text shown in the Android persistent notification. Uses the `StartConfig` default (`"Service running"`) if not overridden. |
-| `foreground_service_type` | `String` | Mobile only | Android foreground service type (e.g. `"dataSync"`, `"specialUse"`). Uses the `StartConfig` default (`"dataSync"`) if not overridden. |
+| `foreground_service_type` | `String` | Mobile only | Android foreground service type (e.g. `"remoteMessaging"`, `"specialUse"`). Uses the `StartConfig` default (`"remoteMessaging"`) if not overridden. |
 
 > **Platform behavior:** `service_label` and `foreground_service_type` are `String` (not `Option<String>`) and only available on mobile platforms, guarded by `#[cfg(mobile)]`. They always contain a value because `StartConfig` provides defaults.
 
@@ -114,7 +165,7 @@ pub struct StartConfig {
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `service_label` | `String` | Optional | `"Service running"` | Text shown in the Android persistent foreground notification. Ignored on desktop. |
-| `foreground_service_type` | `String` | Optional | `"dataSync"` | Android foreground service type. Valid values: `"dataSync"`, `"mediaPlayback"`, `"phoneCall"`, `"location"`, `"connectedDevice"`, `"mediaProjection"`, `"camera"`, `"microphone"`, `"health"`, `"remoteMessaging"`, `"systemExempted"`, `"shortService"`, `"specialUse"`, `"mediaProcessing"`. Ignored on non-Android platforms. |
+| `foreground_service_type` | `String` | Optional | `"remoteMessaging"` | Android foreground service type. Valid values: `"remoteMessaging"`, `"dataSync"`, `"mediaPlayback"`, `"phoneCall"`, `"location"`, `"connectedDevice"`, `"mediaProjection"`, `"camera"`, `"microphone"`, `"health"`, `"systemExempted"`, `"shortService"`, `"specialUse"`, `"mediaProcessing"`. Ignored on non-Android platforms. |
 
 #### JSON format
 
@@ -144,6 +195,8 @@ pub struct PluginConfig {
     pub ios_earliest_processing_begin_minutes: f64,
     pub ios_requires_external_power: bool,
     pub ios_requires_network_connectivity: bool,
+    pub ios_processing_ceiling_multiplier: f64,
+    pub channel_capacity: usize,
     pub android_foreground_service_types: Vec<String>,
     pub android_validate_foreground_service_type: bool,
     pub android_on_timeout: String,
@@ -153,9 +206,14 @@ pub struct PluginConfig {
     pub android_notification_small_icon: Option<String>,
     pub android_show_stop_action: bool,
     pub android_request_notification_permission_on_load: bool,
+    pub notify_on_timeout: bool,
+    pub notify_on_recovery: bool,
     // Behind #[cfg(feature = "desktop-service")]:
     // pub desktop_service_mode: String,
     // pub desktop_service_label: Option<String>,
+    // pub desktop_service_autostart: bool,
+    // pub desktop_start_service_if_missing: bool,
+    // pub desktop_service_start_timeout_ms: u64,
 }
 ```
 
@@ -170,20 +228,24 @@ pub struct PluginConfig {
 | `ios_earliest_processing_begin_minutes` | `f64` | Optional | `15.0` | Minimum delay (in minutes) before iOS schedules a `BGProcessingTask`. iOS only. |
 | `ios_requires_external_power` | `bool` | Optional | `false` | Whether `BGProcessingTask` requires the device to be charging. iOS only. |
 | `ios_requires_network_connectivity` | `bool` | Optional | `false` | Whether `BGProcessingTask` requires network connectivity. iOS only. |
-| `android_foreground_service_types` | `string[]` | Optional | `["dataSync"]` | List of Android foreground service types allowed for `startService()`. The Kotlin preflight validation rejects any type not in this list when `android_validate_foreground_service_type` is `true`. Android only. |
+| `ios_processing_ceiling_multiplier` | `f64` | Optional | `4.0` | iOS adaptive `BGProcessingTask` scheduling ceiling, as a multiplier of `iosEarliestProcessingBeginMinutes`. The Swift adaptive scheduler backs off the request's earliest begin date after expired runs, never beyond `configured * multiplier`. iOS only. |
+| `channel_capacity` | `usize` | Optional | `16` | Capacity for the manager command channel (`mpsc`). A `0` value is rejected by `PluginConfig::validate` (CORE-03) — `mpsc::channel(0)` panics. Increase for high-throughput scenarios with many concurrent start/stop/is-running calls. |
+| `android_foreground_service_types` | `string[]` | Optional | `["remoteMessaging"]` | List of Android foreground service types allowed for `startService()`. The default `["remoteMessaging"]` is the Play-policy-safe choice for a long-lived keepalive; `dataSync` is subject to a 6-hour cumulative timeout on API 34+. The Kotlin preflight validation rejects any type not in this list when `android_validate_foreground_service_type` is `true` (AND-01). Android only. |
 | `android_validate_foreground_service_type` | `bool` | Optional | `true` | Whether to validate the requested foreground service type against `android_foreground_service_types` before starting the native service. Set to `false` to skip the allowlist check. Android only. |
 | `android_on_timeout` | `string` | Optional | `"notifyUser"` | Timeout policy when Android calls `onTimeout()`. Valid values: `"stop"` (clean stop), `"notifyUser"` (stop + timeout notification), `"scheduleRecovery"` (stop + recovery pending + recovery notification). Android only. |
-| `android_notification_channel_id` | `string` | Optional | `"bg_service"` | Notification channel ID for the foreground service notification. The channel is created automatically. Android only. |
-| `android_notification_channel_name` | `string` | Optional | `"Background Service"` | Notification channel name visible to the user in system settings. Android only. |
-| `android_notification_id` | `number` | Optional | `9001` | Notification ID for the foreground service notification. Must be unique within your app. Android only. |
+| `android_notification_channel_id` | `string` | Optional | `"bg_service"` | Notification channel ID for the foreground service notification. The channel is created automatically. Must be non-empty (`PluginConfig::validate` rejects empty). Android only. |
+| `android_notification_channel_name` | `string` | Optional | `"Background Service"` | Notification channel name visible to the user in system settings. Must be non-empty. Android only. |
+| `android_notification_id` | `number` | Optional | `9001` | Notification ID for the foreground service notification. Must be in `1..=i32::MAX` (`PluginConfig::validate` rejects 0 and out-of-range values; CORE-03). Android only. |
 | `android_notification_small_icon` | `string?` | Optional | `null` (system default) | Custom small icon resource name (without extension). The resource must exist in `res/drawable/`. Falls back to the system sync icon if not found. Android only. |
 | `android_show_stop_action` | `boolean` | Optional | `true` | Whether to show a "Stop" action button on the foreground notification. Android only. |
-| `android_request_notification_permission_on_load` | `boolean` | Optional | `true` | Whether to automatically request the `POST_NOTIFICATIONS` runtime permission when the plugin loads. Set to `false` if your app handles permission requests manually. Android only. |
-| `desktop_service_mode` | `String` | Optional | `"inProcess"` | Desktop service mode: `"inProcess"` (default) or `"osService"`. Desktop only, requires `desktop-service` feature. |
+| `android_request_notification_permission_on_load` | `boolean` | Optional | `false` | Whether to automatically request the `POST_NOTIFICATIONS` runtime permission when the plugin loads. Defaults to `false` (NTF-09): the request is consented via an explainer rather than fired unconditionally on load. Android only. |
+| `notify_on_timeout` | `bool` | Optional | `false` | Post a local notification when the OS pauses background delivery (platform timeout/expiration). Opt-in. |
+| `notify_on_recovery` | `bool` | Optional | `false` | Post a local notification when background delivery is restored after an OS restart or boot recovery. Opt-in. Always suppressed on Android (DEC-002). |
+| `desktop_service_mode` | `String` | Optional | `"inProcess"` | Desktop service mode: `"inProcess"` (default) or `"osService"`. `"osService"` requires the `desktop-service` Cargo feature and is Unix-only (Linux systemd user service, macOS launchd agent); Windows is supported in-process only (DESK-01). Desktop only. |
 | `desktop_service_label` | `Option<String>` | Optional | Auto-derived | Custom label for the OS service. Desktop only, requires `desktop-service` feature. |
 | `desktop_service_autostart` | `boolean` | Optional | `false` | Whether the OS service starts automatically on boot (Linux) or login (macOS). Only applies when `desktopServiceMode` is `"osService"`. Desktop only, requires `desktop-service` feature. |
 | `desktop_start_service_if_missing` | `boolean` | Optional | `false` | When `true`, calling `startService()` automatically starts the OS service sidecar if the IPC connection is not available. Only applies when `desktopServiceMode` is `"osService"`. Desktop only, requires `desktop-service` feature. |
-| `desktop_service_start_timeout_ms` | `number` | Optional | `5000` | Timeout in milliseconds to wait for the IPC connection after starting the OS service sidecar. Only applies when `desktopStartServiceIfMissing` is `true`. Desktop only, requires `desktop-service` feature. |
+| `desktop_service_start_timeout_ms` | `number` | Optional | `5000` | Timeout in milliseconds to wait for the IPC connection after starting the OS service sidecar. Must be > 0 (`PluginConfig::validate` rejects 0; CORE-03). Only applies when `desktopStartServiceIfMissing` is `true`. Desktop only, requires `desktop-service` feature. |
 
 #### Configuration example
 
@@ -198,7 +260,7 @@ pub struct PluginConfig {
       "iosEarliestProcessingBeginMinutes": 30.0,
       "iosRequiresExternalPower": true,
       "iosRequiresNetworkConnectivity": false,
-      "androidForegroundServiceTypes": ["dataSync"],
+      "androidForegroundServiceTypes": ["remoteMessaging", "dataSync"],
       "androidValidateForegroundServiceType": true,
       "androidOnTimeout": "notifyUser",
       "androidNotificationChannelId": "my_service_channel",
@@ -206,7 +268,7 @@ pub struct PluginConfig {
       "androidNotificationId": 9100,
       "androidNotificationSmallIcon": "ic_notification",
       "androidShowStopAction": true,
-      "androidRequestNotificationPermissionOnLoad": true,
+      "androidRequestNotificationPermissionOnLoad": false,
       "desktopServiceMode": "osService",
       "desktopServiceLabel": "com.example.myapp.background",
       "desktopServiceAutostart": true,
@@ -703,38 +765,6 @@ tauri::Builder::default()
 
 ---
 
-### `AutoStartConfig`
-
-Platform-specific type used for Android auto-start. Deserialized from SharedPreferences values read by the Kotlin `getAutoStartConfig` bridge. Only used on Android.
-
-```rust
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AutoStartConfig {
-    pub pending: bool,
-    pub label: Option<String>,
-    pub service_type: Option<String>,
-}
-```
-
-#### Fields
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `pending` | `bool` | Whether an auto-start is pending (set by `LifecycleService` after `START_STICKY` restart). |
-| `label` | `Option<String>` | Service label from the original `StartConfig`. |
-| `service_type` | `Option<String>` | Foreground service type from the original `StartConfig`. |
-
-#### Methods
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `into_start_config(self)` | `Option<StartConfig>` | Converts to `StartConfig` if `pending` is `true` and `label` is `Some`. Returns `None` otherwise. |
-
-> This type is rarely used directly — the plugin handles auto-start detection internally during setup on Android.
-
----
-
 ## TypeScript API
 
 Import from `tauri-plugin-background-service`:
@@ -747,13 +777,30 @@ import {
   getServiceState,
   getPlatformCapabilities,
   getSchedulingStatus,
+  getDesiredStateStatus,
+  getPendingBgTask,
   onPluginEvent,
+  startNativeLifecycleBridge,
+  onPlatformError,
+  startNativeCallActionBridge,
+  getNotificationPermissionStatus,
+  requestNotificationPermission,
+  requestBatteryExemption,
+  canUseFullScreenIntent,
+  openFullScreenIntentSettings,
   installService,
   uninstallService,
   startOsService,
   stopOsService,
   restartOsService,
   getOsServiceStatus,
+  enableAutoRestart,
+  disableAutoRestart,
+  getDesiredServiceState,
+  getLifecycleStatus,
+  configureRecovery,
+  validateBackgroundServiceSetup,
+  normalizeBackgroundServiceError,
   type StartConfig,
   type ServiceState,
   type ServiceStatus,
@@ -763,20 +810,18 @@ import {
   type LifecycleGuarantee,
   type PlatformCapabilities,
   type IOSSchedulingStatus,
+  type IOSDesiredStateStatus,
+  type PendingTaskInfo,
+  type NotificationPermissionStatus,
+  type NativeCallActionKind,
+  type NativeCallAction,
   type OsServiceStatus,
   type OsServiceInstallState,
-  enableAutoRestart,
-  disableAutoRestart,
-  getDesiredServiceState,
   type DesiredServiceState,
-  validateBackgroundServiceSetup,
   type SetupValidationReport,
   type SetupIssue,
-  normalizeBackgroundServiceError,
   type BackgroundServiceErrorCode,
   type BackgroundServiceError,
-  getLifecycleStatus,
-  configureRecovery,
   type StopReason,
   type LifecycleState,
   type LifecycleStatus,
@@ -1110,9 +1155,80 @@ interface OsServiceStatus {
 | `socketPath` | `string?` | No | Path to the Unix domain socket. Omitted when the socket path cannot be determined. |
 | `lastError` | `string?` | No | Last error message from the OS service, if any. Omitted when no error has occurred. |
 
+## Notification Permission & System Grants (Android)
+
+These commands route to the Kotlin `@Command` methods via the Rust bridge. On
+non-Android targets the Rust command returns a `"granted"` default / no-ops, so
+the UI always gets a usable answer.
+
+### `getNotificationPermissionStatus()`
+
+Query the Android notification-permission status. Returns `"granted"` /
+`"denied"` / `"notDetermined"` on Android (forwarded from the Kotlin
+`getNotificationPermissionStatus` command). Returns `"granted"` elsewhere — iOS
+authorizes at launch via `UNUserNotificationCenter` (not via a plugin command)
+and desktop has no `POST_NOTIFICATIONS` analogue.
+
+```typescript
+async function getNotificationPermissionStatus(): Promise<NotificationPermissionStatus>
+```
+
+### `requestNotificationPermission()`
+
+Request notification permission (Android). Issues the system `POST_NOTIFICATIONS`
+prompt on API 33+ and resolves with the resulting status. No-op below API 33 /
+on non-Android targets (resolves `"granted"`).
+
+```typescript
+async function requestNotificationPermission(): Promise<NotificationPermissionStatus>
+```
+
+### `NotificationPermissionStatus` (TypeScript)
+
+```typescript
+type NotificationPermissionStatus = 'granted' | 'denied' | 'notDetermined';
+```
+
+| Value | Meaning |
+|-------|---------|
+| `'granted'` | Permission granted (or not required on this platform/API level). |
+| `'denied'` | The user explicitly denied `POST_NOTIFICATIONS`. |
+| `'notDetermined'` | The prompt has not yet been shown. |
+
+### `requestBatteryExemption()`
+
+Open the Android battery-optimization (Doze) exemption dialog
+(`ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`). The library manifest does
+**not** declare the `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` permission — the
+host app must opt in (see [Android Guide](./android.md)). No-op on non-Android.
+
+```typescript
+async function requestBatteryExemption(): Promise<void>
+```
+
+### `canUseFullScreenIntent()` / `openFullScreenIntentSettings()`
+
+`canUseFullScreenIntent()` returns whether the app may post a full-screen intent
+(Android). Other platforms return `{ canUse: true }` so the re-grant affordance
+never shows off-Android. `openFullScreenIntentSettings()` opens the OS settings
+page to re-grant `USE_FULL_SCREEN_INTENT`.
+
+```typescript
+async function canUseFullScreenIntent(): Promise<{ canUse: boolean }>
+async function openFullScreenIntentSettings(): Promise<void>
+```
+
+> **Observability note (Android API 29–33):** whether `USE_FULL_SCREEN_INTENT`
+> is granted is not queryable before API 34. The result is optimistic on those
+> levels — see [Android Guide](./android.md).
+
 ---
 
 ### `enableAutoRestart(config?)`
+
+> **Deprecated — kept for backwards compatibility.** Prefer
+> `configureRecovery({ enabled: true, config })`. This wrapper delegates to it
+> and is retained so existing callers keep compiling.
 
 Persist the intent to keep the background service running across process kills and device reboots, **without** starting the service now. This is the recovery-focused counterpart to `startService()`.
 
@@ -1156,6 +1272,10 @@ await enableAutoRestart({ serviceLabel: 'Syncing data' });
 
 ### `disableAutoRestart()`
 
+> **Deprecated — kept for backwards compatibility.** Prefer
+> `configureRecovery({ enabled: false })`. This wrapper delegates to it and is
+> retained so existing callers keep compiling.
+
 Clear the persisted recovery intent. The service **keeps running** if it is currently active — this only affects future recovery attempts.
 
 ```typescript
@@ -1181,6 +1301,10 @@ await disableAutoRestart();
 ---
 
 ### `getDesiredServiceState()`
+
+> **Deprecated — kept for backwards compatibility.** Prefer
+> `getLifecycleStatus()`. This wrapper derives a `DesiredServiceState` from the
+> lifecycle snapshot and is retained so existing callers keep compiling.
 
 Query the persisted desired-state for the background service. Returns recovery intent and metadata, or `null` if no persistence backend is configured on the current platform.
 
@@ -1477,6 +1601,11 @@ interface BackgroundServiceError {
 ### `getServiceState()`
 
 Query the detailed state of the background service, including the lifecycle state, optional last error, and extended status fields.
+
+> **Deprecated — kept for backwards compatibility.** Prefer
+> `getLifecycleStatus()`. This wrapper maps the detailed `LifecycleState` down
+> to the legacy 4-value `ServiceState` and is retained so existing callers keep
+> compiling.
 
 ```typescript
 async function getServiceState(): Promise<ServiceStatus>
@@ -1783,6 +1912,136 @@ interface IOSSchedulingStatus {
 
 > **Note:** When both `refreshScheduled` and `processingScheduled` are `false`, the Swift layer rejects with `"schedulerUnavailable"` instead of returning this object.
 
+### `getDesiredStateStatus()`
+
+Query the iOS persisted *desired-state* status from the native layer. Returns
+the persisted desired state on iOS, or a default (not desired) status on other
+platforms. Mirrors the Rust `IOSDesiredStateStatus` DTO.
+
+```typescript
+async function getDesiredStateStatus(): Promise<IOSDesiredStateStatus>
+```
+
+#### Returns
+
+`Promise<IOSDesiredStateStatus>` — the persisted desired state. All optional
+fields are `undefined` until the corresponding lifecycle event has occurred.
+
+---
+
+### `IOSDesiredStateStatus` (TypeScript)
+
+```typescript
+interface IOSDesiredStateStatus {
+  desiredRunning: boolean;
+  lastStartConfig?: string;
+  lastTaskKind?: string;
+  lastTaskStartedAt?: number;
+  lastTaskCompletedAt?: number;
+  lastScheduleError?: string;
+  lastCompletionReason?: string;
+  notificationGranted?: boolean;
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `desiredRunning` | `boolean` | Whether the user desires the service running (persisted across launches). |
+| `lastStartConfig` | `string?` | JSON-serialized `StartConfig` of the last successful start. |
+| `lastTaskKind` | `string?` | Kind of the most recent BGTask (`"refresh"` or `"processing"`). |
+| `lastTaskStartedAt` | `number?` | Wall-clock seconds when the most recent BGTask started. |
+| `lastTaskCompletedAt` | `number?` | Wall-clock seconds when the most recent BGTask completed. |
+| `lastScheduleError` | `string?` | Last persisted scheduling error. |
+| `lastCompletionReason` | `string?` | Durable reason the last BGTask run ended (`"completed"` or `"expired"`); survives the next reschedule. |
+| `notificationGranted` | `boolean?` | Whether notification authorization was granted on iOS. Absent until first requested. |
+
+---
+
+### `getPendingBgTask()`
+
+Query the pending iOS background task info. Returns task info on iOS if the app
+was launched by iOS for a background task, or `null` on non-iOS platforms / when
+no pending task exists.
+
+```typescript
+async function getPendingBgTask(): Promise<PendingTaskInfo | null>
+```
+
+---
+
+### `PendingTaskInfo` (TypeScript)
+
+```typescript
+interface PendingTaskInfo {
+  taskKind: string;
+  identifier: string;
+  receivedAt: number;
+  consumedAt?: number | null;
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `taskKind` | `string` | The kind of background task (`"refresh"` or `"processing"`). |
+| `identifier` | `string` | The task identifier (e.g. `com.example.app.bg-refresh`). |
+| `receivedAt` | `number` | Epoch timestamp (seconds) when the task was received. |
+| `consumedAt` | `number? \| null` | Epoch timestamp (seconds) when consumed by auto-start, if yet. |
+
+---
+
+## Native Bridges
+
+These helpers forward native-layer (Kotlin/Swift) events into the Rust actor or
+a JS handler. On platforms where the underlying native event does not exist,
+the listener setup fails gracefully and a no-op unlisten is returned.
+
+### `startNativeLifecycleBridge()`
+
+Forward Android native lifecycle events (`native-lifecycle-event`) to the
+`native_lifecycle_event` Rust command so the manager loop can update service
+actor state (notification stop, timeout).
+
+```typescript
+async function startNativeLifecycleBridge(): Promise<UnlistenFn>
+```
+
+### `onPlatformError(handler)`
+
+Subscribe to native platform-error pushes (Android). The native plugin emits
+`platform-error` when a foreground-start fails or an FGS type is rejected,
+carrying a durable platform-error string.
+
+```typescript
+async function onPlatformError(handler: (error: string) => void): Promise<UnlistenFn>
+```
+
+### `startNativeCallActionBridge(handler)`
+
+Bridge native iOS CallKit perform-actions to a handler so the app can drive the
+Rust call control plane. Emits `call_answered` / `call_ended` / `call_rejected`.
+Valid only while the webview is live (foreground / background-active) — a
+suspended app uses the documented missed-call path (no VoIP/PushKit relay).
+
+```typescript
+async function startNativeCallActionBridge(
+  handler: (action: NativeCallAction) => void
+): Promise<UnlistenFn>
+```
+
+### `NativeCallActionKind` / `NativeCallAction` (TypeScript)
+
+```typescript
+type NativeCallActionKind = 'answered' | 'ended' | 'rejected';
+
+interface NativeCallAction {
+  callId: string;   // the original 32-hex Rust call_id for the session
+  kind: NativeCallActionKind;
+}
+```
+
+`ended` is a hang-up of a live call; `rejected` is a decline of a still-ringing
+call.
+
 ---
 
 ### `onPluginEvent(handler)`
@@ -1856,39 +2115,47 @@ console.log(status.platform);           // 'android' | 'ios' | 'linux' | ...
 console.log(status.issues.length);      // number of current validation issues
 ```
 
-> **Note:** This command requires the `allow-get-lifecycle-status` permission (not included in `background-service:default`).
+> **Permission:** `allow-get-lifecycle-status` is included in
+> `background-service:default`, so this command works out of the box.
 
 ---
 
-### `configureRecovery(enabled, config?)`
+### `configureRecovery(options)`
 
-Enable or disable auto-recovery at runtime. When enabled, the service will be automatically restarted after platform-imposed stops (timeouts, expirations). When disabled, the service stops permanently until manually restarted.
+Enable or disable auto-recovery at runtime. When enabled, the plugin persists
+the intent to keep the service running and uses platform-specific recovery
+mechanisms to restart after process kill or device reboot. When disabled, the
+service stops permanently until manually restarted.
 
 ```typescript
-async function configureRecovery(
-  enabled: boolean,
-  config?: StartConfig
-): Promise<void>
+async function configureRecovery(options: {
+  enabled: boolean;
+  config?: StartConfig;
+}): Promise<void>
 ```
 
 #### Parameters
 
+The single argument is an options object (the legacy two-positional-argument
+form was removed in 1.0):
+
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `enabled` | `boolean` | Required | `true` to enable auto-recovery, `false` to disable. |
-| `config` | `StartConfig` | Optional | Configuration to use when the service is automatically restarted. |
+| `options.enabled` | `boolean` | Required | `true` to enable auto-recovery, `false` to disable. |
+| `options.config` | `StartConfig` | Optional | Configuration to persist for recovery restarts. |
 
 #### Example
 
 ```typescript
 // Enable recovery with a specific config
-await configureRecovery(true, { serviceLabel: 'Background Sync' });
+await configureRecovery({ enabled: true, config: { serviceLabel: 'Background Sync' } });
 
 // Disable recovery
-await configureRecovery(false);
+await configureRecovery({ enabled: false });
 ```
 
-> **Note:** This command requires the `allow-configure-recovery` permission (not included in `background-service:default`).
+> **Permission:** `allow-configure-recovery` is included in
+> `background-service:default`, so this command works out of the box.
 
 ---
 
@@ -1906,7 +2173,8 @@ type StopReason =
   | 'osRestart'
   | 'bootRecovery'
   | 'taskCompleted'
-  | 'error';
+  | 'error'
+  | 'processExit';
 ```
 
 | Value | When |
@@ -1920,6 +2188,7 @@ type StopReason =
 | `'bootRecovery'` | Service recovered after device boot. |
 | `'taskCompleted'` | Service `run()` returned naturally. |
 | `'error'` | Service `run()` returned an error. |
+| `'processExit'` | The host process exited while the service was running (desktop/IPC). |
 
 ---
 
@@ -1993,10 +2262,10 @@ interface StartConfig {
   /** Text shown in the Android persistent foreground notification */
   serviceLabel?: string;
   /**
-   * Android foreground service type. Valid values: "dataSync" (default),
-   * "mediaPlayback", "phoneCall", "location", "connectedDevice",
-   * "mediaProjection", "camera", "microphone", "health", "remoteMessaging",
-   * "systemExempted", "shortService", "specialUse", "mediaProcessing".
+   * Android foreground service type. Valid values: "remoteMessaging" (default),
+   * "dataSync", "mediaPlayback", "phoneCall", "location", "connectedDevice",
+   * "mediaProjection", "camera", "microphone", "health", "systemExempted",
+   * "shortService", "specialUse", "mediaProcessing".
    * Ignored on non-Android platforms.
    */
   foregroundServiceType?: string;
@@ -2008,7 +2277,7 @@ interface StartConfig {
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `serviceLabel` | `string` | Optional | `"Service running"` | Text shown in the Android persistent notification. |
-| `foregroundServiceType` | `string` | Optional | `"dataSync"` | Android foreground service type. See [Android Guide](./android.md) for all 14 valid types and their required permissions. Ignored on non-Android platforms. |
+| `foregroundServiceType` | `string` | Optional | `"remoteMessaging"` | Android foreground service type. See [Android Guide](./android.md) for all valid types and their required permissions. Ignored on non-Android platforms. |
 
 ---
 

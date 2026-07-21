@@ -1,8 +1,9 @@
 //! Platform-agnostic IPC transport layer.
 //!
-//! Provides type aliases, framing functions, and platform-specific connection
-//! primitives that abstract over Unix domain sockets (Linux/macOS) and named
-//! pipes (Windows).
+//! Provides type aliases, framing functions, and Unix-specific connection
+//! primitives. DESK-01: the Windows named-pipe transport was removed — the
+//! unauthenticated default-DACL surface was unsafe to ship. The daemon is
+//! now Unix-only; Windows remains on the in-process backend.
 //!
 //! Only available when the `desktop-service` Cargo feature is enabled.
 
@@ -65,17 +66,11 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 
 // ── Platform-specific re-exports ─────────────────────────────────────────────
 //
-// Consumers import from `transport` instead of the platform submodule directly,
-// making it easy to swap Unix ↔ Windows when the named-pipe transport lands.
+// Consumers import from `transport` instead of the platform submodule
+// directly. Unix-only after DESK-01 (Windows named-pipe transport removed).
 
 #[cfg(unix)]
 pub use crate::desktop::transport_unix::{
-    accept, bind, cleanup, connect, peer_cred_check, split, TransportListener, TransportReadHalf,
-    TransportStream, TransportWriteHalf,
-};
-
-#[cfg(windows)]
-pub use crate::desktop::transport_windows::{
     accept, bind, cleanup, connect, peer_cred_check, split, TransportListener, TransportReadHalf,
     TransportStream, TransportWriteHalf,
 };

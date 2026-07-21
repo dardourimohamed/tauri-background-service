@@ -93,3 +93,39 @@ final class SystemNotificationAuthorizer: NotificationAuthorizing {
             .requestAuthorization(options: options, completionHandler: completionHandler)
     }
 }
+
+// MARK: - Notification-center scheduling seam (IOS-MSG-01)
+
+/// The `UNUserNotificationCenter` capabilities the plugin's message-notification
+/// path needs: `add(_:)` to schedule a `UNNotificationRequest` and
+/// `setNotificationCategories(_:)` to register reply / mark-read actions.
+/// Production wires this to `SystemNotificationCenter`; XCTest injects a
+/// recording fake so IOS-MSG-01 can prove a request with a stable identifier,
+/// metadata/deep-link `userInfo`, and a registered category is produced
+/// without a real system notification center.
+protocol NotificationCenterScheduling: AnyObject {
+    /// Schedule a notification request. The completion fires with an error if
+    /// scheduling failed (e.g. the request identifier is malformed).
+    func add(
+        _ request: UNNotificationRequest,
+        withCompletionHandler completionHandler: @escaping (Error?) -> Void
+    )
+
+    /// Register the set of notification categories the app surfaces.
+    func setNotificationCategories(_ categories: Set<UNNotificationCategory>)
+}
+
+/// Real seam implementation forwarding to `UNUserNotificationCenter.current()` —
+/// the production default. Behavior is identical to calling it directly.
+final class SystemNotificationCenter: NotificationCenterScheduling {
+    func add(
+        _ request: UNNotificationRequest,
+        withCompletionHandler completionHandler: @escaping (Error?) -> Void
+    ) {
+        UNUserNotificationCenter.current().add(request, withCompletionHandler: completionHandler)
+    }
+
+    func setNotificationCategories(_ categories: Set<UNNotificationCategory>) {
+        UNUserNotificationCenter.current().setNotificationCategories(categories)
+    }
+}

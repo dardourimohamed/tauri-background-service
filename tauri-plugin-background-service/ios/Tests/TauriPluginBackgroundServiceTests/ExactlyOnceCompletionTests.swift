@@ -22,18 +22,22 @@ import BackgroundTasks
 final class ExactlyOnceCompletionTests: XCTestCase {
 
     private var plugin: BackgroundServicePlugin!
+    private var suite: UserDefaults!
 
     override func setUp() {
         super.setUp()
+        // IOS-CLEAN-01: isolated suite so this class cannot leak state.
+        suite = TestDefaults.makeIsolatedSuite()
         plugin = freshPlugin()
         // A terminal path that finds a task active reschedules via `scheduleNext`,
         // which only submits when desired_running is true.
-        UserDefaults.standard.set(true, forKey: "ios_desired_running")
+        suite.set(true, forKey: "ios_desired_running")
     }
 
     override func tearDown() {
-        UserDefaults.standard.removeObject(forKey: "ios_desired_running")
+        TestDefaults.clearAll(on: suite)
         plugin = nil
+        suite = nil
         super.tearDown()
     }
 
@@ -43,6 +47,7 @@ final class ExactlyOnceCompletionTests: XCTestCase {
         let p = BackgroundServicePlugin()
         p.scheduler = FakeBGTaskScheduler()
         p.notificationAuthorizer = FakeNotificationAuthorizer()
+        p.defaults = suite
         return p
     }
 

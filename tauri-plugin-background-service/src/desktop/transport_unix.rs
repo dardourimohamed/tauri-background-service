@@ -163,20 +163,60 @@ mod tests {
     #[test]
     fn bgs29_control_socket_rejects_foreign_uid() {
         let my_uid: libc::uid_t = unsafe { libc::getuid() };
-        // Same-UID connection is allowed.
         assert!(
             peer_uid_allowed(my_uid, my_uid),
             "same-UID peer must be allowed"
         );
-        // A foreign UID (my_uid + 1) is rejected.
         assert!(
             !peer_uid_allowed(my_uid.wrapping_add(1), my_uid),
             "foreign UID (my_uid + 1) must be rejected"
         );
-        // A different foreign UID (my_uid - 1) is also rejected.
         assert!(
             !peer_uid_allowed(my_uid.wrapping_sub(1), my_uid),
             "foreign UID (my_uid - 1) must be rejected"
         );
+    }
+
+    /// DESK-06: real same-UID Unix-socket loopback syscall test. Binds a
+    /// `UnixListener`, connects a loopback peer from the SAME process, then
+    /// runs `peer_cred_check` against the server-side stream. The kernel's
+    /// `getsockopt(SO_PEERCRED)` (Linux) / `getpeereid` (macOS) must extract
+    /// our own UID and accept the connection. This is the syscall-level
+    /// complement to the pure `peer_uid_allowed` decision test above.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn desk06_same_uid_loopback_passes_peer_cred_check() {
+        use std::os::unix::net::UnixStream;
+        use tokio::net::UnixListener;
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "tauri-bg-desk06-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind UnixListener");
+
+        // Connect a same-process loopback peer. Use the std sync stream so
+        // the connect happens before we accept.
+        let _client = UnixStream::connect(&path).expect("loopback connect");
+
+        let (server_stream, _addr) = listener.accept().await.expect("accept");
+        let transport_stream: TransportStream = server_stream;
+
+        // The peer is the same process, so the kernel reports OUR uid and
+        // peer_cred_check must accept. This exercises the real
+        // getsockopt(SO_PEERCRED) / getpeereid syscall.
+        let allowed = peer_cred_check(&transport_stream);
+        assert!(
+            allowed,
+            "same-UID loopback connection must pass peer_cred_check"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

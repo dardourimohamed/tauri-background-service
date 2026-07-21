@@ -12,6 +12,7 @@ Default permissions for the background service plugin
 - `allow-enable-auto-restart`
 - `allow-disable-auto-restart`
 - `allow-get-desired-service-state`
+- `allow-get-desired-state-status`
 - `allow-validate-setup`
 - `allow-get-lifecycle-status`
 - `allow-configure-recovery`
@@ -165,6 +166,32 @@ Enables the get_desired_service_state command without any pre-configured scope.
 <td>
 
 Denies the get_desired_service_state command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`background-service:allow-get-desired-state-status`
+
+</td>
+<td>
+
+Enables the get_desired_state_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`background-service:deny-get-desired-state-status`
+
+</td>
+<td>
+
+Denies the get_desired_state_status command without any pre-configured scope.
 
 </td>
 </tr>
@@ -529,32 +556,6 @@ Enables the restart_os_service command without any pre-configured scope.
 <td>
 
 Denies the restart_os_service command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`background-service:allow-service-status`
-
-</td>
-<td>
-
-Enables the service_status command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`background-service:deny-service-status`
-
-</td>
-<td>
-
-Denies the service_status command without any pre-configured scope.
 
 </td>
 </tr>

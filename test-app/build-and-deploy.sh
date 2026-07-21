@@ -43,17 +43,34 @@ echo
 
 # ── Build & Deploy ───────────────────────────────────────────────────
 
-# Start Waydroid if not running
+# Helper: poll a shell command up to N seconds for success.
+wait_for() {
+    local label="$1"; shift
+    local timeout_s="${1:-30}"; shift
+    local deadline=$(( $(date +%s) + timeout_s ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if "$@" >/dev/null 2>&1; then
+            echo "$label: ready"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "ERROR: $label did not become ready within ${timeout_s}s" >&2
+    return 1
+}
+
+# Start Waydroid if not running, then poll for RUNNING status (replaces
+# the fixed `sleep 5` — slow cold starts used to race the next step).
 if ! waydroid status | grep -q "RUNNING"; then
     echo "Starting Waydroid..."
     waydroid session start
-    sleep 5
 fi
+wait_for "waydroid" 60 waydroid status \| grep -q RUNNING || exit 1
 
-# Connect ADB
+# Connect ADB and poll for the device (replaces `sleep 2`).
 echo "Connecting ADB..."
 waydroid adb connect
-sleep 2
+wait_for "adb device" 30 adb wait-for-device || exit 1
 
 # Verify connection
 adb devices

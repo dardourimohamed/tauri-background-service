@@ -31,7 +31,6 @@ class LifecycleServiceInstrumentedTest {
         prefs = context.getSharedPreferences("bg_service", Context.MODE_PRIVATE)
         // Reset static state
         LifecycleService.isRunning = false
-        LifecycleService.autoRestarting = false
         prefs.edit().clear().apply()
     }
 
@@ -48,7 +47,6 @@ class LifecycleServiceInstrumentedTest {
             // Service may not be running
         }
         LifecycleService.isRunning = false
-        LifecycleService.autoRestarting = false
         prefs.edit().clear().apply()
     }
 
@@ -185,7 +183,7 @@ class LifecycleServiceInstrumentedTest {
     // ── onDestroy resets state ─────────────────────────────────────────
 
     @Test
-    fun onDestroy_resetsIsRunningAndAutoRestarting() {
+    fun onDestroy_resetsIsRunning() {
         startForegroundService("Destroy Test")
         assertTrue("Should be running before stop", LifecycleService.isRunning)
 
@@ -194,10 +192,6 @@ class LifecycleServiceInstrumentedTest {
         assertFalse(
             "isRunning should be false after onDestroy",
             LifecycleService.isRunning
-        )
-        assertFalse(
-            "autoRestarting should be false after onDestroy",
-            LifecycleService.autoRestarting
         )
     }
 

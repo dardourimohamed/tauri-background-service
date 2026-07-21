@@ -21,7 +21,7 @@ use std::path::PathBuf;
 
 use service_manager::{
     RestartPolicy, ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager, ServiceStartCtx,
-    ServiceStopCtx, ServiceUninstallCtx,
+    ServiceStatusCtx, ServiceStopCtx, ServiceUninstallCtx,
 };
 use tauri::AppHandle;
 
@@ -176,11 +176,10 @@ pub(crate) fn make_launchd_plist_contents(
 /// `ServiceLevel::User` — see the module docs for the per-user data-dir
 /// strategy that compensates.
 pub(crate) fn service_level_for_platform() -> ServiceLevel {
-    if cfg!(windows) {
-        ServiceLevel::System
-    } else {
-        ServiceLevel::User
-    }
+    // DESK-01: Windows daemon support was removed. The OS-service path is
+    // Unix-only (systemd user service / launchd agent), so the level is
+    // always User. (Windows SCM used System; that path is gone.)
+    ServiceLevel::User
 }
 
 /// Manages an OS-level service lifecycle using the `service-manager` crate.
@@ -296,6 +295,20 @@ impl DesktopServiceManager {
                 label: self.label.clone(),
             })
             .map_err(|e| ServiceError::ServiceStop(e.to_string()))
+    }
+
+    /// Query the OS-native install/run status.
+    ///
+    /// DESK-02: wraps `service-manager`'s `status()` so the caller can
+    /// distinguish `NotInstalled` from `Stopped` from `Running` rather than
+    /// guessing `Installed` whenever IPC is disconnected. The IPC-connectivity
+    /// axis stays separate (see `build_os_service_status`).
+    pub fn status(&self) -> Result<service_manager::ServiceStatus, ServiceError> {
+        self.manager
+            .status(ServiceStatusCtx {
+                label: self.label.clone(),
+            })
+            .map_err(|e| ServiceError::Platform(format!("status query failed: {e}")))
     }
 }
 

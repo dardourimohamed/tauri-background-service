@@ -122,7 +122,7 @@ class BackgroundServicePluginTest {
         assertEquals("", DurableState.load(context).lastServiceLabel)
     }
 
-    // ── getAutoStartConfig: reads pending state ─────────────────────────
+    // ── DurableState: recovery fields roundtrip (AND-07 removed legacy auto-start) ──
 
     @Test
     fun durableStateRecoveryPendingRoundtrip() {
@@ -154,7 +154,7 @@ class BackgroundServicePluginTest {
         assertEquals("", state.lastServiceLabel)
     }
 
-    // ── clearAutoStartConfig: clears only recovery fields ───────────────
+    // ── DurableState: clearing recovery fields preserves the rest ──────
 
     @Test
     fun clearRecoveryFieldsPreservesOtherDurableState() {
@@ -311,11 +311,12 @@ class BackgroundServicePluginTest {
     /**
      * BGS-22 (doc-08 Step 14): `requestBatteryExemption` fires the system
      * ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS intent for this app's package
-     * so the user can grant the Doze exemption. The
-     * REQUEST_IGNORE_BATTERY_OPTIMIZATIONS permission is declared in the plugin
-     * AndroidManifest.xml but was never requested until this flow. The @Command
-     * delegates to `launchBatteryExemptionRequest()` (a unit-testable seam)
-     * because the full @Command needs a Tauri Invoke. NV-MUT: remove the
+     * so the user can grant the Doze exemption. AND-09: the
+     * REQUEST_IGNORE_BATTERY_OPTIMIZATIONS permission is now declared by the
+     * HOST app (the library dropped it as Play-policy-restricted); the command
+     * still ships and launches the dialog, authorized by the host manifest. The
+     * @Command delegates to `launchBatteryExemptionRequest()` (a unit-testable
+     * seam) because the full @Command needs a Tauri Invoke. NV-MUT: remove the
      * `activity.startActivity(intent)` inside `launchBatteryExemptionRequest`
      * ⇒ `nextStartedActivity` is null and only this assertion REDs.
      */
@@ -658,26 +659,6 @@ class BackgroundServicePluginTest {
         assertEquals(
             "the call_id must ride the incoming-call extras (binds onAnswer/focus)",
             "tele-in-1",
-            record.extras.getString(IncomingCallNotifier.EXTRA_CALL_ID),
-        )
-    }
-
-    @Test
-    @Config(sdk = [34])
-    fun outboundDial_issuesPlaceCallCarryingCallId() {
-        // The symmetric outbound capability (DEC-058): placeCall issues a
-        // self-managed outgoing call carrying the call_id. (Its production wire to a
-        // live dial event is a follow-on — there is no native outbound hook today;
-        // outbound is core-initiated via start_call.)
-        BackgroundCallConnectionService.placeOutgoingCall(context, "tele-out-1")
-
-        val tm = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-        val record = shadowOf(tm).onlyOutgoingCall
-        assertNotNull("an outbound dial must issue placeCall", record)
-        assertNotNull("placeCall must carry a routing address", record.address)
-        assertEquals(
-            "the call_id must ride the outgoing-call extras",
-            "tele-out-1",
             record.extras.getString(IncomingCallNotifier.EXTRA_CALL_ID),
         )
     }

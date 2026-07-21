@@ -113,4 +113,41 @@ class CoreBridgeTest {
             result.rawJson.contains("native_library_load_failed"),
         )
     }
+
+    // ── AND-03: `ok` is the accept discriminator; `state` is opaque ────
+
+    @Test
+    fun `ok true with unknown state degraded is accepted`() {
+        // A host core returning an unknown-but-successful state must be accepted:
+        // `accepted` follows `ok`, not a hardcoded state allowlist.
+        val bridge = FakeCoreBridge.okState(ok = true, state = "degraded")
+        val result = bridge.start(context, "test")
+        assertTrue("ok=true must be accepted regardless of state", result.ok)
+        assertTrue("ok=true,state=degraded must be accepted (AND-03)", result.accepted)
+        assertEquals("state is opaque diagnostics, still surfaced", "degraded", result.state)
+    }
+
+    @Test
+    fun `ok false is rejected even with a success-like state`() {
+        val bridge = FakeCoreBridge.okState(ok = false, state = "running")
+        val result = bridge.start(context, "test")
+        assertFalse("ok=false must be rejected regardless of state", result.ok)
+        assertFalse("ok=false must be rejected even if state=='running' (AND-03)", result.accepted)
+    }
+
+    @Test
+    fun `fromJson treats ok as the accept discriminator`() {
+        // The wire parser must drive `accepted` from `ok` only.
+        val degraded = HeadlessBridgeResult.fromJson(
+            """{"ok":true,"state":"degraded","recoverable":true}"""
+        )
+        assertTrue(degraded.ok)
+        assertTrue("ok=true,state=degraded accepted via fromJson (AND-03)", degraded.accepted)
+
+        val failed = HeadlessBridgeResult.fromJson(
+            """{"ok":false,"state":"failed","message":"boom","recoverable":true}"""
+        )
+        assertFalse(failed.ok)
+        assertFalse("ok=false rejected via fromJson (AND-03)", failed.accepted)
+    }
 }

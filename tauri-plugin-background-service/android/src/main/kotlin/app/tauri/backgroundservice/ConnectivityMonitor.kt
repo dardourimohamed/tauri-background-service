@@ -93,7 +93,11 @@ class ConnectivityMonitor(
                 connectivityManager().registerNetworkCallback(request, cb)
             } catch (e: Exception) {
                 Log.w(TAG, "registerNetworkCallback failed: ${e.message}")
+                // AND-08: the HandlerThread was quit, so its Handler is dead —
+                // drop the reference retained above or a later trailing-edge
+                // scheduleTrailingFire would post onto a looper that never runs.
                 thread.quitSafely()
+                backgroundHandler = null
                 return
             }
             handlerThread = thread
@@ -218,6 +222,15 @@ class ConnectivityMonitor(
 
     @VisibleForTesting
     internal fun backgroundLooper(): Looper? = handlerThread?.looper
+
+    /**
+     * AND-08: whether the (production) trailing-fire Handler is still retained.
+     * After a failed [register] the dead HandlerThread's Handler must be dropped
+     * (cleared in the catch) so a later [scheduleTrailingFire] cannot post onto
+     * a looper that never runs. Exposed for the registration-failure test.
+     */
+    @VisibleForTesting
+    internal fun backgroundHandlerRetained(): Boolean = backgroundHandler != null
 
     private fun connectivityManager(): ConnectivityManager =
         context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager

@@ -5,46 +5,17 @@ import os.log
 
 // MARK: - F3 degraded-mode decision (pure, unit-tested)
 
-/// The iOS app lifecycle states relevant to delivering an inbound call (spec 08 §F3).
-///
-/// F3: ringing works only while the app is foreground, in the short background-active
-/// window, or during a live `BGTask`. A suspended or force-quit app cannot be woken by an
-/// inbound QUIC packet, so v1 (no APNs push relay) gives the caller a fast `Unreachable`
-/// (offer-ack timeout T1, Step 4) and queues a missed-call notice through the control
-/// outbox (Step 5) for delivery on the next wake.
-enum BackgroundCallAppState: String, Equatable {
-    /// App visible; report the call to CallKit (system ring + in-call UI).
-    case foreground
-    /// Short background-active window / live BGTask; report the call to CallKit.
-    case backgroundActive
-    /// Cannot be woken by inbound QUIC; do NOT ring. Caller gets `Unreachable` + a
-    /// missed-call control-outbox record drained on the next wake.
-    case suspended
-}
-
-/// What the iOS side does with an inbound call offer, given the app's lifecycle state.
-enum CallDeliveryAction: Equatable {
-    /// Report the call to CallKit so the system rings and shows the in-call UI.
-    case ring(hasVideo: Bool)
-    /// App is suspended: skip CallKit entirely. The caller's T1 yields `Unreachable` and a
-    /// missed-call record is drained from the control outbox on the next wake.
-    case deferToControlOutbox
-}
-
 /// Pure F3(a)+(c) decision logic for iOS call delivery.
 ///
-/// Mirrors the Kotlin/Android fast-path but expresses iOS's honest constraint: there is no
-/// push relay in v1, so a suspended app simply cannot ring. Decoupled from `CXProvider` /
-/// UIKit so it is unit-testable without the iOS runtime (spec-01 seam philosophy).
+/// Mirrors the Kotlin/Android fast-path but expresses iOS's honest constraint:
+/// there is no push relay in v1, so a suspended app simply cannot ring. The
+/// surface below is the testable residue: the foreground ring gate and the
+/// honest "no suspended ring" claim. The unused `BackgroundCallAppState` /
+/// `CallDeliveryAction` / `deliveryAction` triple this enum previously hosted
+/// was dead — only tests referenced it — and is removed in IOS-CLEAN-01.
+/// Decoupled from `CXProvider` / UIKit so it is unit-testable without the iOS
+/// runtime (spec-01 seam philosophy).
 enum BackgroundCallDecision {
-    static func deliveryAction(appState: BackgroundCallAppState, offerHasVideo: Bool) -> CallDeliveryAction {
-        switch appState {
-        case .foreground, .backgroundActive:
-            return .ring(hasVideo: offerHasVideo)
-        case .suspended:
-            return .deferToControlOutbox
-        }
-    }
 
     /// Step 12 (M-NATIVE-4 = NR-6): native-ring foreground gate — the iOS twin of
     /// the Rust `event_bridge::should_ring_native`.
@@ -67,18 +38,13 @@ enum BackgroundCallDecision {
     /// Step 13 (M-NATIVE-5 = CCF-14/NR-5): the iOS twin of the Rust
     /// `the host core("ios").suspended_incoming_ring_supported`.
     ///
-    /// **`false` on iOS, honestly.** Step 17 declares the `voip` UIBackgroundMode
-    /// and Step 18 Task B lands the on-device `PKPushRegistry`
-    /// (`BackgroundServicePlugin` → `the push-token sink`), but the APNs **relay**
-    /// that actually delivers a VoIP push to a suspended app is an EXTERNAL
-    /// dependency (Fork 2) and not yet device-verified. Until it is, a suspended
-    /// app gets the documented missed-call path
-    /// (`CallDeliveryAction.deferToControlOutbox`), never a reliable ring —
-    /// so this must never be presented as native incoming-call parity. The
-    /// registry-vs-relay distinction is observable via
-    /// `MobilePackagingValidation.push_relay_configured` (token registered, NOT
-    /// delivery verified). Host-build deferred (no macOS toolchain) — written +
-    /// unit-shaped, recorded NOT done.
+    /// **`false` on iOS, honestly.** No APNs/VoIP-push relay ships in v1
+    /// (IOS-PUSH-01 removed the incomplete PushKit surface rather than ship a
+    /// registry with no producer), so a suspended/terminated app cannot be
+    /// woken to ring. The caller instead gets the documented missed-call path
+    /// (Unreachable + a control-outbox record drained on the next wake), never
+    /// a reliable ring — so this must never be presented as native
+    /// incoming-call parity. Active-process CallKit only.
     static let suspendedIncomingRingSupported: Bool = false
 }
 
@@ -146,10 +112,11 @@ enum CallAudioRoute: String {
 // MARK: - Native core bridge (host-provided; no native lib ships with the plugin)
 
 // The plugin ships no native library. A host app that bridges CallKit perform-
-// actions (Answer/Reject/End) and PushKit tokens to its own native core injects
-// closures: BackgroundCallKitController.performCallAction and
-// BackgroundServicePlugin.pushTokenSink. Defaults are no-ops, so the plugin
-// builds and runs standalone.
+// actions (Answer/Reject/End) to its own native core injects a closure:
+// BackgroundCallKitController.performCallAction (wired in
+// BackgroundServicePlugin.callKitController to the public main-thread
+// `callActionHandler`). Default is a no-op, so the plugin builds and runs
+// standalone. (IOS-PUSH-01 removed the incomplete PushKit token sink.)
 
 // MARK: - CallKit + AVAudioSession wrapper (runtime glue; device-tested)
 
@@ -193,18 +160,6 @@ final class BackgroundCallKitController: NSObject, CXProviderDelegate {
     /// performed. `didActivate` derives `hasVideo` from this call's `activeCalls`
     /// entry (L6) instead of a clobber-prone scalar.
     private var activeAudioCallUUID: UUID?
-
-    /// Deprecated fallback seam for the CallKit→webview event path (H7). The
-    /// perform-handlers now route Answer/Reject/End DIRECTLY to Rust via
-    /// `performCallAction` (BGS-10: the webview is suspended when CallKit
-    /// rings, so a webview-routed lock-screen answer may never connect), so this
-    /// closure is NO LONGER fired by the perform-handlers. Retained for a future
-    /// webview-foreground-answer path; currently dormant for answer/reject/end.
-    /// The plugin still wires it (`BackgroundServicePlugin.callKitController`);
-    /// the webview consumer (`useNativeCallActions.ts`) is now dead code for
-    /// these actions (carry-forward cleanup — no merge concern: no sibling branch
-    /// touches it).
-    var onCallEvent: ((_ event: String, _ callId: String) -> Void)?
 
     /// The active CallKit→native-core call-action bridge (BGS-10, Step 18 Task B).
     /// The default is a no-op — the plugin ships no native library, so a consumer

@@ -127,11 +127,23 @@ class BootReceiver : BroadcastReceiver() {
             putExtra(LifecycleService.EXTRA_SERVICE_TYPE, serviceType)
             putExtra(LifecycleService.EXTRA_START_REASON, reason)
         }
-        // BGS-30 (doc-08 Step 13): route the ACTION_START recovery start through the
-        // guarded helper so an OS start-restriction is logged instead of crashing the
-        // boot/package-replace path. foreground=true preserves the original branched
-        // startForegroundService/startService. The helper lives in BackgroundServicePlugin.kt
-        // (same module/package); CROSS-DOC: doc 06.
-        startServiceGuarded(context, intent, foreground = true)
+        // BGS-30 (doc-08 Step 13) + AND-04: route the ACTION_START recovery
+        // start through the guarded helper. AND-04 makes the helper return a
+        // structured outcome so a boot-time restriction is not just logged but
+        // recovered: ANY Rejected (including a runtime
+        // ForegroundServiceStartNotAllowedException reason the static
+        // BOOT_BLOCKED_TYPES_API35 set doesn't enumerate — that set is now only
+        // an optimization for the known fast-path cases) persists recovery +
+        // posts one notification so the user can resume the service manually.
+        when (val outcome = startServiceGuarded(context, intent, foreground = true)) {
+            ServiceStartOutcome.Started -> { /* delivered; LifecycleService owns the rest */ }
+            is ServiceStartOutcome.Rejected -> {
+                DurableState.save(context, DurableState.load(context).copy(
+                    recoveryPending = true,
+                    recoveryReason = "start_rejected:" + outcome.cause.javaClass.simpleName,
+                ))
+                postRecoveryNotification(context, label)
+            }
+        }
     }
 }

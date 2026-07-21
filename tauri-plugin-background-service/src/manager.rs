@@ -642,6 +642,17 @@ struct ServiceState<R: Runtime> {
     /// "scheduling degraded / foreground-only" status (H9). Cleared on the next
     /// start attempt and on stop.
     scheduling_degraded: Arc<Mutex<Option<String>>>,
+    /// CORE-01: terminal reason slot, scoped to the current generation.
+    /// Set by `handle_stop_with_reason` BEFORE `token.cancel()` so the
+    /// spawned cleanup path can emit `PluginEvent::Stopped { reason }` with
+    /// the user-meaningful reason (UserStop, PlatformTimeout, ...) instead of
+    /// always emitting `TaskCompleted`. Cleared on every `handle_start`.
+    /// Read under the generation guard so a stale task cannot stomp a newer
+    /// generation's reason. Stored as `(generation, reason)` so a stale task
+    /// whose generation has been cleared by a newer start still sees its OWN
+    /// reason and not None (which would wrongly fall through to natural
+    /// completion).
+    terminal_reason: Arc<Mutex<Option<(u64, StopReason)>>>,
     /// Desired-state persistence backend.
     /// `None` on platforms that haven't set one up yet.
     desired_state: Option<Arc<dyn DesiredStateBackend>>,
@@ -755,6 +766,7 @@ pub async fn manager_loop<R: Runtime>(
         lifecycle_state: Arc::new(Mutex::new(ServiceLifecycle::Idle)),
         last_error: Arc::new(Mutex::new(None)),
         scheduling_degraded: Arc::new(Mutex::new(None)),
+        terminal_reason: Arc::new(Mutex::new(None)),
         desired_state: desired_state_backend,
         lifecycle_mode,
         android_fg_service_types,
@@ -787,12 +799,18 @@ pub async fn manager_loop<R: Runtime>(
             if let Ok(ds) = backend.load() {
                 if should_replay_on_boot(&ds) {
                     if let Some(app) = boot_app.as_ref() {
-                        let config = ds
+                        let config_result = ds
                             .last_start_config
                             .as_ref()
-                            .and_then(|v| serde_json::from_value::<StartConfig>(v.clone()).ok());
-                        if let Some(config) = config {
-                            match handle_start(&mut state, app.clone(), config) {
+                            .map(|v| serde_json::from_value::<StartConfig>(v.clone()));
+                        match config_result {
+                            None => {
+                                // CORE-05: no last_start_config persisted —
+                                // nothing to replay. This is the expected
+                                // state on a fresh install; no diagnostic.
+                            }
+                            Some(Ok(config)) => match handle_start(&mut state, app.clone(), config)
+                            {
                                 Ok(()) => {
                                     log::info!(
                                         "BGS-05: replayed Start on boot (desired_running=true)"
@@ -801,6 +819,17 @@ pub async fn manager_loop<R: Runtime>(
                                 Err(e) => {
                                     log::warn!("BGS-05: boot Start-replay failed: {e}");
                                 }
+                            },
+                            // CORE-05: a malformed persisted `last_start_config`
+                            // was previously swallowed silently via `.ok()`. Now
+                            // surface a diagnostic so the operator can see that
+                            // boot replay was attempted and skipped due to a
+                            // corrupted StartConfig rather than failing invisibly.
+                            Some(Err(e)) => {
+                                log::warn!(
+                                    "BGS-05: boot Start-replay skipped — \
+                                     malformed persisted last_start_config: {e}"
+                                );
                             }
                         }
                     }
@@ -975,11 +1004,13 @@ fn handle_start<R: Runtime>(
 ) -> Result<(), ServiceError> {
     log::info!("handle_start: entry (label={})", config.service_label);
 
-    // Store the app handle for event emission during merge.
-    state.app = Some(app.clone());
-
     let mut guard = state.token.lock().unwrap();
 
+    // CORE-05: `state.app` MUST be assigned only after the AlreadyRunning and
+    // validation guards succeed. Previously this ran unconditionally on entry,
+    // so a rejected `AlreadyRunning` start (or a validation-rejected start)
+    // overwrote the previously-stored `AppHandle`, leaking the old handle's
+    // event subscribers.
     if guard.is_some() {
         return Err(ServiceError::AlreadyRunning);
     }
@@ -1007,6 +1038,10 @@ fn handle_start<R: Runtime>(
         state.android_validate_fg_type,
     )?;
 
+    // Guards passed — now it is safe to remember the app handle for this
+    // generation's event emission.
+    state.app = Some(app.clone());
+
     let token = CancellationToken::new();
     let shutdown = token.clone();
     *guard = Some(token);
@@ -1016,6 +1051,11 @@ fn handle_start<R: Runtime>(
     *state.last_error.lock().unwrap() = None;
     // Clear any prior advisory scheduling-degraded marker for this fresh start.
     *state.scheduling_degraded.lock().unwrap() = None;
+    // CORE-01: the terminal_reason slot is generation-tagged, so a newer
+    // start does NOT need to clear it — stale entries simply do not match
+    // the new generation's cleanup read. Clearing would race an in-flight
+    // stale task's emit (the new start lands between the old task's
+    // shutdown.cancelled() wake and its terminal_reason read).
 
     drop(guard);
 
@@ -1086,6 +1126,16 @@ fn handle_start<R: Runtime>(
     let is_running_ref = state.is_running.clone();
     let lifecycle_ref = state.lifecycle_state.clone();
     let last_error_ref = state.last_error.clone();
+    // CORE-01: shared terminal-reason slot. Read under the generation guard
+    // so a stale task cannot emit a reason set by a newer generation's stop.
+    let terminal_reason_ref = state.terminal_reason.clone();
+    // CORE-01: desired-state backend and mobile bridge are needed in the
+    // cleanup path so natural completion can clear persisted desired intent
+    // (mirroring `handle_stop_with_reason`'s `should_clear_desired_state`
+    // branch) without bouncing a message back through the actor.
+    let desired_state_ref = state.desired_state.clone();
+    let mobile_ref = state.mobile.clone();
+    let lifecycle_mode_ref = state.lifecycle_mode;
 
     let mut service = (state.factory)();
 
@@ -1151,25 +1201,73 @@ fn handle_start<R: Runtime>(
         // Phase 2: run
         let result = service.run(&ctx).await;
 
-        // Emit terminal event.
-        match result {
-            Ok(()) => {
-                let _ = app.emit(
-                    "background-service://event",
-                    PluginEvent::Stopped {
-                        reason: StopReason::TaskCompleted,
-                    },
-                );
-            }
-            Err(ref e) => {
-                let _ = app.emit(
-                    "background-service://event",
-                    PluginEvent::Error {
-                        message: e.to_string(),
-                    },
-                );
+        // CORE-01: determine the terminal reason for THIS generation. Read
+        // `terminal_reason_ref` under the generation guard so a stale task
+        // cannot pick up a reason set by a newer generation's stop. An
+        // explicit reason (set by `handle_stop_with_reason` before
+        // `token.cancel()`) wins; the inline Ok/Err classification is the
+        // fallback for natural completion / unprompted error.
+        let explicit_reason: Option<StopReason> = {
+            let tr = terminal_reason_ref.lock().unwrap();
+            // CORE-01: read the terminal reason only if it was set for THIS
+            // generation. A newer start bumps generation and clears the slot,
+            // but the tuple-tagged storage means a stale task whose
+            // generation has been cleared still finds its OWN reason here
+            // (matches my_gen) rather than falling through to natural
+            // completion.
+            tr.and_then(|(gen, reason)| if gen == my_gen { Some(reason) } else { None })
+        };
+
+        // Emit terminal event exactly once. Explicit stop reason always
+        // surfaces as `Stopped{reason}` — even if the cooperative shutdown
+        // returned an Err, the user-meaningful reason is the explicit stop,
+        // not an internal error from the cancelled task.
+        if let Some(r) = explicit_reason {
+            // Explicit stop reason always wins, even when the cooperative
+            // shutdown returned an Err. The user-meaningful reason is the
+            // explicit stop, not an internal error from the cancelled task.
+            let _ = app.emit(
+                "background-service://event",
+                PluginEvent::Stopped { reason: r },
+            );
+        } else {
+            // Natural completion / unprompted error classification.
+            match &result {
+                Ok(()) => {
+                    let _ = app.emit(
+                        "background-service://event",
+                        PluginEvent::Stopped {
+                            reason: StopReason::TaskCompleted,
+                        },
+                    );
+                }
+                Err(e) => {
+                    let _ = app.emit(
+                        "background-service://event",
+                        PluginEvent::Error {
+                            message: e.to_string(),
+                        },
+                    );
+                }
             }
         }
+
+        // CORE-01: natural completion clears persisted/native desired intent
+        // (mirroring `handle_stop_with_reason`'s `should_clear_desired_state
+        // (TaskCompleted)` branch). Unprompted error PRESERVES desired state
+        // so recovery can resume. Explicit-reason clears/preserves were
+        // already handled by `handle_stop_with_reason` before cancel(); do
+        // not double-write here.
+        if explicit_reason.is_none() && result.is_ok() {
+            save_desired_running_via(
+                &desired_state_ref,
+                &mobile_ref,
+                lifecycle_mode_ref,
+                false,
+                None,
+            );
+        }
+        // Err path: leave desired_running alone (recovery may resume).
 
         // Fire on_complete callback (captured at spawn time).
         // MUST fire before clearing the token so that
@@ -1198,7 +1296,7 @@ fn handle_start<R: Runtime>(
                         *lc = ServiceLifecycle::Stopped;
                     }
                 }
-                if let Err(ref e) = result {
+                if let Err(e) = &result {
                     *last_error_ref.lock().unwrap() = Some(e.to_string());
                 }
             }
@@ -1256,13 +1354,6 @@ async fn handle_shutdown_gracefully<R: Runtime>(
 }
 
 /// Handle a `StopWithReason` command.
-///
-/// Like `handle_stop` but applies a reason-based desired-state policy:
-/// - Clears desired state for intentional stops: `UserStop`, `AppStop`,
-///   `NativeNotificationStop`, `TaskCompleted`.
-/// - Preserves desired state for platform/error/exit reasons: `PlatformTimeout`,
-///   `PlatformExpiration`, `OsRestart`, `BootRecovery`, `Error`, `ProcessExit`.
-///   A `PlatformTimeout` additionally re-submits native scheduling (M13).
 fn handle_stop_with_reason<R: Runtime>(
     state: &mut ServiceState<R>,
     reason: StopReason,
@@ -1270,6 +1361,16 @@ fn handle_stop_with_reason<R: Runtime>(
     let mut guard = state.token.lock().unwrap();
     match guard.take() {
         Some(token) => {
+            // CORE-01: record the explicit stop reason for this generation
+            // BEFORE cancelling the token. The spawned task's cleanup reads
+            // this under the generation guard and emits
+            // `PluginEvent::Stopped { reason }` with this reason instead of
+            // the inline `TaskCompleted`/`Error` classification. Explicit
+            // reason wins; the cleanup path's own Ok/Err branch is only used
+            // when no explicit reason was set (natural completion or
+            // unprompted error).
+            *state.terminal_reason.lock().unwrap() =
+                Some((state.generation.load(Ordering::Acquire), reason));
             token.cancel();
             state.is_running.store(false, Ordering::SeqCst);
             *state.lifecycle_state.lock().unwrap() = ServiceLifecycle::Stopped;
@@ -1562,6 +1663,52 @@ fn save_desired_running<R: Runtime>(
     }
 }
 
+/// CORE-01: same payload as `save_desired_running` but callable from the
+/// spawned task where only the desired-state backend / mobile bridge clones
+/// are available (no `&ServiceState`). Used by the natural-completion path
+/// to clear persisted/native desired intent when `run()` returns `Ok` and no
+/// explicit stop reason was set.
+fn save_desired_running_via(
+    desired_state: &Option<std::sync::Arc<dyn DesiredStateBackend>>,
+    mobile: &Option<std::sync::Arc<dyn MobileKeepalive>>,
+    lifecycle_mode: LifecycleMode,
+    desired: bool,
+    config: Option<&StartConfig>,
+) {
+    if let Some(backend) = desired_state {
+        let mut ds = backend.load().unwrap_or_default();
+        ds.desired_running = desired;
+        if desired {
+            ds.last_start_config = config.map(|c| serde_json::to_value(c).unwrap_or_default());
+            ds.last_start_epoch_ms = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            );
+        } else {
+            ds.last_start_config = None;
+            ds.last_start_epoch_ms = None;
+            ds.recovery_pending = false;
+            ds.recovery_reason = None;
+            ds.restart_attempt = 0;
+        }
+        if let Err(e) = backend.save(&ds) {
+            log::warn!("failed to save desired state from spawned task: {e}");
+        }
+    }
+    // Mirror to native on iOS so UserDefaults + BGTask scheduling follow.
+    // Desktop has no mobile bridge; the explicit-stop path already mirrored.
+    if matches!(lifecycle_mode, LifecycleMode::IosBgTaskScheduler) {
+        if let Some(m) = mobile {
+            let config_value = config.map(|c| serde_json::to_value(c).unwrap_or_default());
+            if let Err(e) = m.mirror_desired_state(desired, config_value.as_ref()) {
+                log::warn!("failed to mirror desired state to native from spawned task: {e}");
+            }
+        }
+    }
+}
+
 /// Mirror the Rust-authoritative desired state into native persistence (H4/D1).
 ///
 /// Called by the intent-only recovery commands (`SetDesiredRunning`,
@@ -1690,6 +1837,22 @@ fn reconcile_running_with_native<R: Runtime>(state: &ServiceState<R>) -> bool {
     } else {
         crate::models::ServiceState::Stopped
     };
+    // CORE-02: when native authority says the service has stopped, also
+    // take/cancel the Rust-side token so a subsequent Start does not hit
+    // `AlreadyRunning` and permanently block restart. Previously this path
+    // flipped `is_running` to false but left `token=Some`, leaking the slot
+    // until process restart.
+    if !native.native_running {
+        if let Some(token) = state.token.lock().unwrap().take() {
+            token.cancel();
+            // Surface the native-stop reason on the terminal slot so any
+            // in-flight task cleanup emits the user-meaningful reason.
+            *state.terminal_reason.lock().unwrap() = Some((
+                state.generation.load(Ordering::Acquire),
+                crate::models::StopReason::NativeNotificationStop,
+            ));
+        }
+    }
     native.native_running
 }
 
@@ -1916,10 +2079,14 @@ fn build_lifecycle_status<R: Runtime>(
     // Surface data_dir from native state for path validation.
     let data_dir = native_state.as_ref().map(|ns| ns.data_dir.clone());
 
-    let (platform, _) = crate::capabilities::CapabilityProvider::detect_platform(desktop_mode);
+    let (platform, detected_mode) =
+        crate::capabilities::CapabilityProvider::detect_platform(desktop_mode);
     let capabilities = crate::capabilities::CapabilityProvider::capabilities(
         platform,
-        state.lifecycle_mode,
+        // DESK-04: prefer the per-request detected mode over the actor's
+        // spawn-time lifecycle_mode. The headless server passes
+        // `Some("osService")` so a connected GUI reports DesktopOsService.
+        detected_mode,
         false,
     );
     let report = crate::validator::SetupValidator::validate(platform);
@@ -1965,6 +2132,7 @@ fn build_lifecycle_status<R: Runtime>(
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use crate::desired_state::DesiredState;
@@ -5665,6 +5833,388 @@ mod tests {
         assert!(
             saves.last().unwrap().desired_running,
             "ProcessExit must preserve desired_running=true"
+        );
+    }
+
+    // ── CORE-01: terminal-reason slot contract ─────────────────────────────
+    //
+    // The actor emits a single terminal PluginEvent per generation. An
+    // explicit stop reason (set by `handle_stop_with_reason` before cancel)
+    // wins over the inline Ok/Err classification; natural completion emits
+    // `TaskCompleted`; unprompted error emits `Error`. Natural completion
+    // also clears persisted desired intent; unprompted error preserves it.
+    /// Capture every `background-service://event` payload JSON string into a
+    /// `Vec<String>` so terminal-event tests can assert on the exact emitted
+    /// reason/type. Returns `(captured, listener_id)` so the caller keeps the
+    /// listener alive for the test's lifetime.
+    fn capture_plugin_events<R: tauri::Runtime>(
+        app: &tauri::AppHandle<R>,
+    ) -> (Arc<std::sync::Mutex<Vec<String>>>, tauri::EventId) {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let id = app.listen("background-service://event", move |event: tauri::Event| {
+            // `payload()` returns `&str` in Tauri 2 (the JSON-serialized
+            // PluginEvent). Clone into the capture buffer.
+            captured_clone
+                .lock()
+                .unwrap()
+                .push(event.payload().to_string());
+        });
+        (captured, id)
+    }
+
+    /// YieldingOkService: init ok, run sleeps briefly then returns Ok.
+    struct YieldingOkService;
+    #[async_trait]
+    impl BackgroundService<tauri::test::MockRuntime> for YieldingOkService {
+        async fn init(
+            &mut self,
+            _ctx: &ServiceContext<tauri::test::MockRuntime>,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn run(
+            &mut self,
+            _ctx: &ServiceContext<tauri::test::MockRuntime>,
+        ) -> Result<(), ServiceError> {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(())
+        }
+    }
+
+    /// BlockingOkService: init ok, run blocks until the shutdown token fires,
+    /// then returns Ok. Models a cooperative cancellation that returns Ok.
+    struct BlockingOkService;
+    #[async_trait]
+    impl BackgroundService<tauri::test::MockRuntime> for BlockingOkService {
+        async fn init(
+            &mut self,
+            _ctx: &ServiceContext<tauri::test::MockRuntime>,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn run(
+            &mut self,
+            ctx: &ServiceContext<tauri::test::MockRuntime>,
+        ) -> Result<(), ServiceError> {
+            // Block until cancelled, then return Ok.
+            let _ = ctx.shutdown.cancelled().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn core01_natural_completion_emits_task_completed_exactly_once() {
+        let handle = setup_manager_with_factory(Box::new(|| Box::new(YieldingOkService)));
+        let app = tauri::test::mock_app();
+        let (captured, _guard) = capture_plugin_events(app.handle());
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        wait_until_stopped(&handle, 2000).await;
+        // Give the emit + listener a beat to land.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = captured.lock().unwrap();
+        // Expect exactly: Started, Stopped{taskCompleted}.
+        assert!(
+            events.iter().any(|e| e.contains("\"type\":\"started\"")),
+            "expected a Started event, got: {events:?}"
+        );
+        let stopped: Vec<_> = events
+            .iter()
+            .filter(|e| e.contains("\"type\":\"stopped\""))
+            .collect();
+        assert_eq!(
+            stopped.len(),
+            1,
+            "exactly one terminal Stopped event, got: {stopped:?}"
+        );
+        assert!(
+            stopped[0].contains("\"reason\":\"taskCompleted\""),
+            "natural Ok must emit taskCompleted, got: {}",
+            stopped[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn core01_user_stop_emits_explicit_reason_over_cooperative_ok() {
+        // The service returns Ok after cancellation. The terminal event MUST
+        // be Stopped{userStop}, not Stopped{taskCompleted} — the explicit
+        // stop reason wins.
+        let handle = setup_manager_with_factory(Box::new(|| Box::new(BlockingOkService)));
+        let app = tauri::test::mock_app();
+        let (captured, _guard) = capture_plugin_events(app.handle());
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        wait_until_running(&handle).await;
+        send_stop(&handle).await.unwrap();
+        wait_until_stopped(&handle, 2000).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = captured.lock().unwrap();
+        let stopped: Vec<_> = events
+            .iter()
+            .filter(|e| e.contains("\"type\":\"stopped\""))
+            .collect();
+        assert_eq!(stopped.len(), 1, "exactly one Stopped: {stopped:?}");
+        assert!(
+            stopped[0].contains("\"reason\":\"userStop\""),
+            "explicit user stop must win over cooperative Ok, got: {}",
+            stopped[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn core01_platform_timeout_emits_platform_timeout_reason() {
+        let handle = setup_manager_with_factory(Box::new(|| Box::new(BlockingOkService)));
+        let app = tauri::test::mock_app();
+        let (captured, _guard) = capture_plugin_events(app.handle());
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        wait_until_running(&handle).await;
+        send_stop_with_reason(&handle, StopReason::PlatformTimeout)
+            .await
+            .unwrap();
+        wait_until_stopped(&handle, 2000).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = captured.lock().unwrap();
+        let stopped: Vec<_> = events
+            .iter()
+            .filter(|e| e.contains("\"type\":\"stopped\""))
+            .collect();
+        assert_eq!(stopped.len(), 1);
+        assert!(
+            stopped[0].contains("\"reason\":\"platformTimeout\""),
+            "got: {}",
+            stopped[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn core01_unprompted_error_emits_error_event() {
+        // ImmediateErrorService returns Err from run() WITHOUT an explicit
+        // stop. The terminal event MUST be Error (no explicit reason set).
+        let handle = setup_manager_with_factory(Box::new(|| Box::new(ImmediateErrorService)));
+        let app = tauri::test::mock_app();
+        let (captured, _guard) = capture_plugin_events(app.handle());
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        wait_until_stopped(&handle, 2000).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let events = captured.lock().unwrap();
+        assert!(
+            events.iter().any(|e| e.contains("\"type\":\"error\"")),
+            "unprompted Err must emit Error, got: {events:?}"
+        );
+        // And it must NOT also emit a Stopped event for the same generation.
+        let stopped = events
+            .iter()
+            .filter(|e| e.contains("\"type\":\"stopped\""))
+            .count();
+        assert_eq!(stopped, 0, "Error path must not double-emit Stopped");
+    }
+
+    #[tokio::test]
+    async fn core01_natural_completion_clears_desired_running() {
+        // Natural Ok must clear persisted desired_running — the task is done.
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(YieldingOkService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        wait_until_stopped(&handle, 2000).await;
+        // Give the post-completion save a beat to land.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let saves = backend.saves.lock().unwrap();
+        // The last save after natural completion must set desired_running=false.
+        let last = saves.last().expect("expected at least one save");
+        assert!(
+            !last.desired_running,
+            "natural completion must clear desired_running; last save = {last:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn core01_unprompted_error_preserves_desired_running() {
+        // Unprompted Err must NOT clear desired_running — recovery may resume.
+        let backend = MockDesiredStateBackend::new();
+        let handle = setup_manager_with_factory_and_backend(
+            Box::new(|| Box::new(ImmediateErrorService)),
+            Some(backend.clone()),
+        );
+        let app = tauri::test::mock_app();
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        wait_until_stopped(&handle, 2000).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The last save is `desired_running=true` from `handle_start`'s
+        // post-spawn save; no additional `false` save should land.
+        let saves = backend.saves.lock().unwrap();
+        let last = saves.last().expect("expected at least one save");
+        assert!(
+            last.desired_running,
+            "unprompted error must preserve desired_running=true; last save = {last:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn core01_restart_after_user_stop_succeeds_with_correct_reason() {
+        // Regression: a stop-then-start cycle must emit the NEW generation's
+        // reason, not leak the previous generation's terminal_reason.
+        let handle = setup_manager_with_factory(Box::new(|| Box::new(BlockingOkService)));
+        let app = tauri::test::mock_app();
+        let (captured, _guard) = capture_plugin_events(app.handle());
+
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        wait_until_running(&handle).await;
+        send_stop(&handle).await.unwrap();
+        wait_until_stopped(&handle, 2000).await;
+
+        // Second generation — natural completion.
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        // Replace the service so the second run returns immediately... but we
+        // cannot change factory. Use BlockingOkService and stop instead:
+        wait_until_running(&handle).await;
+        send_stop_with_reason(&handle, StopReason::PlatformExpiration)
+            .await
+            .unwrap();
+        wait_until_stopped(&handle, 2000).await;
+        // Poll for the second Stopped event to land instead of a fixed sleep
+        // — under parallel test load the emit + listener dispatch can race.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let n = captured
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.contains("\"type\":\"stopped\""))
+                .count();
+            if n >= 2 || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let events = captured.lock().unwrap();
+        let stopped: Vec<_> = events
+            .iter()
+            .filter(|e| e.contains("\"type\":\"stopped\""))
+            .collect();
+        assert_eq!(
+            stopped.len(),
+            2,
+            "expected one Stopped per generation, got: {stopped:?}"
+        );
+        assert!(
+            stopped[0].contains("\"reason\":\"userStop\""),
+            "first stop reason: {}",
+            stopped[0]
+        );
+        assert!(
+            stopped[1].contains("\"reason\":\"platformExpiration\""),
+            "second stop reason must be the new generation's, got: {}",
+            stopped[1]
+        );
+    }
+
+    // ── CORE-02: native reconcile must release the token ───────────────────
+    //
+    // When the native authority reports stopped while the actor believes the
+    // service is running, the reconcile path MUST take/cancel the Rust-side
+    // token — not just flip `is_running`. Previously the token was left
+    // `Some`, so the next Start returned `AlreadyRunning` and restart was
+    // permanently blocked until process restart.
+
+    #[tokio::test]
+    async fn core02_reconcile_native_stopped_then_restart_succeeds() {
+        let mock = MockNativeState::new();
+        let handle =
+            setup_manager_with_factory_and_backend(Box::new(|| Box::new(BlockingService)), None);
+        let app = tauri::test::mock_app();
+
+        send_set_mobile(&handle, mock.clone()).await;
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        wait_until_running(&handle).await;
+
+        // Native authority reports STOPPED while Rust believes running —
+        // the split-brain trigger that fires `reconcile_running_with_native`.
+        mock.set_native_state(native_state(false));
+
+        // Reconcile converges: is_running now reports false.
+        assert!(
+            !send_is_running(&handle).await,
+            "reconcile must converge is_running to false"
+        );
+
+        // CORE-02 headline: restart MUST NOT return AlreadyRunning. Before
+        // the fix, the token was left Some after the reconcile, so this
+        // returned AlreadyRunning permanently.
+        let result = send_start(&handle, app.handle().clone()).await;
+        assert!(
+            result.is_ok(),
+            "restart after native-stopped reconcile must succeed (CORE-02): {result:?}"
+        );
+
+        // Before checking is_running, flip native back to running — otherwise
+        // the next `is_running` query would reconcile-again to false (native
+        // authority really did report stopped; reconcile is correct, not a
+        // bug). The point of CORE-02 is the TOKEN release, not the reconcile
+        // behavior itself.
+        mock.set_native_state(native_state(true));
+        assert!(
+            send_is_running(&handle).await,
+            "service must be observable as running after restart + native agreement"
+        );
+    }
+
+    //
+    // A malformed persisted `last_start_config` previously hit `.ok()` and
+    // was silently discarded. The fix surfaces a diagnostic log AND keeps
+    // the system in a clean state (no half-replayed Start). The observable
+    // contract tested here: malformed config does NOT cause a panic, does
+    // NOT start the service, and a subsequent explicit Start still works.
+
+    #[tokio::test]
+    async fn core05_malformed_boot_replay_is_skipped_cleanly_and_restart_works() {
+        let backend = MockDesiredStateBackend::new();
+        // Plant a desired-state that says "user wanted service running" but
+        // carries a MALFORMED last_start_config (not a valid StartConfig).
+        backend
+            .save(&crate::desired_state::DesiredState {
+                desired_running: true,
+                last_start_config: Some(serde_json::json!({"serviceLabel": 12345})),
+                ..Default::default()
+            })
+            .unwrap();
+        let app = tauri::test::mock_app();
+        let handle = setup_manager_with_factory_backend_and_boot_app(
+            Box::new(|| Box::new(BlockingService)),
+            Some(backend.clone()),
+            Some(app.handle().clone()),
+            true,
+        );
+
+        // Give the loop a moment to attempt (and skip) the malformed replay.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+        // CORE-05 contract: malformed replay must NOT have started the service.
+        assert!(
+            !send_is_running(&handle).await,
+            "malformed boot replay must not start the service"
+        );
+
+        // And the system must remain restartable from an explicit Start.
+        send_start(&handle, app.handle().clone()).await.unwrap();
+        assert!(
+            send_is_running(&handle).await,
+            "explicit start after malformed-replay skip must succeed"
         );
     }
 

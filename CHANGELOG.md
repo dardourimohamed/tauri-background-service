@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-07-21
+
+Audit remediation release. 44 findings addressed across Rust, Android,
+iOS, desktop daemon, ACL/permissions, TypeScript wire, CI/release, E2E,
+and documentation. No breaking API changes — all fixes are backward-compatible
+correctness, security, and reliability improvements.
+
+### Fixed (Critical)
+- **CORE-01:** Per-generation terminal-reason slot — explicit stop reasons
+  (`userStop`, `platformTimeout`, ...) now win over the inline
+  `taskCompleted`/`error` classification. Natural completion clears desired
+  state; unprompted error preserves it. Exactly one terminal event per
+  generation.
+- **CORE-02:** Native reconciliation now takes/cancels the Rust token —
+  restart no longer hits `AlreadyRunning` after a native-stop divergence.
+- **DESK-01:** Windows daemon removed (unauthenticated named-pipe transport
+  + LocalSystem install path). Windows remains supported in-process.
+- **ACL-01:** `get_desired_state_status` now has generated permission tokens
+  and is in the default capability set.
+- **WIRE-01:** Notification-permission commands return the scalar `String`
+  (matching the TS `NotificationPermissionStatus` union), not the
+  `{status}` object.
+- **E2E-01:** `run-tests.py` now parses UIAutomator XML and asserts per-case
+  predicates; the agent response is no longer the oracle.
+
+### Fixed (High)
+- **CORE-03:** `PluginConfig::validate` — rejects `channelCapacity=0`,
+  invalid Android notification IDs, empty channel names, unknown timeout
+  policies, invalid desktop mode, and non-positive timers before setup.
+- **CORE-04:** `FileDesiredStateBackend::save` is now transactional
+  (sibling temp + fsync + rename).
+- **WIRE-02:** `processExit` added to the TypeScript `StopReason` union;
+  native timeout listener now maps to `platformTimeout` (not the invalid
+  `timeout`).
+- **AND-01..10:** Android foreground-service-type preflight validates
+  against the merged manifest; outgoing-call path deleted; bridge result
+  treats `ok` as discriminator; boot receiver handles
+  `ForegroundServiceStartNotAllowedException`; pre-load events queued;
+  timeout dispatches `bridge.stop`; dead auto-start keys removed;
+  edge-path fixes; library no longer declares
+  `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`.
+- **IOS-PUSH-01:** PushKit surface removed (no relay shipped).
+- **IOS-CALL-01:** Public main-thread `callActionHandler` on
+  `BackgroundServicePlugin`.
+- **IOS-MSG-01:** `showMessageNotification` implemented on iOS with
+  `UNNotificationRequest` + category/actions.
+- **IOS-SCHED-01:** BGTask `register` Bool results captured; numeric
+  config clamped.
+- **CI-01/02/03:** Lint fatal; `npm test` + `xcodebuild test` run; MSRV
+  1.77.2; `--all-targets`; `RUSTDOCFLAGS=-D warnings`; x86_64 Android;
+  least-privilege permissions + concurrency + rust-cache.
+- **REL-01:** Release validated (tag==Cargo==npm); `cargo publish` without
+  `--no-verify`; npm chained to crate via `needs`.
+- **REPO-01:** Plaintext secret removed; git history confirmed empty;
+  orphan artifacts deleted; `.gitignore` narrowed.
+- **DOC-01..05:** API reference, Android, iOS, desktop, and metadata docs
+  reconciled against source.
+
+### Fixed (Medium/Low)
+- **CORE-05..07:** Boot-replay diagnostic; notification ID masked to
+  `[1, i32::MAX]`; `NotificationPermissionStatus` `#[non_exhaustive]`;
+  orphan `service_status.toml` removed.
+- **DESK-02..06:** OS-service status wraps native `ServiceManager::status`;
+  persistent client mirrors desired-state on Start/Stop; daemon reports
+  `osService`; restart stop-then-start; loopback syscall test + headless
+  example.
+- **TESTAPP-01:** Desktop-service feature enabled; official Tauri schema;
+  bounded Waydroid readiness poll.
+
+### Security
+- Windows named-pipe daemon with default DACL removed (DESK-01).
+- Plaintext API key removed from the repository (REPO-01). **Action
+  required:** rotate the previously exposed key at the provider.
+- Library AndroidManifest no longer declares Play-restricted
+  `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` (AND-09).
+
+### Added
+- `CODEBASE_AUDIT.md` — permanent findings ledger with evidence and
+  verification status for all 44 findings.
+- `examples/headless_daemon.rs` — compilable headless daemon example.
+- `test-app/oracle.py` + `test-app/test_oracle.py` — pure-Python E2E
+  oracle module + 42 fixture tests.
+
 ## [1.0.0] - 2026-07-16
 
 First stable release. The production implementation matured inside a host app
@@ -328,10 +411,11 @@ no-op defaults.
 - Desktop standard Tokio task execution
 - TypeScript API: `startService()`, `stopService()`, `isServiceRunning()`, `onPluginEvent()`
 - Permissions system with `allow-start`, `allow-stop`, `allow-is-running`
-- `Notifier` helper for fire-and-forget local notifications
 - `StartConfig` with configurable `serviceLabel` and `foregroundServiceType`
 
-[Unreleased]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.7.1...HEAD
+[Unreleased]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v1.0.1...HEAD
+[1.0.1]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v1.0.0...plugin-v1.0.1
+[1.0.0]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.7.1...plugin-v1.0.0
 [0.7.1]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.7.0...plugin-v0.7.1
 [0.7.0]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.6.0...plugin-v0.7.0
 [0.6.0]: https://github.com/dardourimohamed/tauri-background-service/compare/plugin-v0.5.2...plugin-v0.6.0

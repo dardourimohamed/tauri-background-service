@@ -31,8 +31,8 @@ Add the following permissions to your app's `AndroidManifest.xml` (inside the `<
 <!-- Required for all foreground services -->
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
-<!-- Required for the default foregroundServiceType "dataSync" -->
-<uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+<!-- Required for the default foregroundServiceType "remoteMessaging" -->
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
 
 <!-- Required on Android 13+ (API 33) to show the foreground notification -->
 <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -49,11 +49,18 @@ If you use `foregroundServiceType: "specialUse"`, replace `FOREGROUND_SERVICE_DA
 | Permission | Required Since | Purpose |
 |-----------|---------------|---------|
 | `FOREGROUND_SERVICE` | API 28 (Android 9) | Allows starting foreground services |
-| `FOREGROUND_SERVICE_DATA_SYNC` | API 34 (Android 14) | Required for `dataSync` service type |
+| `FOREGROUND_SERVICE_REMOTE_MESSAGING` | API 34 (Android 14) | Required for the default `remoteMessaging` service type |
+| `FOREGROUND_SERVICE_DATA_SYNC` | API 34 (Android 14) | Required if you use the `dataSync` service type |
 | `FOREGROUND_SERVICE_SPECIAL_USE` | API 34 (Android 14) | Required for `specialUse` service type |
-| `POST_NOTIFICATIONS` | API 33 (Android 13) | Runtime permission for notifications |
+| `POST_NOTIFICATIONS` | API 33 (Android 13) | Runtime permission for user-facing notifications |
 
-The plugin automatically requests `POST_NOTIFICATIONS` at runtime when the WebView loads (see `BackgroundServicePlugin.load()`). No additional code is needed.
+The plugin does **not** automatically request `POST_NOTIFICATIONS` when the
+WebView loads — the `androidRequestNotificationPermissionOnLoad` config defaults
+to `false`. By default the permission is resolved lazily, at the first
+`startService()` (before the foreground notification posts), and the explicit
+`requestNotificationPermission()` command is available for a user-driven consent
+flow. Set `androidRequestNotificationPermissionOnLoad: true` in the plugin
+config to request at load instead.
 
 ## Foreground Service Type
 
@@ -72,7 +79,7 @@ await startService({
 
 | Type | Android Constant | Required Permission | Use Case |
 |------|-----------------|---------------------|----------|
-| `"dataSync"` (default) | `FOREGROUND_SERVICE_TYPE_DATA_SYNC` | `FOREGROUND_SERVICE_DATA_SYNC` | Data synchronization, file uploads/downloads, API polling |
+| `"dataSync"` | `FOREGROUND_SERVICE_TYPE_DATA_SYNC` | `FOREGROUND_SERVICE_DATA_SYNC` | Data synchronization, file uploads/downloads, API polling |
 | `"mediaPlayback"` | `FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK` | `FOREGROUND_SERVICE_MEDIA_PLAYBACK` | Audio/video playback |
 | `"phoneCall"` | `FOREGROUND_SERVICE_TYPE_PHONE_CALL` | `FOREGROUND_SERVICE_PHONE_CALL` | Ongoing phone calls |
 | `"location"` | `FOREGROUND_SERVICE_TYPE_LOCATION` | `FOREGROUND_SERVICE_LOCATION` | Location tracking |
@@ -81,17 +88,28 @@ await startService({
 | `"camera"` | `FOREGROUND_SERVICE_TYPE_CAMERA` | `FOREGROUND_SERVICE_CAMERA` | Camera access |
 | `"microphone"` | `FOREGROUND_SERVICE_TYPE_MICROPHONE` | `FOREGROUND_SERVICE_MICROPHONE` | Microphone access |
 | `"health"` | `FOREGROUND_SERVICE_TYPE_HEALTH` | `FOREGROUND_SERVICE_HEALTH` | Health/fitness data |
-| `"remoteMessaging"` | `FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING` | `FOREGROUND_SERVICE_REMOTE_MESSAGING` | Push messaging |
+| `"remoteMessaging"` (default) | `FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING` | `FOREGROUND_SERVICE_REMOTE_MESSAGING` | Push messaging — the Play-policy-safe default for a long-lived keepalive |
 | `"systemExempted"` | `FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED` | `FOREGROUND_SERVICE_SYSTEM_EXEMPTED` | System-critical operations |
 | `"shortService"` | `FOREGROUND_SERVICE_TYPE_SHORT_SERVICE` | `FOREGROUND_SERVICE_SHORT_SERVICE` | Short-lived tasks (< 3 minutes) |
 | `"specialUse"` | `FOREGROUND_SERVICE_TYPE_SPECIAL_USE` | `FOREGROUND_SERVICE_SPECIAL_USE` | Custom use cases (requires Play Console justification) |
 | `"mediaProcessing"` | `FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING` | `FOREGROUND_SERVICE_MEDIA_PROCESSING` | Media transcoding/processing |
 
-Unrecognized type strings fall back to `FOREGROUND_SERVICE_TYPE_DATA_SYNC` with a warning logged to logcat.
+Unrecognized type strings are **rejected** before the service starts (see
+[Preflight Validation](#preflight-validation) and [Manifest-declared type
+check](#manifest-declared-type-check-and-01)). They no longer fall back to
+`dataSync` — an invalid or undeclared type fails fast with a structured error
+instead of crashing late at `startForeground`.
 
 ### Choosing a Type
 
-- Use **`"dataSync"`** (default) for most background work: syncing data, periodic API calls, file transfers.
+- Use **`"remoteMessaging"`** (the default) for a long-lived keepalive. It is
+  the Play-policy-safe choice: Google Play restricts most other FGS types
+  (notably `dataSync`, which is subject to a 6-hour cumulative timeout and is
+  blocked from boot-time start on Android 15+) to apps whose foreground use case
+  matches the type. `remoteMessaging` is the least-restricted type available to
+  a general background-service plugin.
+- Use **`"dataSync"`** only if your service genuinely synchronizes user data on
+  the user's behalf — and accept its 6-hour/24h cap and boot-recovery limits.
 - Use **`"specialUse"`** only when your use case doesn't fit any standard category. Google Play requires you to declare a justification for this type in the Play Console under **App Content → Foreground Services**.
 
 ## Foreground Service Type Configuration
@@ -106,7 +124,7 @@ Add these fields to your plugin config in `tauri.conf.json`:
 {
   "plugins": {
     "background-service": {
-      "androidForegroundServiceTypes": ["dataSync"],
+      "androidForegroundServiceTypes": ["remoteMessaging"],
       "androidValidateForegroundServiceType": true
     }
   }
@@ -117,7 +135,7 @@ Add these fields to your plugin config in `tauri.conf.json`:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `androidForegroundServiceTypes` | `string[]` | `["dataSync"]` | List of foreground service types allowed for `startService()`. The preflight validation rejects any type not in this list. |
+| `androidForegroundServiceTypes` | `string[]` | `["remoteMessaging"]` | List of foreground service types allowed for `startService()`. The preflight validation rejects any type not in this list. |
 | `androidValidateForegroundServiceType` | `boolean` | `true` | Whether to validate the requested type against the allowlist before starting the service. Set to `false` to skip validation. |
 
 If you use multiple foreground service types (e.g., your app supports both `dataSync` and `specialUse`), declare all of them:
@@ -155,13 +173,58 @@ Declare the `FOREGROUND_SERVICE` permission plus a type-specific permission for 
 <!-- Required for all foreground services -->
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
-<!-- Required for "dataSync" (default) -->
-<uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+<!-- Required for "remoteMessaging" (default) -->
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
 ```
 
 ### Service Declaration
 
-The plugin's `LifecycleService` is declared in the plugin's own manifest with `foregroundServiceType="dataSync|specialUse"`. This over-declaration is intentional — the manifest is static, while the actual type is selected at runtime via `startService()` config.
+The plugin's `LifecycleService` is declared in the plugin's own
+`AndroidManifest.xml` with:
+
+```xml
+android:foregroundServiceType="dataSync|remoteMessaging|specialUse|phoneCall|microphone"
+```
+
+These **five library-declared types** cover the plugin's own use cases (the
+default keepalive `remoteMessaging`, plus `phoneCall`/`microphone` for the
+incoming-call path, `dataSync`, and `specialUse`). The manifest is static while
+the actual type is selected at runtime via `startService()` config, so the
+library declares the union it might promote to.
+
+**Extending with a host-merged manifest.** To use a type the library does not
+declare (e.g. `location`, `camera`, `health`, `mediaPlayback`), the **host app**
+must add it to the merged `<service>` declaration. The manifest merger combines
+the library and host declarations, so re-declaring the service in your app
+manifest with an extended `android:foregroundServiceType` adds the missing bit:
+
+```xml
+<service
+    android:name="app.tauri.backgroundservice.LifecycleService"
+    android:foregroundServiceType="remoteMessaging|location"
+    tools:replace="android:foregroundServiceType" />
+```
+
+Also declare the matching `FOREGROUND_SERVICE_*` permission in your host
+manifest for every type you add.
+
+### Manifest-declared type check (AND-01)
+
+Even a type that passes the config allowlist is **rejected before dispatch** if
+its bit is absent from the merged `<service android:foregroundServiceType>`.
+This prevents a late native crash at `startForeground(...)` on Android 14+ (the
+OS rejects an undeclared type bit there). The plugin reads
+`ServiceInfo.foregroundServiceType` from the merged manifest and rejects with a
+structured `fgs_type_not_declared` error:
+
+```
+Foreground service type 'location' is allowlisted but not declared in the
+merged <service foregroundServiceType>. Declare it (and the matching
+FOREGROUND_SERVICE_* permission) in the host manifest.
+```
+
+On API < 29 the `foregroundServiceType` field does not exist, so the check is
+skipped (the config allowlist already gates the type).
 
 ### specialUse Type
 
@@ -185,7 +248,7 @@ If you use `foregroundServiceType: "specialUse"`, you must also:
 
 | If using | Add to manifest |
 |----------|----------------|
-| `"dataSync"` (default) | `FOREGROUND_SERVICE_DATA_SYNC` permission |
+| `"remoteMessaging"` (default) | `FOREGROUND_SERVICE_REMOTE_MESSAGING` permission |
 | `"specialUse"` | `FOREGROUND_SERVICE_SPECIAL_USE` permission |
 | `"location"` | `FOREGROUND_SERVICE_LOCATION` + `ACCESS_FINE_LOCATION` or `ACCESS_COARSE_LOCATION` |
 | `"camera"` | `FOREGROUND_SERVICE_CAMERA` + `CAMERA` |
@@ -372,7 +435,7 @@ When your app is updated (either via Google Play or sideload), the `MY_PACKAGE_R
 
 ### Recovery Notification
 
-When the `BootReceiver` cannot start the service directly (blocked type on API 35+), or when the `LifecycleService` is restarted by `START_STICKY` after an OS kill, it posts a recovery notification:
+When the `BootReceiver` cannot start the service directly, it persists the recovery intent and posts **one** recovery notification. This covers both the static API-35+ blocked-type set **and** any runtime `ForegroundServiceStartNotAllowedException` for a type/reason the static set does not know about (newer OS restrictions) — every rejection takes the same recovery path. The same notification is posted when the `LifecycleService` is restarted by `START_STICKY` after an OS kill:
 
 - **Channel:** `"bg_service_recovery"` (importance: high)
 - **ID:** `9002`
@@ -552,14 +615,31 @@ Foreground services have stricter launch requirements:
 
 - Foreground service types are mandatory. Each type requires its corresponding permission.
 - The system enforces a timeout via `onTimeout()`. Long-running services may be killed.
+- **Full-screen-intent observability (API 29–33):** whether `USE_FULL_SCREEN_INTENT` is granted is not queryable before API 34. The plugin returns an optimistic result on those levels; treat `canUseFullScreenIntent()` as advisory on API 29–33 and authoritative on API 34+.
 
 ### OEM Battery Optimization
 
 Some device manufacturers (Xiaomi, Huawei, Samsung) implement aggressive battery optimization that can kill foreground services despite `START_STICKY`. Common workarounds:
 
 - Ask users to disable battery optimization for your app in system settings
-- Use `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` intent to prompt directly
+- Request the Doze exemption via the `requestBatteryExemption()` command (it fires `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`); see [Battery optimization exemption](#battery-optimization-exemption-and-09) — the host must opt in
 - Test on real devices, not just the emulator
+
+### Battery optimization exemption (AND-09)
+
+The library manifest does **not** declare `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`
+— it is Play-policy-restricted (Google Play rejects apps that declare it without
+a qualifying core use case). The `requestBatteryExemption()` command still ships
+and launches the system Doze-exemption dialog, but the **host app** must declare
+the permission in its own manifest to authorize that dialog:
+
+```xml
+<uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+```
+
+Without the host-declared permission, the dialog throws a `SecurityException` at
+runtime. Declare it only if your app's use case qualifies under Google Play
+policy.
 
 ## Debugging
 
@@ -602,4 +682,4 @@ Ensure you're calling `startForeground()` in `onStartCommand()`. The plugin hand
 Check if your app is excluded from battery optimization. Some OEMs ignore `START_STICKY` entirely for battery-optimized apps.
 
 **Notification not showing on Android 13+:**
-Verify `POST_NOTIFICATIONS` permission is granted. The plugin requests it automatically, but users can deny it.
+Verify `POST_NOTIFICATIONS` permission is granted. The plugin resolves it lazily at the first `startService()` (not automatically at load by default), and users can deny it.

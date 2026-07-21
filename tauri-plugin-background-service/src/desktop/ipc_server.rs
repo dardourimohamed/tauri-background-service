@@ -461,7 +461,12 @@ async fn handle_request<R: Runtime>(
             let (reply, rx) = tokio::sync::oneshot::channel();
             if cmd_tx
                 .send(ManagerCommand::GetLifecycleStatus {
-                    desktop_mode: None,
+                    // DESK-04: the headless sidecar is intrinsically an OS
+                    // service (systemd/launchd). Reporting `None` left the
+                    // GUI reporting `desktopInProcess` even when connected to
+                    // a real daemon. Pin `Some("osService")` without a
+                    // protocol change.
+                    desktop_mode: Some("osService".to_string()),
                     reply,
                 })
                 .await
@@ -740,6 +745,36 @@ mod tests {
         let data = resp.data.unwrap();
         assert_eq!(data["state"], "idle");
         assert_eq!(data["lastError"], serde_json::Value::Null);
+
+        shutdown.cancel();
+        let _ = handle.await;
+    }
+
+    // ── DESK-04: server reports `osService` mode ──────────────────────────
+
+    #[tokio::test]
+    async fn desk04_server_reports_os_service_mode_in_lifecycle_status() {
+        // The headless sidecar is intrinsically an OS service. The server
+        // MUST pass `Some("osService")` (not `None`) so a connected GUI
+        // reports DesktopOsService, not DesktopInProcess.
+        let (server, path, shutdown) = setup_server();
+        let s = shutdown.clone();
+        let handle = tokio::spawn(async move { server.run(s).await });
+
+        let mut stream = connect(&path).await;
+        send_request(&mut stream, &IpcRequest::GetLifecycleStatus).await;
+        let resp = read_response(&mut stream).await;
+        assert!(
+            resp.ok,
+            "GetLifecycleStatus should succeed: {:?}",
+            resp.error
+        );
+        let data = resp.data.unwrap();
+        let caps = &data["capabilities"];
+        assert_eq!(
+            caps["lifecycleMode"], "desktopOsService",
+            "connected daemon must report desktopOsService, got: {caps}"
+        );
 
         shutdown.cancel();
         let _ = handle.await;

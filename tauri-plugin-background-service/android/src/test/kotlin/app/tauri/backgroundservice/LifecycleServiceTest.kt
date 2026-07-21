@@ -61,10 +61,10 @@ class LifecycleServiceTest {
         LifecycleService.coreStopExecutor = LifecycleService.DEFAULT_CORE_STOP_EXECUTOR
         LifecycleService.isRunning = false
         LifecycleService.isForeground = false
-        LifecycleService.autoRestarting = false
         BackgroundServicePlugin.onTimeoutEvent = null
         BackgroundServicePlugin.onNativeLifecycleEvent = null
         BackgroundServicePlugin.onPlatformErrorEvent = null
+        NativeEventQueue.resetForTest()
     }
 
     // ── onStartCommand: ACTION_STOP ────────────────────────────────────
@@ -430,7 +430,6 @@ class LifecycleServiceTest {
 
         controller.destroy()
         assertFalse("Should not be running after destroy", LifecycleService.isRunning)
-        assertFalse("Should not be autoRestarting after destroy", LifecycleService.autoRestarting)
     }
 
     // ── R-W1.4: native isRunning is the cross-bridge state authority ───
@@ -1105,7 +1104,6 @@ class LifecycleServiceTest {
 
         // Cleanup
         LifecycleService.isRunning = false
-        LifecycleService.autoRestarting = false
     }
 
     // ── buildTimeoutState ─────────────────────────────────────────────
@@ -1185,6 +1183,72 @@ class LifecycleServiceTest {
         assertFalse("recoveryPending should be false for stop policy", state.recoveryPending)
 
         // Cleanup
+        LifecycleService.isRunning = false
+    }
+
+    @Test
+    @Config(sdk = [33])
+    fun handleTimeout_dispatchesCoreStopWithAndroidTimeoutBeforeServiceStop() {
+        // AND-06: handleTimeout must dispatch bridge.stop(reason="android_timeout")
+        // off-main BEFORE stopForeground/stopSelf, so the host flushes/tears down.
+        prefs.edit().clear().apply()
+        DurableState.clear(context)
+        prefs.edit()
+            .putString("bg_service_label", "Syncing")
+            .putString("bg_service_type", "dataSync")
+            .putString("bg_on_timeout_policy", "stop")
+            .apply()
+
+        var stopCount = 0
+        var stopReason: String? = null
+        var runningAtStop: Boolean? = null
+        val recordingBridge = object : CoreBridge {
+            override fun start(context: Context, reason: String) =
+                FakeCoreBridge(result = "running").start(context, reason)
+            override fun stop(context: Context, reason: String): HeadlessBridgeResult {
+                stopCount++
+                stopReason = reason
+                runningAtStop = LifecycleService.isRunning
+                return FakeCoreBridge().stop(context, reason)
+            }
+            override fun notifyNetworkChanged(): HeadlessBridgeResult =
+                FakeCoreBridge().notifyNetworkChanged()
+        }
+        LifecycleService.bridgeProvider = { recordingBridge }
+        // coreStopExecutor is inline (setup) so the stop is observed synchronously
+        // before the cheap teardown that follows it in handleTimeout.
+
+        val intent = Intent(context, LifecycleService::class.java).apply {
+            action = LifecycleService.ACTION_START
+            putExtra(LifecycleService.EXTRA_LABEL, "Syncing")
+            putExtra(LifecycleService.EXTRA_SERVICE_TYPE, "dataSync")
+        }
+        val service = Robolectric.buildService(LifecycleService::class.java)
+            .withIntent(intent)
+            .create()
+            .get()
+        service.onStartCommand(intent, 0, 0)
+        assertTrue("Precondition: should be running", LifecycleService.isRunning)
+
+        service.handleTimeout(ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+
+        assertEquals(
+            "exactly one bridge.stop must be dispatched on timeout",
+            1,
+            stopCount,
+        )
+        assertEquals(
+            "the timeout core stop must carry reason android_timeout",
+            "android_timeout",
+            stopReason,
+        )
+        assertEquals(
+            "bridge.stop must run BEFORE stopForeground/stopSelf (service still running)",
+            true,
+            runningAtStop,
+        )
+        assertFalse("service must be stopped after handleTimeout", LifecycleService.isRunning)
+
         LifecycleService.isRunning = false
     }
 
@@ -1708,7 +1772,6 @@ class LifecycleServiceTest {
 
         // Cleanup
         LifecycleService.isRunning = false
-        LifecycleService.autoRestarting = false
     }
 
     // ── Recovery start-acceptance emits (D1, spec01 Step 3) ────────────
@@ -1934,7 +1997,6 @@ class LifecycleServiceTest {
 
         // Cleanup
         LifecycleService.isRunning = false
-        LifecycleService.autoRestarting = false
     }
 
     @Test
@@ -1967,6 +2029,142 @@ class LifecycleServiceTest {
         assertEquals("Test", state.lastServiceLabel)
 
         // Cleanup
+        LifecycleService.isRunning = false
+    }
+
+    // ── AND-07: restartAttempt transitions ─────────────────────────────
+
+    @Test
+    @Config(sdk = [33])
+    fun osRestart_incrementsRestartAttempt() {
+        prefs.edit()
+            .putString("bg_service_label", "Syncing")
+            .putString("bg_service_type", "dataSync")
+            .apply()
+        DurableState.save(context, DurableState(desiredRunning = true, restartAttempt = 0))
+        LifecycleService.bridgeProvider = { FakeCoreBridge(result = "running") }
+
+        val service = Robolectric.buildService(LifecycleService::class.java)
+            .withIntent(Intent(context, LifecycleService::class.java).apply {
+                action = LifecycleService.ACTION_START
+            })
+            .create()
+            .get()
+
+        service.onStartCommand(null, 0, 0)
+
+        assertEquals(
+            "an OS (START_STICKY) restart must increment restartAttempt",
+            1,
+            DurableState.load(context).restartAttempt,
+        )
+
+        LifecycleService.isRunning = false
+    }
+
+    @Test
+    @Config(sdk = [33])
+    fun osRestart_monotonicAcrossRestarts() {
+        prefs.edit()
+            .putString("bg_service_label", "Syncing")
+            .putString("bg_service_type", "dataSync")
+            .apply()
+        DurableState.save(context, DurableState(desiredRunning = true, restartAttempt = 0))
+        LifecycleService.bridgeProvider = { FakeCoreBridge(result = "running") }
+
+        val service = Robolectric.buildService(LifecycleService::class.java)
+            .withIntent(Intent(context, LifecycleService::class.java).apply {
+                action = LifecycleService.ACTION_START
+            })
+            .create()
+            .get()
+
+        service.onStartCommand(null, 0, 0)
+        service.onStartCommand(null, 0, 0)
+
+        assertEquals(
+            "restartAttempt must be monotonic across OS restarts",
+            2,
+            DurableState.load(context).restartAttempt,
+        )
+
+        LifecycleService.isRunning = false
+    }
+
+    @Test
+    @Config(sdk = [33])
+    fun explicitStart_resetsRestartAttemptToZero() {
+        prefs.edit().clear().apply()
+        // A prior run accumulated backoff pressure.
+        DurableState.save(context, DurableState(desiredRunning = true, restartAttempt = 3))
+        LifecycleService.bridgeProvider = { FakeCoreBridge(result = "running") }
+
+        val intent = Intent(context, LifecycleService::class.java).apply {
+            action = LifecycleService.ACTION_START
+            putExtra(LifecycleService.EXTRA_LABEL, "Manual")
+            putExtra(LifecycleService.EXTRA_SERVICE_TYPE, "dataSync")
+        }
+        val service = Robolectric.buildService(LifecycleService::class.java)
+            .withIntent(intent)
+            .create()
+            .get()
+
+        service.onStartCommand(intent, 0, 0)
+
+        assertEquals(
+            "a successful explicit start must reset restartAttempt to 0",
+            0,
+            DurableState.load(context).restartAttempt,
+        )
+
+        LifecycleService.isRunning = false
+    }
+
+    // ── AND-10: direct unit-level analog of the permission-denial path ──
+
+    /**
+     * AND-10: a direct, deterministic unit-level analog of the
+     * (Waydroid-gated) `PermissionDenialTest` instrumentation — the foreground
+     * service notification is POST_NOTIFICATIONS-exempt, so the service must
+     * start and persist its config even though POST_NOTIFICATIONS is not
+     * granted. Pins the denied-permission precondition so the assertion is not
+     * vacuous, then exercises the same ACTION_START path the instrumentation
+     * covers.
+     */
+    @Test
+    @Config(sdk = [33])
+    fun serviceStart_persistsConfig_evenWhenPostNotificationsNotGranted() {
+        val granted = context.checkSelfPermission(
+            android.Manifest.permission.POST_NOTIFICATIONS
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        assertFalse(
+            "precondition: POST_NOTIFICATIONS must NOT be granted for this denial analog",
+            granted,
+        )
+
+        prefs.edit().clear().apply()
+        DurableState.clear(context)
+        LifecycleService.bridgeProvider = { FakeCoreBridge(result = "running") }
+
+        val intent = Intent(context, LifecycleService::class.java).apply {
+            action = LifecycleService.ACTION_START
+            putExtra(LifecycleService.EXTRA_LABEL, "No Permission")
+            putExtra(LifecycleService.EXTRA_SERVICE_TYPE, "dataSync")
+        }
+        val service = Robolectric.buildService(LifecycleService::class.java)
+            .withIntent(intent)
+            .create()
+            .get()
+        service.onStartCommand(intent, 0, 0)
+
+        assertTrue(
+            "the FGS must start even when POST_NOTIFICATIONS is denied",
+            LifecycleService.isRunning,
+        )
+        val state = DurableState.load(context)
+        assertTrue("config must persist despite the denial", state.desiredRunning)
+        assertEquals("No Permission", state.lastServiceLabel)
+
         LifecycleService.isRunning = false
     }
 
@@ -2174,7 +2372,6 @@ class LifecycleServiceTest {
         // Cleanup
         service.onDestroy()
         LifecycleService.isRunning = false
-        LifecycleService.autoRestarting = false
     }
 
     @Test

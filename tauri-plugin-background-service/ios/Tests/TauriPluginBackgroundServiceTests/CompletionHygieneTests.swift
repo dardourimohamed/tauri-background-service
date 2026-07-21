@@ -11,37 +11,32 @@ final class CompletionHygieneTests: XCTestCase {
 
     private var plugin: BackgroundServicePlugin!
     private var scheduler: FakeBGTaskScheduler!
+    private var suite: UserDefaults!
 
     override func setUp() {
         super.setUp()
         plugin = BackgroundServicePlugin()
         scheduler = FakeBGTaskScheduler()
         plugin.scheduler = scheduler
+        // IOS-CLEAN-01: isolate persistence so this class cannot leak state
+        // into `.standard` or another class's suite. `clearKeys()` previously
+        // cleared only a subset; `TestDefaults.clearAll(on:)` clears the
+        // canonical complete list.
+        suite = TestDefaults.makeIsolatedSuite()
+        plugin.defaults = suite
         // `startKeepalive` now requests notification authorization (M4); inject the
         // fake so the real `UNUserNotificationCenter.current()` isn't touched in the
         // test host (which has no app bundle).
         plugin.notificationAuthorizer = FakeNotificationAuthorizer()
-        clearKeys()
+        TestDefaults.clearAll(on: suite)
     }
 
     override func tearDown() {
-        clearKeys()
+        TestDefaults.clearAll(on: suite)
         plugin = nil
         scheduler = nil
+        suite = nil
         super.tearDown()
-    }
-
-    private func clearKeys() {
-        let d = UserDefaults.standard
-        for key in [
-            "ios_desired_running", "ios_last_schedule_error", "ios_last_start_config",
-            "ios_last_task_kind", "ios_last_task_started_at", "ios_last_task_completed_at",
-            "ios_last_refresh_scheduled", "ios_last_processing_scheduled",
-            "ios_last_refresh_error", "ios_last_processing_error",
-            "ios_last_task_outcome", "ios_adaptive_processing_begin_minutes",
-        ] {
-            d.removeObject(forKey: key)
-        }
     }
 
     // MARK: - M1: waitForCancel supersedes a stale pending invoke
@@ -64,31 +59,31 @@ final class CompletionHygieneTests: XCTestCase {
     // MARK: - M2: scheduleNext owns lastScheduleError (set then cleared)
 
     func testScheduleNext_setsThenClearsAggregateScheduleError_viaBackgroundReschedule() {
-        UserDefaults.standard.set(true, forKey: "ios_desired_running")
+        suite.set(true, forKey: "ios_desired_running")
 
         // A background-transition reschedule that fails must make the error visible.
         scheduler.submitError = FakeSchedulerError()
         plugin.appDidEnterBackground()
         XCTAssertNotNil(
-            UserDefaults.standard.string(forKey: "ios_last_schedule_error"),
+            suite.string(forKey: "ios_last_schedule_error"),
             "a failed background reschedule must persist lastScheduleError (single source = scheduleNext)")
 
         // A subsequent successful reschedule clears the stale error.
         scheduler.submitError = nil
         plugin.appDidEnterBackground()
         XCTAssertNil(
-            UserDefaults.standard.string(forKey: "ios_last_schedule_error"),
+            suite.string(forKey: "ios_last_schedule_error"),
             "a successful reschedule must clear the stale lastScheduleError")
     }
 
     func testScheduleNext_tracksRefreshAndProcessingErrorsIndependently() {
-        UserDefaults.standard.set(true, forKey: "ios_desired_running")
+        suite.set(true, forKey: "ios_desired_running")
         // Fail only the processing identifier; refresh still succeeds.
         scheduler.shouldFailSubmit = { $0.identifier.hasSuffix(".bg-processing") }
 
         plugin.appDidEnterBackground()
 
-        let d = UserDefaults.standard
+        let d = suite
         XCTAssertNil(d.string(forKey: "ios_last_refresh_error"),
                      "refresh succeeded → no refresh error")
         XCTAssertNotNil(d.string(forKey: "ios_last_processing_error"),
@@ -116,7 +111,7 @@ final class CompletionHygieneTests: XCTestCase {
     // MARK: - L1: one pending request per identifier across start/background combos
 
     func testScheduleNext_keepsAtMostOnePendingPerIdentifier() {
-        UserDefaults.standard.set(true, forKey: "ios_desired_running")
+        suite.set(true, forKey: "ios_desired_running")
 
         // Start, then a background transition, then another — each reschedules.
         plugin.startKeepalive(InvokeCapture().makeInvoke(args: "{}"))
@@ -136,7 +131,7 @@ final class CompletionHygieneTests: XCTestCase {
     // MARK: - L2: appWillEnterForeground reconciles like appDidEnterBackground
 
     func testForeground_reschedulesWhenDesiredAndNoActiveTask() {
-        UserDefaults.standard.set(true, forKey: "ios_desired_running")
+        suite.set(true, forKey: "ios_desired_running")
 
         plugin.appWillEnterForeground()
 
@@ -145,7 +140,7 @@ final class CompletionHygieneTests: XCTestCase {
     }
 
     func testForeground_doesNotRescheduleWhenNotDesired() {
-        UserDefaults.standard.set(false, forKey: "ios_desired_running")
+        suite.set(false, forKey: "ios_desired_running")
 
         plugin.appWillEnterForeground()
 

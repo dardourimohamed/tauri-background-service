@@ -11,6 +11,7 @@ import BackgroundTasks
 final class PendingTaskLifecycleTests: XCTestCase {
 
     private var plugin: BackgroundServicePlugin!
+    private var suite: UserDefaults!
 
     // The literal UserDefaults keys the plugin persists pending state under
     // (mirrors `PendingTaskKeys`, which is private).
@@ -23,29 +24,25 @@ final class PendingTaskLifecycleTests: XCTestCase {
     override func setUp() {
         super.setUp()
         plugin = BackgroundServicePlugin()
-        clearKeys()
+        // IOS-CLEAN-01: isolated suite so this class cannot leak state.
+        suite = TestDefaults.makeIsolatedSuite()
+        plugin.defaults = suite
+        TestDefaults.clearAll(on: suite)
     }
 
     override func tearDown() {
-        clearKeys()
+        TestDefaults.clearAll(on: suite)
         plugin = nil
+        suite = nil
         super.tearDown()
-    }
-
-    private func clearKeys() {
-        let d = UserDefaults.standard
-        for key in [kindKey, identifierKey, receivedAtKey, consumedAtKey, lastFailedAtKey] {
-            d.removeObject(forKey: key)
-        }
     }
 
     /// Simulate a stored, unconsumed pending BGTask record.
     private func storePending(kind: String = "refresh", identifier: String = "com.example.bg-refresh") {
-        let d = UserDefaults.standard
-        d.set(kind, forKey: kindKey)
-        d.set(identifier, forKey: identifierKey)
-        d.set(1_700_000_000.0 as TimeInterval, forKey: receivedAtKey)
-        d.removeObject(forKey: consumedAtKey)
+        suite.set(kind, forKey: kindKey)
+        suite.set(identifier, forKey: identifierKey)
+        suite.set(1_700_000_000.0 as TimeInterval, forKey: receivedAtKey)
+        suite.removeObject(forKey: consumedAtKey)
     }
 
     // MARK: - H5: clear hides pending and deletes all keys
@@ -73,7 +70,7 @@ final class PendingTaskLifecycleTests: XCTestCase {
         XCTAssertTrue(payload.contains("\"taskKind\":null"),
                       "pending must be None after clear: \(payload)")
 
-        let d = UserDefaults.standard
+        let d = suite
         XCTAssertNil(d.object(forKey: kindKey), "kind key must be deleted")
         XCTAssertNil(d.object(forKey: identifierKey), "identifier key must be deleted")
         XCTAssertNil(d.object(forKey: receivedAtKey), "receivedAt key must be deleted")
@@ -85,7 +82,7 @@ final class PendingTaskLifecycleTests: XCTestCase {
     func testGet_consumedRecord_reportsNoPending() {
         storePending()
         // Stamp consumedAt without deleting the other keys (a stale record).
-        UserDefaults.standard.set(1_700_000_060.0 as TimeInterval, forKey: consumedAtKey)
+        suite.set(1_700_000_060.0 as TimeInterval, forKey: consumedAtKey)
 
         let capture = InvokeCapture()
         plugin.getPendingBgTask(capture.makeInvoke())
@@ -130,7 +127,7 @@ final class PendingTaskLifecycleTests: XCTestCase {
                       "pending must be preserved after a recorded failure: \(payload)")
 
         // The failure marker is stamped for diagnostics.
-        let marker = UserDefaults.standard.object(forKey: lastFailedAtKey) as? TimeInterval
+        let marker = suite.object(forKey: lastFailedAtKey) as? TimeInterval
         XCTAssertEqual(marker, 1_700_000_500.0,
                        "lastFailedAt marker must be stamped via the clock seam")
     }

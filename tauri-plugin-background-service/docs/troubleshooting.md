@@ -16,19 +16,25 @@ Common issues and solutions when integrating `tauri-plugin-background-service`. 
 
 ```xml
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-<uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
 ```
 
-2. Declare the service type on the `<service>` element:
+> The default foreground service type is `remoteMessaging`. Replace the
+> `FOREGROUND_SERVICE_REMOTE_MESSAGING` permission with the matching
+> `FOREGROUND_SERVICE_*` permission for whichever type you configure.
+
+2. Declare the service type on the `<service>` element (the library already
+   declares `dataSync|remoteMessaging|specialUse|phoneCall|microphone`; extend
+   it via a merged manifest if you need more):
 
 ```xml
 <service
   android:name="app.tauri.backgroundservice.LifecycleService"
-  android:foregroundServiceType="dataSync"
+  android:foregroundServiceType="remoteMessaging"
   android:exported="false" />
 ```
 
-3. The plugin defaults to `"dataSync"`. If you use `specialUse`, also add:
+3. The plugin defaults to `"remoteMessaging"`. If you use `specialUse`, also add:
 
 ```xml
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
@@ -73,7 +79,7 @@ If auto-restart is pending, you'll see `bg_auto_start_pending` set to `true` wit
 
 **Symptom:** The background service does not automatically start after a device reboot on Android 15 (API 35), even though `desiredRunning` was `true` before reboot.
 
-**Root cause:** Android 15 blocks certain foreground service types from being started by `BOOT_COMPLETED` receivers. The default type `"dataSync"` is one of the blocked types. The `BootReceiver` cannot start the foreground service directly — it posts a recovery notification instead.
+**Root cause:** Android 15 blocks certain foreground service types from being started by `BOOT_COMPLETED` receivers. `dataSync` is one of the blocked types — if you have changed the default `remoteMessaging` to `dataSync`, the `BootReceiver` cannot start the foreground service directly and posts a recovery notification instead.
 
 **Blocked types on API 35+:** `dataSync`, `camera`, `mediaPlayback`, `phoneCall`, `mediaProjection`, `microphone`.
 

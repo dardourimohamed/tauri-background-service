@@ -34,11 +34,11 @@ These run in CI (`.github/workflows/ci.yml`) but should pass locally before push
 |---|-----------|-------|----------|
 | A1 | Start service | Call `startService({ serviceLabel: 'Test' })` | Persistent notification appears, `isServiceRunning()` returns `true`, `started` event fires |
 | A2 | Stop service | Call `stopService()` | Notification removed, `isServiceRunning()` returns `false`, `stopped` event fires |
-| A3 | FGS type validation (default) | Start with default config (`dataSync`) | Service starts with `FOREGROUND_SERVICE_TYPE_DATA_SYNC` |
+| A3 | FGS type validation (default) | Start with default config (`remoteMessaging`) | Service starts with `FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING` |
 | A4 | FGS type validation (custom) | Start with `foregroundServiceType: 'specialUse'` | Service starts with `FOREGROUND_SERVICE_TYPE_SPECIAL_USE`. Requires `FOREGROUND_SERVICE_SPECIAL_USE` permission and `PROPERTY_SPECIAL_USE_FGS_SUBTYPE` in manifest |
 | A5 | FGS type validation (invalid) | Start with `foregroundServiceType: 'invalidType'` | Returns error, service does not start |
 | A6 | Boot recovery | Enable auto-restart, reboot device | Service starts on boot (if type allows). If blocked (e.g. `dataSync` on API 35+), recovery notification appears |
-| A7 | Timeout handling | Start with `dataSync` type, wait for 6-hour cumulative timeout (or mock `onTimeout`) | Service stops, state persists with `nativeState: 'timeout'`, `stopped` event with `reason: 'timeout'` |
+| A7 | Timeout handling | Start with `dataSync` type, wait for 6-hour cumulative timeout (or mock `onTimeout`) | Service stops, state persists with `nativeState: 'timeout'`, `stopped` event with `reason: 'platformTimeout'` |
 | A8 | Notification customization | Configure `androidNotificationChannelName`, `androidNotificationSmallIcon`, `androidShowStopAction` | Notification uses custom channel name, icon, and shows stop action if enabled |
 | A9 | Force quit survival | Start service, force-quit app from settings | Service stops. This is unsupported by design |
 | A10 | `START_STICKY` restart | Start service, swipe app from recents | Service restarts via `START_STICKY` (best-effort, depends on OEM) |

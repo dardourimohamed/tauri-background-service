@@ -75,8 +75,12 @@ class MessageNotificationActionReceiver : BroadcastReceiver() {
         val chatId = intent.getStringExtra(ActionableMessageNotifier.EXTRA_CHAT_ID) ?: return
         val messageId = intent.getStringExtra(ActionableMessageNotifier.EXTRA_MESSAGE_ID) ?: return
         val action = intent.getStringExtra(ActionableMessageNotifier.EXTRA_ACTION) ?: return
-        val notificationId = intent.getIntExtra(ActionableMessageNotifier.EXTRA_NOTIFICATION_ID, Int.MIN_VALUE)
-        if (notificationId == Int.MIN_VALUE) return
+        // AND-08: detect a missing id via hasExtra rather than a sentinel.
+        // getIntExtra(.., Int.MIN_VALUE) collided: a legitimate id equal to
+        // Int.MIN_VALUE was silently dropped. hasExtra is an unambiguous
+        // presence check; the default below is never used when present.
+        if (!intent.hasExtra(ActionableMessageNotifier.EXTRA_NOTIFICATION_ID)) return
+        val notificationId = intent.getIntExtra(ActionableMessageNotifier.EXTRA_NOTIFICATION_ID, 0)
 
         // BGS-20 (doc-08 Step 11): a SINGLE goAsync() wraps BOTH the reply and
         // mark_read branches (one PendingResult, one executor dispatch covering

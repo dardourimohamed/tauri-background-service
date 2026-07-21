@@ -291,14 +291,6 @@ pub struct PluginConfig {
     #[cfg(feature = "desktop-service")]
     #[serde(default = "default_desktop_service_start_timeout_ms")]
     pub desktop_service_start_timeout_ms: u64,
-
-    /// When `true`, the Windows GUI uses the daemon-first backend path
-    /// (identical to Unix). Default: false — Windows stays on the
-    /// in-process Local backend until the daemon suite passes on Windows
-    /// CI (spec 01 §6 D3 compat clause). Unix ignores this flag.
-    #[cfg(feature = "desktop-service")]
-    #[serde(default)]
-    pub desktop_windows_daemon_opt_in: bool,
 }
 
 fn default_ios_safety_timeout() -> f64 {
@@ -784,9 +776,132 @@ impl Default for PluginConfig {
             desktop_start_service_if_missing: false,
             #[cfg(feature = "desktop-service")]
             desktop_service_start_timeout_ms: default_desktop_service_start_timeout_ms(),
-            #[cfg(feature = "desktop-service")]
-            desktop_windows_daemon_opt_in: false,
         }
+    }
+}
+
+// ── CORE-03: PluginConfig::validate ───────────────────────────────────
+//
+// `PluginConfig` is deserialized from the Tauri plugin config and consumed in
+// `init_with_service`'s setup hook. Several fields can panic at runtime if
+// allowed through unchecked (e.g. `mpsc::channel(0)` panics). Invalid values
+// for Android ids / modes / timers also reach native setup and produce
+// confusing late failures. `validate` runs once before any of those consumers
+// see the config and returns a typed error with a precise diagnostic.
+impl PluginConfig {
+    /// Validate every field used by the manager / native setup.
+    ///
+    /// Returns the first violation encountered as a `ServiceError::Platform`
+    pub fn validate(&self) -> Result<(), crate::error::ServiceError> {
+        use crate::error::ServiceError;
+        use ServiceError::Platform;
+
+        // ── iOS timeouts ───────────────────────────────────────────────
+        // safety_timeout is the BGAppRefreshTask cap — must be finite + > 0.
+        if !self.ios_safety_timeout_secs.is_finite() || self.ios_safety_timeout_secs <= 0.0 {
+            return Err(Platform(
+                "iosSafetyTimeoutSecs must be a finite positive number".into(),
+            ));
+        }
+        // cancel listener timeout must be > 0 (it is a u64, only 0 is invalid).
+        if self.ios_cancel_listener_timeout_secs == 0 {
+            return Err(Platform(
+                "iosCancelListenerTimeoutSecs must be greater than 0".into(),
+            ));
+        }
+        // processing safety timeout is OPTIONAL (0.0 = uncapped), but if
+        // supplied it must be finite and non-negative.
+        if !self.ios_processing_safety_timeout_secs.is_finite()
+            || self.ios_processing_safety_timeout_secs < 0.0
+        {
+            return Err(Platform(
+                "iosProcessingSafetyTimeoutSecs must be finite and non-negative (0 = uncapped)"
+                    .into(),
+            ));
+        }
+        // earliest begin minutes must be finite and non-negative for both
+        // task kinds (negative would backdate the request and be rejected
+        // by BGTaskScheduler).
+        for (name, value) in [
+            (
+                "iosEarliestRefreshBeginMinutes",
+                self.ios_earliest_refresh_begin_minutes,
+            ),
+            (
+                "iosEarliestProcessingBeginMinutes",
+                self.ios_earliest_processing_begin_minutes,
+            ),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(Platform(format!("{name} must be finite and non-negative")));
+            }
+        }
+        // processing ceiling multiplier must be finite and >= 1.
+        if !self.ios_processing_ceiling_multiplier.is_finite()
+            || self.ios_processing_ceiling_multiplier < 1.0
+        {
+            return Err(Platform(
+                "iosProcessingCeilingMultiplier must be finite and >= 1".into(),
+            ));
+        }
+
+        // ── Manager channel ─────────────────────────────────────────────
+        // mpsc::channel panics at capacity 0.
+        if self.channel_capacity == 0 {
+            return Err(Platform(
+                "channelCapacity must be greater than 0 (mpsc::channel panics at 0)".into(),
+            ));
+        }
+
+        // ── Android notification / channel ──────────────────────────────
+        // Android NotificationManager ids are non-negative i32; 0 is treated
+        // as "no id" on some surfaces. Tauri's notification builder accepts
+        // i32, so anything outside `1..=i32::MAX` is rejected.
+        if self.android_notification_id == 0 || self.android_notification_id > i32::MAX as u32 {
+            return Err(Platform(format!(
+                "androidNotificationId must be in 1..=i32::MAX (got {})",
+                self.android_notification_id
+            )));
+        }
+        if self.android_notification_channel_id.trim().is_empty() {
+            return Err(Platform(
+                "androidNotificationChannelId must be non-empty".into(),
+            ));
+        }
+        if self.android_notification_channel_name.trim().is_empty() {
+            return Err(Platform(
+                "androidNotificationChannelName must be non-empty".into(),
+            ));
+        }
+        // android_on_timeout policy must be a known vocabulary word.
+        match self.android_on_timeout.as_str() {
+            "stop" | "notifyUser" | "scheduleRecovery" => {}
+            other => {
+                return Err(Platform(format!(
+                    "androidOnTimeout must be one of stop|notifyUser|scheduleRecovery (got {other:?})"
+                )));
+            }
+        }
+
+        // ── Desktop-service mode + startup timeout ──────────────────────
+        #[cfg(feature = "desktop-service")]
+        {
+            match self.desktop_service_mode.as_str() {
+                "inProcess" | "osService" => {}
+                other => {
+                    return Err(Platform(format!(
+                        "desktopServiceMode must be inProcess|osService (got {other:?})"
+                    )));
+                }
+            }
+            if self.desktop_service_start_timeout_ms == 0 {
+                return Err(Platform(
+                    "desktopServiceStartTimeoutMs must be greater than 0".into(),
+                ));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -958,6 +1073,7 @@ pub struct IOSDesiredStateStatus {
 /// `denied`, while the `requestNotificationPermission` `@PermissionCallback`
 /// (Step 10a) resolves `granted` | `denied`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct NotificationPermissionStatus {
     /// Current POST_NOTIFICATIONS authorization.
     pub status: String,
@@ -1168,6 +1284,7 @@ pub struct IosNativeState {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -2538,6 +2655,154 @@ mod tests {
         );
     }
 
+    // ── CORE-03: PluginConfig::validate boundary tests ────────────────────
+
+    #[test]
+    fn core03_default_config_is_valid() {
+        assert!(PluginConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn core03_channel_capacity_zero_rejected() {
+        let mut c = PluginConfig::default();
+        c.channel_capacity = 0;
+        let msg = format!("{}", c.validate().unwrap_err());
+        assert!(
+            msg.contains("channelCapacity") && msg.contains('0'),
+            "expected channelCapacity diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn core03_ios_safety_timeout_nonpositive_or_nonfinite_rejected() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut c = PluginConfig::default();
+            c.ios_safety_timeout_secs = bad;
+            assert!(
+                format!("{}", c.validate().unwrap_err()).contains("iosSafetyTimeoutSecs"),
+                "value {bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn core03_ios_cancel_listener_timeout_zero_rejected() {
+        let mut c = PluginConfig::default();
+        c.ios_cancel_listener_timeout_secs = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn core03_ios_processing_safety_timeout_negative_or_nonfinite_rejected() {
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            let mut c = PluginConfig::default();
+            c.ios_processing_safety_timeout_secs = bad;
+            assert!(c.validate().is_err(), "{bad:?} should be rejected");
+        }
+        // 0.0 = uncapped, allowed.
+        let mut c = PluginConfig::default();
+        c.ios_processing_safety_timeout_secs = 0.0;
+        assert!(c.validate().is_ok());
+        c.ios_processing_safety_timeout_secs = 120.0;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn core03_ios_earliest_begin_negative_or_nonfinite_rejected() {
+        for bad in [-0.1, f64::NAN, f64::INFINITY] {
+            let mut c = PluginConfig::default();
+            c.ios_earliest_refresh_begin_minutes = bad;
+            assert!(c.validate().is_err(), "refresh {bad:?}");
+            let mut c = PluginConfig::default();
+            c.ios_earliest_processing_begin_minutes = bad;
+            assert!(c.validate().is_err(), "processing {bad:?}");
+        }
+        // Zero is allowed (BGTaskScheduler treats it as "as soon as possible").
+        let mut c = PluginConfig::default();
+        c.ios_earliest_refresh_begin_minutes = 0.0;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn core03_ios_processing_ceiling_multiplier_below_one_rejected() {
+        for bad in [0.0, 0.99, -1.0, f64::NAN] {
+            let mut c = PluginConfig::default();
+            c.ios_processing_ceiling_multiplier = bad;
+            assert!(c.validate().is_err(), "{bad:?} should be rejected");
+        }
+        // 1.0 = no adaptive backoff, allowed.
+        let mut c = PluginConfig::default();
+        c.ios_processing_ceiling_multiplier = 1.0;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn core03_android_notification_id_outside_i32_range_rejected() {
+        for bad in [0u32, (i32::MAX as u32) + 1, u32::MAX] {
+            let mut c = PluginConfig::default();
+            c.android_notification_id = bad;
+            assert!(c.validate().is_err(), "id {bad} should be rejected");
+        }
+        for ok in [1u32, i32::MAX as u32] {
+            let mut c = PluginConfig::default();
+            c.android_notification_id = ok;
+            assert!(c.validate().is_ok(), "id {ok} should pass");
+        }
+    }
+
+    #[test]
+    fn core03_android_notification_channel_id_empty_rejected() {
+        for bad in ["", "   ", "\t"] {
+            let mut c = PluginConfig::default();
+            c.android_notification_channel_id = bad.into();
+            assert!(c.validate().is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn core03_android_notification_channel_name_empty_rejected() {
+        let mut c = PluginConfig::default();
+        c.android_notification_channel_name = "   ".into();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn core03_android_on_timeout_unknown_policy_rejected() {
+        for bad in ["", "notify", "recover", "STOP", "schedule"] {
+            let mut c = PluginConfig::default();
+            c.android_on_timeout = bad.into();
+            assert!(c.validate().is_err(), "{bad:?} should be rejected");
+        }
+        for ok in ["stop", "notifyUser", "scheduleRecovery"] {
+            let mut c = PluginConfig::default();
+            c.android_on_timeout = ok.into();
+            assert!(c.validate().is_ok(), "{ok:?} should pass");
+        }
+    }
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn core03_desktop_service_mode_invalid_rejected() {
+        for bad in ["", "os-service", "OSService", "daemon", "in-process"] {
+            let mut c = PluginConfig::default();
+            c.desktop_service_mode = bad.into();
+            assert!(c.validate().is_err(), "{bad:?} should be rejected");
+        }
+        for ok in ["inProcess", "osService"] {
+            let mut c = PluginConfig::default();
+            c.desktop_service_mode = ok.into();
+            assert!(c.validate().is_ok(), "{ok:?} should pass");
+        }
+    }
+
+    #[cfg(feature = "desktop-service")]
+    #[test]
+    fn core03_desktop_service_start_timeout_zero_rejected() {
+        let mut c = PluginConfig::default();
+        c.desktop_service_start_timeout_ms = 0;
+        assert!(c.validate().is_err());
+    }
+
     // --- PluginConfig android_request_notification_permission_on_load tests ---
 
     #[test]
@@ -2565,6 +2830,50 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let de: PluginConfig = serde_json::from_str(&json).unwrap();
         assert!(!de.android_request_notification_permission_on_load);
+    }
+    // --- CORE-07: NotificationPermissionStatus non_exhaustive + serde ---
+
+    #[test]
+    fn core07_notification_permission_status_internal_construct() {
+        // Within the defining crate, struct-literal construction still works
+        // despite #[non_exhaustive] (the attribute restricts downstream
+        // crates only). Pin this so future refactors don't break the
+        // internal call sites in lib.rs.
+        let s = NotificationPermissionStatus {
+            status: "granted".to_string(),
+        };
+        assert_eq!(s.status, "granted");
+    }
+
+    #[test]
+    fn core07_notification_permission_status_serde_roundtrip() {
+        // The wire shape is exactly {"status": String} and stays stable.
+        for v in ["granted", "denied", "notDetermined"] {
+            let s = NotificationPermissionStatus {
+                status: v.to_string(),
+            };
+            let json = serde_json::to_string(&s).unwrap();
+            assert_eq!(json, format!("{{\"status\":\"{v}\"}}"));
+            let de: NotificationPermissionStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(de, s);
+        }
+    }
+
+    #[test]
+    fn core07_notification_permission_status_is_non_exhaustive() {
+        // Source-level contract: the struct declaration carries
+        // #[non_exhaustive]. We assert via a doc-derived snapshot so a
+        // future removal trips this test.
+        let src = include_str!("models.rs");
+        let needle = concat!(
+            "#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]\n",
+            "#[non_exhaustive]\n",
+            "pub struct NotificationPermissionStatus"
+        );
+        assert!(
+            src.contains(needle),
+            "NotificationPermissionStatus must retain #[non_exhaustive]"
+        );
     }
 
     #[test]
@@ -2773,46 +3082,31 @@ mod tests {
         );
     }
 
+    /// DESK-01: the Windows-daemon opt-in config field and its serde default
+    /// are gone for good. Pin the absence so a future revert trips this test.
     #[cfg(feature = "desktop-service")]
     #[test]
-    fn plugin_config_windows_daemon_opt_in_default_false() {
-        let json = "{}";
-        let config: PluginConfig = serde_json::from_str(json).unwrap();
-        assert!(!config.desktop_windows_daemon_opt_in);
-    }
-
-    #[cfg(feature = "desktop-service")]
-    #[test]
-    fn plugin_config_windows_daemon_opt_in_true() {
+    fn desk01_windows_daemon_opt_in_field_is_absent() {
+        let src = include_str!("models.rs");
+        // The field name is built by concat so this test's own source does
+        // not match the literal needle (self-reference guard).
+        let needle = ["desktop_windows", "_daemon_opt_in"].concat();
+        // Allow the references inside THIS test function (the source-grep
+        // contract is about the struct + Default impl, not the test).
+        let without_this_test = src
+            .split("fn desk01_windows_daemon_opt_in_field_is_absent")
+            .next()
+            .unwrap_or("");
+        assert!(
+            !without_this_test.contains(&needle[..]),
+            "DESK-01: the opt-in field must not be re-introduced on PluginConfig"
+        );
+        // The serde key is gone too — unknown keys are accepted by serde's
+        // default (no deny_unknown_fields), but the field is gone from the
+        // struct, so this config cannot enable anything.
         let json = r#"{"desktopWindowsDaemonOptIn":true}"#;
         let config: PluginConfig = serde_json::from_str(json).unwrap();
-        assert!(config.desktop_windows_daemon_opt_in);
-    }
-
-    #[cfg(feature = "desktop-service")]
-    #[test]
-    fn plugin_config_windows_daemon_opt_in_serde_roundtrip() {
-        let config = PluginConfig {
-            desktop_windows_daemon_opt_in: true,
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&config).unwrap();
-        let de: PluginConfig = serde_json::from_str(&json).unwrap();
-        assert!(de.desktop_windows_daemon_opt_in);
-    }
-
-    #[cfg(feature = "desktop-service")]
-    #[test]
-    fn plugin_config_windows_daemon_opt_in_json_key_camel_case() {
-        let config = PluginConfig {
-            desktop_windows_daemon_opt_in: true,
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&config).unwrap();
-        assert!(
-            json.contains("desktopWindowsDaemonOptIn"),
-            "JSON should use camelCase: {json}"
-        );
+        let _ = config;
     }
 
     #[cfg(feature = "desktop-service")]

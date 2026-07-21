@@ -19,6 +19,7 @@ final class NotificationPermissionTests: XCTestCase {
     private var plugin: BackgroundServicePlugin!
     private var scheduler: FakeBGTaskScheduler!
     private var authorizer: FakeNotificationAuthorizer!
+    private var suite: UserDefaults!
 
     private let grantedKey = "ios_notification_granted"
 
@@ -29,25 +30,19 @@ final class NotificationPermissionTests: XCTestCase {
         authorizer = FakeNotificationAuthorizer()
         plugin.scheduler = scheduler
         plugin.notificationAuthorizer = authorizer
-        clearKeys()
+        // IOS-CLEAN-01: isolated suite so this class cannot leak state.
+        suite = TestDefaults.makeIsolatedSuite()
+        plugin.defaults = suite
+        TestDefaults.clearAll(on: suite)
     }
 
     override func tearDown() {
-        clearKeys()
+        TestDefaults.clearAll(on: suite)
         plugin = nil
         scheduler = nil
         authorizer = nil
+        suite = nil
         super.tearDown()
-    }
-
-    private func clearKeys() {
-        let d = UserDefaults.standard
-        for key in [
-            "ios_desired_running", "ios_last_schedule_error", "ios_last_start_config",
-            "ios_last_task_completed_at", "ios_notification_granted",
-        ] {
-            d.removeObject(forKey: key)
-        }
     }
 
     // MARK: - M4: no prompt at load()
@@ -57,7 +52,7 @@ final class NotificationPermissionTests: XCTestCase {
 
         XCTAssertEqual(authorizer.requestCount, 0,
                        "load() must NOT request notification authorization (deferred to intent, M4)")
-        XCTAssertNil(UserDefaults.standard.object(forKey: grantedKey),
+        XCTAssertNil(suite.object(forKey: grantedKey),
                      "no granted fact is persisted before the user expresses intent")
     }
 
@@ -92,7 +87,7 @@ final class NotificationPermissionTests: XCTestCase {
         authorizer.grantResult = true
         plugin.startKeepalive(InvokeCapture().makeInvoke(args: "{}"))
 
-        XCTAssertEqual(UserDefaults.standard.object(forKey: grantedKey) as? Bool, true,
+        XCTAssertEqual(suite.object(forKey: grantedKey) as? Bool, true,
                        "granted is persisted into the Rust-readable durable store")
 
         let capture = InvokeCapture()
@@ -106,7 +101,7 @@ final class NotificationPermissionTests: XCTestCase {
         authorizer.grantResult = false
         plugin.startKeepalive(InvokeCapture().makeInvoke(args: "{}"))
 
-        XCTAssertEqual(UserDefaults.standard.object(forKey: grantedKey) as? Bool, false,
+        XCTAssertEqual(suite.object(forKey: grantedKey) as? Bool, false,
                        "a denied decision is forwarded too, so the Notifier can degrade")
     }
 

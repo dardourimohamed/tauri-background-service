@@ -27,7 +27,7 @@ Add the plugin to your app's `Cargo.toml`:
 [dependencies]
 tauri = { version = "2" }
 tauri-plugin-notification = "2"
-tauri-plugin-background-service = "0.7"
+tauri-plugin-background-service = "1.0"
 ```
 
 ### npm (TypeScript API)

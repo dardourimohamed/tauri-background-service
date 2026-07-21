@@ -11,6 +11,7 @@ final class SchedulingStatusContractTests: XCTestCase {
 
     private var plugin: BackgroundServicePlugin!
     private var scheduler: FakeBGTaskScheduler!
+    private var suite: UserDefaults!
 
     override func setUp() {
         super.setUp()
@@ -21,27 +22,18 @@ final class SchedulingStatusContractTests: XCTestCase {
         // fake so the real `UNUserNotificationCenter.current()` isn't touched in the
         // test host (which has no app bundle).
         plugin.notificationAuthorizer = FakeNotificationAuthorizer()
-        clearKeys()
+        // IOS-CLEAN-01: isolated suite so this class cannot leak state.
+        suite = TestDefaults.makeIsolatedSuite()
+        plugin.defaults = suite
+        TestDefaults.clearAll(on: suite)
     }
 
     override func tearDown() {
-        clearKeys()
+        TestDefaults.clearAll(on: suite)
         plugin = nil
         scheduler = nil
+        suite = nil
         super.tearDown()
-    }
-
-    private func clearKeys() {
-        let d = UserDefaults.standard
-        for key in [
-            "ios_desired_running", "ios_last_schedule_error", "ios_last_start_config",
-            "ios_last_task_kind", "ios_last_task_started_at", "ios_last_task_completed_at",
-            "ios_last_refresh_scheduled", "ios_last_processing_scheduled",
-            "ios_last_refresh_error", "ios_last_processing_error",
-            "ios_adaptive_processing_begin_minutes", "ios_pending_task_consumed_at",
-        ] {
-            d.removeObject(forKey: key)
-        }
     }
 
     // MARK: - getSchedulingStatus = submit-result shape (IOSSchedulingStatus)

@@ -234,15 +234,18 @@ impl<R: Runtime> MobileLifecycle<R> {
     /// resolves immediately with `{status: granted|notDetermined|denied}`. This
     /// is the NON-BLOCKING getter — the cfg axis (Android-active) lives on the
     /// `#[tauri::command]` wrapper in `lib.rs`, mirroring `get_scheduling_status`.
-    pub fn get_notification_permission_status(
-        &self,
-    ) -> Result<NotificationPermissionStatus, ServiceError> {
+    ///
+    /// WIRE-01: returns the inner SCALAR status string so the Tauri command
+    /// can serialize it directly to the JS `NotificationPermissionStatus`
+    /// string union (no `{status}` object wrapper on the wire).
+    pub fn get_notification_permission_status(&self) -> Result<String, ServiceError> {
         let result: serde_json::Value = self
             .handle
             .run_mobile_plugin("getNotificationPermissionStatus", ())
             .map_err(|e| ServiceError::Platform(e.to_string()))?;
-        serde_json::from_value::<NotificationPermissionStatus>(result)
-            .map_err(|e| ServiceError::Platform(e.to_string()))
+        let parsed = serde_json::from_value::<NotificationPermissionStatus>(result)
+            .map_err(|e| ServiceError::Platform(e.to_string()))?;
+        Ok(parsed.status)
     }
 
     /// Whether the app may post a full-screen intent (NTF-16, Step 12c).
@@ -282,15 +285,18 @@ impl<R: Runtime> MobileLifecycle<R> {
     /// permission-dialog duration — the `wait_for_cancel` class. The
     /// `#[tauri::command]` wrapper MUST therefore wrap this call in
     /// `tokio::task::spawn_blocking`. Resolves `{status: granted|denied}`.
-    pub fn request_notification_permission(
-        &self,
-    ) -> Result<NotificationPermissionStatus, ServiceError> {
+    ///
+    /// WIRE-01: returns the inner SCALAR status string so the Tauri command
+    /// can serialize it directly to the JS `NotificationPermissionStatus`
+    /// string union.
+    pub fn request_notification_permission(&self) -> Result<String, ServiceError> {
         let result: serde_json::Value = self
             .handle
             .run_mobile_plugin("requestNotificationPermission", ())
             .map_err(|e| ServiceError::Platform(e.to_string()))?;
-        serde_json::from_value::<NotificationPermissionStatus>(result)
-            .map_err(|e| ServiceError::Platform(e.to_string()))
+        let parsed = serde_json::from_value::<NotificationPermissionStatus>(result)
+            .map_err(|e| ServiceError::Platform(e.to_string()))?;
+        Ok(parsed.status)
     }
 
     /// Query the persisted iOS *desired-state* status from the native layer.
@@ -554,8 +560,12 @@ impl<R: Runtime> MobileLifecycle<R> {
             chat_id,
             message_id
         );
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "ios"))]
         {
+            // IOS-MSG-01: now that the Swift `@objc showMessageNotification`
+            // handler exists (with UNNotificationRequest + category/actions),
+            // dispatch on iOS as well as Android. Desktop (and any other
+            // platform) takes the no-op arm below.
             self.handle
                 .run_mobile_plugin::<()>(
                     "showMessageNotification",
@@ -570,15 +580,10 @@ impl<R: Runtime> MobileLifecycle<R> {
                 )
                 .map_err(|e| ServiceError::Platform(e.to_string()))?;
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
-            // doc-06 NTF-07 iOS actionable message-surface DEFERRED to
-            // Step-13 iOS runbook: this arm conflates desktop (correctly a
-            // no-op — desktop routes actionable notifications via
-            // emit_system_notification) with iOS (which has no Swift
-            // showMessageNotification handler + no UNUserNotificationCenter
-            // post code). Do NOT widen the `#[cfg(target_os = "android")]`
-            // active arm above to `cfg(any(.., target_os = "ios"))`.
+            // Desktop / other: routes actionable notifications via
+            // emit_system_notification — no mobile-plugin dispatch.
             let _ = (notification_id, chat_id, message_id, title, body, route_uri);
         }
         Ok(())
@@ -699,7 +704,7 @@ struct ShowIncomingCallArgs {
 }
 
 /// Arguments for the native `showMessageNotification` handler.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "ios"))]
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShowMessageNotificationArgs {

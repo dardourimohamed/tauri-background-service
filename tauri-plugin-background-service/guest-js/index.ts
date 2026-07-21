@@ -40,11 +40,10 @@ export interface StartConfig {
   serviceLabel?: string;
   /**
    * Android foreground service type.
-   * Valid values: `"dataSync"` (default), `"mediaPlayback"`, `"phoneCall"`,
-   * `"location"`, `"connectedDevice"`, `"mediaProjection"`, `"camera"`,
-   * `"microphone"`, `"health"`, `"remoteMessaging"`, `"systemExempted"`,
-   * `"shortService"`, `"specialUse"`, `"mediaProcessing"`.
-   * Ignored on non-Android platforms.
+   * Valid values: `"remoteMessaging"` (default), `"dataSync"`, `"mediaPlayback"`,
+   * `"phoneCall"`, `"location"`, `"connectedDevice"`, `"mediaProjection"`,
+   * `"camera"`, `"microphone"`, `"health"`, `"systemExempted"`, `"shortService"`,
+   * `"specialUse"`, `"mediaProcessing"`. Ignored on non-Android platforms.
    */
   foregroundServiceType?: string;
 }
@@ -77,7 +76,13 @@ export interface ValidationIssue {
   platform: Platform;
 }
 
-/** Reason the service stopped, reported in lifecycle events. */
+/** Reason the service stopped, reported in lifecycle events.
+ *
+ * WIRE-02: mirrors the Rust `StopReason` enum (`src/models.rs`) exactly.
+ * The Rust enum is `#[non_exhaustive]` and may grow; this union is kept in
+ * sync with the serialized variants so the wire contract is checkable from
+ * tests.
+ */
 export type StopReason =
   | 'userStop'
   | 'appStop'
@@ -87,7 +92,8 @@ export type StopReason =
   | 'osRestart'
   | 'bootRecovery'
   | 'taskCompleted'
-  | 'error';
+  | 'error'
+  | 'processExit';
 
 /** Complete snapshot of the background service lifecycle status. */
 export interface LifecycleStatus {
@@ -237,8 +243,10 @@ export async function getNotificationPermissionStatus(): Promise<NotificationPer
  * `POST_NOTIFICATIONS` prompt on API 33+ and is a no-op below API 33 / on
  * non-Android targets.
  */
-export async function requestNotificationPermission(): Promise<void> {
-  await invoke('plugin:background-service|request_notification_permission');
+export async function requestNotificationPermission(): Promise<NotificationPermissionStatus> {
+  return invoke<NotificationPermissionStatus>(
+    'plugin:background-service|request_notification_permission'
+  );
 }
 
 /**
@@ -363,8 +371,13 @@ export async function onPluginEvent(
 
   let pluginListener: PluginListener | null = null;
   try {
-    pluginListener = await addPluginListener('background-service', 'timeout', (payload: any) => {
-      handler({ type: 'stopped', reason: 'timeout' });
+    // The native timeout payload carries diagnostic fields; we only need the
+    // event signal here. `unknown` is correct — the payload is not consumed.
+    pluginListener = await addPluginListener('background-service', 'timeout', (_payload: unknown) => {
+      // WIRE-02: the Rust StopReason vocabulary has no 'timeout' variant;
+      // map the native timeout event to 'platformTimeout' so the emitted
+      // PluginEvent matches the declared StopReason union.
+      handler({ type: 'stopped', reason: 'platformTimeout' });
     });
   } catch {
     // Plugin listener not available on non-Android platforms

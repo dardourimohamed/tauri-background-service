@@ -3,8 +3,8 @@ package app.tauri.backgroundservice
 import android.content.Context
 import org.json.JSONObject
 
-class FakeCoreBridge(
-    result: String = "running",
+class FakeCoreBridge private constructor(
+    private val startResult: HeadlessBridgeResult,
 ) : CoreBridge {
 
     var lastStartReason: String? = null
@@ -29,25 +29,7 @@ class FakeCoreBridge(
     /** When set, [notifyNetworkChanged] throws it (e.g. UnsatisfiedLinkError). */
     var networkChangedError: Throwable? = null
 
-    private val startResult: HeadlessBridgeResult = when (result) {
-        "running", "setup_idle", "locked_idle" -> {
-            val json = JSONObject().apply {
-                put("ok", true)
-                put("state", result)
-            }.toString()
-            HeadlessBridgeResult(ok = true, state = result, message = null, recoverable = true, rawJson = json)
-        }
-        "failed" -> {
-            val json = JSONObject().apply {
-                put("ok", false)
-                put("state", "failed")
-                put("message", "FakeCoreBridge configured failure")
-                put("recoverable", true)
-            }.toString()
-            HeadlessBridgeResult(ok = false, state = "failed", message = "FakeCoreBridge configured failure", recoverable = true, rawJson = json)
-        }
-        else -> throw IllegalArgumentException("Unknown FakeCoreBridge state: $result. Use: running, setup_idle, locked_idle, failed")
-    }
+    constructor(result: String = "running") : this(startResultFor(result))
 
     override fun start(context: Context, reason: String): HeadlessBridgeResult {
         lastStartReason = reason
@@ -75,5 +57,46 @@ class FakeCoreBridge(
             put("controlFlushed", true)
         }.toString()
         return HeadlessBridgeResult(ok = true, state = "running", message = null, recoverable = true, rawJson = json)
+    }
+
+    companion object {
+        // AND-03: the success states remain as named fixtures for the existing
+        // CoreBridgeTest cases, but they now set `ok=true` and rely on
+        // `accepted = ok` (state is opaque diagnostics, never the accept gate).
+        private fun startResultFor(result: String): HeadlessBridgeResult = when (result) {
+            "running", "setup_idle", "locked_idle" -> {
+                val json = JSONObject().apply {
+                    put("ok", true)
+                    put("state", result)
+                }.toString()
+                HeadlessBridgeResult(ok = true, state = result, message = null, recoverable = true, rawJson = json)
+            }
+            "failed" -> {
+                val json = JSONObject().apply {
+                    put("ok", false)
+                    put("state", "failed")
+                    put("message", "FakeCoreBridge configured failure")
+                    put("recoverable", true)
+                }.toString()
+                HeadlessBridgeResult(ok = false, state = "failed", message = "FakeCoreBridge configured failure", recoverable = true, rawJson = json)
+            }
+            else -> throw IllegalArgumentException("Unknown FakeCoreBridge state: $result. Use: running, setup_idle, locked_idle, failed")
+        }
+
+        /**
+         * AND-03: build a fake whose start result carries an arbitrary
+         * `ok`/`state` pair, so tests can assert that `ok=true,state="degraded"`
+         * is accepted (and `ok=false` rejected) — `state` is opaque diagnostics,
+         * never the accept discriminator. Mirrors a host core that returns an
+         * unknown-but-successful state.
+         */
+        fun okState(ok: Boolean, state: String, recoverable: Boolean = true): FakeCoreBridge {
+            val json = JSONObject().apply {
+                put("ok", ok)
+                put("state", state)
+                put("recoverable", recoverable)
+            }.toString()
+            return FakeCoreBridge(HeadlessBridgeResult(ok, state, null, recoverable, json))
+        }
     }
 }

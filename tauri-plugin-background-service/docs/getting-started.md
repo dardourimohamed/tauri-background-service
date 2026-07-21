@@ -22,7 +22,7 @@ Add the plugin and its notification dependency to your app's `Cargo.toml`:
 
 ```toml
 [dependencies]
-tauri-plugin-background-service = "0.7"
+tauri-plugin-background-service = "1.0"
 tauri-plugin-notification = "2"
 ```
 
@@ -146,7 +146,7 @@ For OS-service mode on Linux and macOS, enable the `desktop-service` feature fla
 
 ```toml
 [dependencies]
-tauri-plugin-background-service = { version = "0.7", features = ["desktop-service"] }
+tauri-plugin-background-service = { version = "1.0", features = ["desktop-service"] }
 ```
 
 ```json
@@ -168,13 +168,13 @@ See [Desktop Guide](./desktop.md) for the full configuration reference, includin
 
 ### Android Configuration
 
-On Android, you can configure which foreground service types your app allows. The default allows `"dataSync"` only. If your app uses a different type, add it to the allowlist:
+On Android, you can configure which foreground service types your app allows. The default allows `"remoteMessaging"` only — the Play-policy-safe choice for a long-lived keepalive. If your app uses a different type (e.g. `dataSync`), add it to the allowlist:
 
 ```json
 {
   "plugins": {
     "background-service": {
-      "androidForegroundServiceTypes": ["dataSync"],
+      "androidForegroundServiceTypes": ["remoteMessaging", "dataSync"],
       "androidValidateForegroundServiceType": true
     }
   }

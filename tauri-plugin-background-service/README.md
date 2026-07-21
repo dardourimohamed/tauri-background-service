@@ -302,9 +302,9 @@ For desktop service mode, also add:
 
 The plugin uses a Foreground Service with a persistent notification to reduce the likelihood of the OS killing the process while backgrounded. Required additions to your app's `AndroidManifest.xml` (the plugin's manifest already declares these):
 
-- `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_DATA_SYNC` permissions
-- `POST_NOTIFICATIONS` runtime permission (requested automatically on Android 13+)
-- `foregroundServiceType="dataSync"` on the service declaration (see [Android Guide](./docs/android.md) for all 14 valid types)
+- `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_REMOTE_MESSAGING` permissions (the default type is `remoteMessaging`)
+- `POST_NOTIFICATIONS` runtime permission (resolved lazily at the first `startService()`; not auto-requested at load by default)
+- `foregroundServiceType="dataSync|remoteMessaging|specialUse|phoneCall|microphone"` on the library service declaration (see [Android Guide](./docs/android.md) for all valid types and merged-manifest extension)
 - `stopWithTask="false"` ensures the service survives when the user swipes the app away
 - `START_STICKY` causes the OS to restart the service if killed under memory pressure
 

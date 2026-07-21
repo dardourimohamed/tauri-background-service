@@ -193,7 +193,13 @@ pub fn socket_path(label: &str) -> Result<std::path::PathBuf, ServiceError> {
     }
     #[cfg(windows)]
     {
-        Ok(std::path::PathBuf::from(format!(r"\\.\pipe\{label}")))
+        // DESK-01: Windows daemon support was removed. The caller (now
+        // Unix-only via cfg in mod.rs) never reaches this branch; we return
+        // an explicit error rather than silently produce a pipe path.
+        let _ = label;
+        Err(ServiceError::Platform(
+            "OS-service socket path is not available on Windows (DESK-01)".into(),
+        ))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {

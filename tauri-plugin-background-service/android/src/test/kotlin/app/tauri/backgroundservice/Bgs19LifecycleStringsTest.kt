@@ -73,10 +73,10 @@ class Bgs19LifecycleStringsTest {
         LifecycleService.coreStopExecutor = LifecycleService.DEFAULT_CORE_STOP_EXECUTOR
         LifecycleService.isRunning = false
         LifecycleService.isForeground = false
-        LifecycleService.autoRestarting = false
         BackgroundServicePlugin.onTimeoutEvent = null
         BackgroundServicePlugin.onNativeLifecycleEvent = null
         BackgroundServicePlugin.onPlatformErrorEvent = null
+        NativeEventQueue.resetForTest()
     }
 
     // ── Restart foreground notification body (handleOsRestart) ──────────

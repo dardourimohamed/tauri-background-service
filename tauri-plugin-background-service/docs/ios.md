@@ -115,7 +115,7 @@ The plugin observes `UIApplication.didEnterBackgroundNotification` and `UIApplic
 | Transition | Behavior |
 |------------|----------|
 | **Foreground → Background** | If `ios_desired_running == true` and no BGTask is currently active, the plugin calls `scheduleNext()` to submit both `BGAppRefreshTaskRequest` and `BGProcessingTaskRequest`. This ensures iOS has scheduled tasks that may relaunch the app. |
-| **Background → Foreground** | No special action. The service continues running uninterrupted while the app is active. |
+| **Background → Foreground** | The plugin reschedules. If `ios_desired_running == true` and no BGTask is currently active, the foreground transition calls `scheduleNext()` to re-arm both requests (the same path as the background transition), so iOS keeps an eligible pending request after the app returns to the foreground. |
 
 When the app transitions to the background with `desired_running=true`, the scheduling ensures iOS can potentially relaunch the app for a background task. When iOS does relaunch the app, the pending task bridge (described above) auto-starts the Rust service.
 
@@ -223,7 +223,7 @@ The plugin has several configurable values set via `PluginConfig` in your Tauri 
 
 - **Default**: `14400` seconds (4 hours)
 - **Purpose**: Maximum time the cancel listener thread will wait for an iOS expiration signal. Prevents indefinite thread leaks if iOS kills the app without firing the expiration handler.
-- **When it fires**: The `waitForCancel` pending invoke is rejected and the cancel listener exits.
+- **When it fires**: The `waitForCancel` pending invoke is **resolved** (not rejected) and the cancel listener exits cleanly. The timeout is a lifecycle policy that unblocks the Rust thread when iOS kills the app without signaling.
 - **Recommendation**: Leave at the default unless you have specific requirements.
 
 ### `iosProcessingSafetyTimeoutSecs`
@@ -264,10 +264,13 @@ iOS cancellation uses the **Pending Invoke pattern**:
    - The `on_complete` callback fires `completeBgTask(success: false)` on the Swift side
    - `BGTask.setTaskCompleted(success: false)` is called
    - `scheduleNext()` queues the next background task
-4. If the safety timer fires first (Rust didn't complete in time):
-   - The stored invoke is **rejected** (unblocking the Rust thread)
-   - The BGTask is completed with `success: false`
-   - Next task is scheduled
+4. If the cancel-listener timeout (`iosCancelListenerTimeoutSecs`) elapses
+   first (iOS killed the app without firing the expiration handler), the stored
+   invoke is **resolved** — not rejected. The timeout is a lifecycle policy: it
+   unblocks the Rust thread cleanly so it can exit, then completes the BGTask
+   with `success: false` and schedules the next task. (A `reject` is used only
+   for the rare "superseded" case, where a newer `waitForCancel` displaces a
+   stale one.)
 
 ## Completion Safety
 
@@ -287,7 +290,9 @@ The guard works by:
 1. Checking a `taskCompleted` flag before calling `setTaskCompleted`
 2. Setting the flag to `true` on first call and nil-ing the task reference
 3. Returning `false` (no-op) on subsequent calls
-4. Resetting the flag when a new BGTask handler fires or during cleanup
+4. Resetting the flag **per task** — when a new BGTask handler fires. Teardown
+   (`stopKeepalive`) does not reset the guard; the guard is owned by the active
+   task, so a fresh task always starts with the flag clear.
 
 This prevents double-completion in edge cases like:
 - Expiration handler fires while `completeBgTask` is in flight
@@ -411,9 +416,57 @@ Each `BGAppRefreshTask` gives you approximately 30 seconds of execution. The plu
 
 ## Notification Permission
 
-The plugin requests notification authorization in `BackgroundServicePlugin.load()` with `.alert`, `.sound`, and `.badge` options. This enables the `Notifier` API to display local notifications from your background service.
+The plugin requests notification authorization in `BackgroundServicePlugin.load()`
+via `UNUserNotificationCenter` at launch. The request uses `.alert`, `.sound`,
+**and** `.badge` (badge is one of several options, not the only one). This
+enables the `Notifier` API to display local notifications from your background
+service. If the user denies authorization, notifications will not appear but the
+service still functions; the granted/denied decision is persisted and surfaced
+through `IOSDesiredStateStatus.notificationGranted`.
 
-No additional code is needed. If the user denies the permission, notifications won't appear but the service will still function.
+> This is an explicit system authorization request, not an auto-grant. No
+> additional code is needed — the request is issued once at launch.
+
+## Platform Floor
+
+The Swift package (`Package.swift`) targets **iOS 14+** (`.iOS(.v14)`). BGTask
+scheduler dual-task support, the CallKit controller, and the message-notification
+handler all require iOS 14 or later.
+
+## CallKit (Active-Process Only)
+
+The plugin ships an **active-process CallKit** surface only — there is **no
+VoIP/PushKit relay**. Concretely:
+
+- A suspended or terminated app **cannot** be woken to ring an incoming call.
+  `BackgroundCallDecision.suspendedIncomingRingSupported` is `false` on iOS, and
+  that is the honest position (a PushKit/APNs wake path was removed in IOS-PUSH-01
+  rather than shipped incomplete).
+- CallKit answer/reject/end actions are delivered **only while the webview is
+  live** (foreground or background-active). A suspended app uses the documented
+  missed-call path (`Unreachable` + a control-outbox record drained on the next
+  wake).
+
+### Public CallKit handler (IOS-CALL-01)
+
+Lock-screen answer/reject/end is wired through a **public, main-thread-static**
+handler on `BackgroundServicePlugin`. The host app installs a closure that
+receives the original call id and the action; the CallKit controller routes
+`performCallAction` through it. A missing integration is logged (it does not
+silently drop the action). The JS layer bridges these actions via
+`startNativeCallActionBridge()` (`call_answered` / `call_ended` /
+`call_rejected`).
+
+## Message Notifications (IOS-MSG-01)
+
+`showMessageNotification` is implemented on iOS (it is no longer a silent
+no-op). It schedules a `UNUserNotificationCenter` request with a stable
+identifier, optional metadata/deep link, and a reply/mark-read category with
+actions. The host app registers a **public message-action handler** to receive
+tap/reply/mark-read events; the invoke resolves/rejects based on scheduling
+errors rather than silently succeeding. Message notifications intentionally
+survive a service stop (they are user-visible communication; only call/ring
+state is service-lifecycle-owned).
 
 ## Debugging
 

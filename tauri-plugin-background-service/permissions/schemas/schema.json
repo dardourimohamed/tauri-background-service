@@ -355,6 +355,18 @@
           "markdownDescription": "Denies the get_desired_service_state command without any pre-configured scope."
         },
         {
+          "description": "Enables the get_desired_state_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-desired-state-status",
+          "markdownDescription": "Enables the get_desired_state_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_desired_state_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-desired-state-status",
+          "markdownDescription": "Denies the get_desired_state_status command without any pre-configured scope."
+        },
+        {
           "description": "Enables the get_lifecycle_status command without any pre-configured scope.",
           "type": "string",
           "const": "allow-get-lifecycle-status",
@@ -523,18 +535,6 @@
           "markdownDescription": "Denies the restart_os_service command without any pre-configured scope."
         },
         {
-          "description": "Enables the service_status command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-service-status",
-          "markdownDescription": "Enables the service_status command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the service_status command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-service-status",
-          "markdownDescription": "Denies the service_status command without any pre-configured scope."
-        },
-        {
           "description": "Enables the start command without any pre-configured scope.",
           "type": "string",
           "const": "allow-start",
@@ -607,10 +607,10 @@
           "markdownDescription": "Denies the validate_setup command without any pre-configured scope."
         },
         {
-          "description": "Default permissions for the background service plugin\n#### This default permission set includes:\n\n- `allow-start`\n- `allow-stop`\n- `allow-is-running`\n- `allow-get-service-state`\n- `allow-get-platform-capabilities`\n- `allow-enable-auto-restart`\n- `allow-disable-auto-restart`\n- `allow-get-desired-service-state`\n- `allow-validate-setup`\n- `allow-get-lifecycle-status`\n- `allow-configure-recovery`\n- `allow-native-lifecycle-event`\n- `allow-get-scheduling-status`\n- `allow-get-pending-bg-task`\n- `allow-get-notification-permission-status`\n- `allow-request-notification-permission`\n- `allow-request-battery-exemption`\n- `allow-can-use-full-screen-intent`\n- `allow-open-full-screen-intent-settings`\n- `allow-install-service`\n- `allow-uninstall-service`\n- `allow-start-os-service`\n- `allow-stop-os-service`\n- `allow-restart-os-service`\n- `allow-get-os-service-status`",
+          "description": "Default permissions for the background service plugin\n#### This default permission set includes:\n\n- `allow-start`\n- `allow-stop`\n- `allow-is-running`\n- `allow-get-service-state`\n- `allow-get-platform-capabilities`\n- `allow-enable-auto-restart`\n- `allow-disable-auto-restart`\n- `allow-get-desired-service-state`\n- `allow-get-desired-state-status`\n- `allow-validate-setup`\n- `allow-get-lifecycle-status`\n- `allow-configure-recovery`\n- `allow-native-lifecycle-event`\n- `allow-get-scheduling-status`\n- `allow-get-pending-bg-task`\n- `allow-get-notification-permission-status`\n- `allow-request-notification-permission`\n- `allow-request-battery-exemption`\n- `allow-can-use-full-screen-intent`\n- `allow-open-full-screen-intent-settings`\n- `allow-install-service`\n- `allow-uninstall-service`\n- `allow-start-os-service`\n- `allow-stop-os-service`\n- `allow-restart-os-service`\n- `allow-get-os-service-status`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for the background service plugin\n#### This default permission set includes:\n\n- `allow-start`\n- `allow-stop`\n- `allow-is-running`\n- `allow-get-service-state`\n- `allow-get-platform-capabilities`\n- `allow-enable-auto-restart`\n- `allow-disable-auto-restart`\n- `allow-get-desired-service-state`\n- `allow-validate-setup`\n- `allow-get-lifecycle-status`\n- `allow-configure-recovery`\n- `allow-native-lifecycle-event`\n- `allow-get-scheduling-status`\n- `allow-get-pending-bg-task`\n- `allow-get-notification-permission-status`\n- `allow-request-notification-permission`\n- `allow-request-battery-exemption`\n- `allow-can-use-full-screen-intent`\n- `allow-open-full-screen-intent-settings`\n- `allow-install-service`\n- `allow-uninstall-service`\n- `allow-start-os-service`\n- `allow-stop-os-service`\n- `allow-restart-os-service`\n- `allow-get-os-service-status`"
+          "markdownDescription": "Default permissions for the background service plugin\n#### This default permission set includes:\n\n- `allow-start`\n- `allow-stop`\n- `allow-is-running`\n- `allow-get-service-state`\n- `allow-get-platform-capabilities`\n- `allow-enable-auto-restart`\n- `allow-disable-auto-restart`\n- `allow-get-desired-service-state`\n- `allow-get-desired-state-status`\n- `allow-validate-setup`\n- `allow-get-lifecycle-status`\n- `allow-configure-recovery`\n- `allow-native-lifecycle-event`\n- `allow-get-scheduling-status`\n- `allow-get-pending-bg-task`\n- `allow-get-notification-permission-status`\n- `allow-request-notification-permission`\n- `allow-request-battery-exemption`\n- `allow-can-use-full-screen-intent`\n- `allow-open-full-screen-intent-settings`\n- `allow-install-service`\n- `allow-uninstall-service`\n- `allow-start-os-service`\n- `allow-stop-os-service`\n- `allow-restart-os-service`\n- `allow-get-os-service-status`"
         }
       ]
     }

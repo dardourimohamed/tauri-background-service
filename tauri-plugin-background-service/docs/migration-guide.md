@@ -58,7 +58,7 @@ To use the desktop OS service mode:
 
 ```toml
 [dependencies]
-tauri-plugin-background-service = { version = "0.7", features = ["desktop-service"] }
+tauri-plugin-background-service = { version = "1.0", features = ["desktop-service"] }
 ```
 
 2. Configure in `tauri.conf.json`:
@@ -314,7 +314,7 @@ There are **no breaking changes** in 0.7. All 0.6 code continues to work unchang
 | `configureRecovery()` | All | Runtime control of auto-recovery behavior |
 | `Severity` / `ValidationIssue` | All | Typed validation with severity levels |
 | `issues` field on `SetupValidationReport` | All | Unified issues list with typed severity alongside `errors`/`warnings` |
-| `android_request_notification_permission_on_load` | Android | Configurable notification permission prompt on plugin load (default: `true`) |
+| `android_request_notification_permission_on_load` | Android | Configurable notification permission prompt on plugin load (default: `false`) |
 | Desktop `FileDesiredStateBackend` | Desktop | File-based desired state persistence for auto-recovery across app restarts |
 | iOS UserDefaults persistence | iOS | Pending BGTask info persisted to survive timing gaps |
 | `consumedAt` on `PendingTaskInfo` | iOS | Track when auto-start consumed the pending task |
@@ -414,20 +414,24 @@ replaced by the desired-state recovery machinery.
 ### Breaking: iOS `SilaNativeFFI` removed
 
 The four `@_silgen_name("sila_*")` symbols are deleted, so the Swift package now
-links for any host app. If you bridged CallKit perform-actions or PushKit tokens
-to a native core, inject closures instead:
+links for any host app. If you bridged CallKit perform-actions to a native core,
+inject a closure via the **public** `BackgroundServicePlugin.callActionHandler`
+(main-thread static):
 
 ```swift
-callKitController.performCallAction = { callId, action in /* route to your core */ }
-backgroundServicePlugin.pushTokenSink = { token in /* persist; nil clears */ }
+BackgroundServicePlugin.callActionHandler = { callId, action in /* route to your core */ }
 ```
 
-Defaults are no-ops, so the plugin builds and runs standalone.
+The default is a no-op (with missing-integration logging), so the plugin builds
+and runs standalone. **PushKit was removed** (IOS-PUSH-01): the plugin ships no
+VoIP/APNs relay and no `pushTokenSink`. If you previously relayed PushKit tokens,
+that path is gone — a suspended/terminated app can no longer be woken to ring
+(see the iOS guide's "CallKit (Active-Process Only)" section).
 
 ### New `desktop-service` feature (opt-in)
 
-Managed OS service support (systemd / launchd / Windows service) is behind the
-`desktop-service` cargo feature:
+Managed OS service support (systemd on Linux, launchd on macOS — **Unix only**;
+Windows is in-process) is behind the `desktop-service` cargo feature:
 
 ```toml
 tauri-plugin-background-service = { version = "1.0", features = ["desktop-service"] }

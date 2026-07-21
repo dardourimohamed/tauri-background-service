@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import androidx.annotation.VisibleForTesting
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.CompletableFuture
@@ -21,8 +22,13 @@ data class HeadlessBridgeResult(
     val recoverable: Boolean,
     val rawJson: String,
 ) {
+    // AND-03: `ok` is the accept discriminator — `state` is opaque diagnostics.
+    // Previously `accepted` hardcoded the three success state strings
+    // ("running"/"setup_idle"/"locked_idle"); a host core returning
+    // `ok=true,state="degraded"` was wrongly rejected. Treat any `ok=true` as
+    // accepted and surface `state`/`message` as diagnostics only.
     val accepted: Boolean
-        get() = ok && (state == "running" || state == "setup_idle" || state == "locked_idle")
+        get() = ok
 
     companion object {
         fun fromJson(json: String): HeadlessBridgeResult {
@@ -311,8 +317,15 @@ object HeadlessBridge {
         }
     }
 
-    private fun dataDir(context: Context): File =
-        File(context.applicationInfo.dataDir, "data")
+    @VisibleForTesting
+    internal fun dataDir(context: Context): File {
+        // AND-08: applicationInfo.dataDir can be null (early process init,
+        // restored backups, or some host contexts). Fall back to filesDir,
+        // which Android guarantees exists and is writable, so the headless
+        // core always receives a real data root instead of File("null","data").
+        val base = context.applicationInfo.dataDir ?: context.filesDir.absolutePath
+        return File(base, "data")
+    }
 
     private fun ensureDataDir(dir: File): Boolean =
         dir.exists() || dir.mkdirs()

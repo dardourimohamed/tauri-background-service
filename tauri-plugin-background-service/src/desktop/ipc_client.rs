@@ -323,9 +323,18 @@ impl PersistentIpcClientHandle {
             })
             .await
             .map_err(|_| ServiceError::Ipc("persistent client shut down".into()))?;
-        reply_rx
+        let result = reply_rx
             .await
-            .map_err(|_| ServiceError::Ipc("command dropped".into()))?
+            .map_err(|_| ServiceError::Ipc("command dropped".into()))?;
+        // DESK-03: a successful direct Start over IPC MUST update the local
+        // desired_running mirror so a subsequent disconnect synthesizes
+        // RecoveryPending (not Stopped). Previously only enable/disable
+        // _auto_restart touched this mirror, leaving direct Starts invisible.
+        if result.is_ok() {
+            self.desired_running
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
     }
 
     /// Send a Stop command through the persistent connection.
@@ -338,9 +347,19 @@ impl PersistentIpcClientHandle {
             .send(IpcCommand::Stop { reply: reply_tx })
             .await
             .map_err(|_| ServiceError::Ipc("persistent client shut down".into()))?;
-        reply_rx
+        let result = reply_rx
             .await
-            .map_err(|_| ServiceError::Ipc("command dropped".into()))?
+            .map_err(|_| ServiceError::Ipc("command dropped".into()))?;
+        // DESK-03: a successful direct Stop over IPC MUST clear the local
+        // desired_running mirror so a subsequent disconnect synthesizes
+        // Stopped (not RecoveryPending). Previously the mirror was untouched
+        // here, so a stale `true` from a prior enable_auto_restart could
+        // wrongly surface RecoveryPending after an explicit stop.
+        if result.is_ok() {
+            self.desired_running
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
     }
 
     /// Query whether the service is running through the persistent connection.
@@ -563,6 +582,13 @@ impl PersistentIpcClientHandle {
     pub(crate) fn set_desired_running_for_test(&self, value: bool) {
         self.desired_running
             .store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// DESK-03 test seam: read the local desired_running mirror.
+    #[cfg(all(test, unix))]
+    pub(crate) fn desired_running_for_test(&self) -> bool {
+        self.desired_running
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Nudge the persistent client to skip its current backoff delay and
@@ -2622,6 +2648,92 @@ mod tests {
         );
 
         shutdown.cancel();
+    }
+
+    // ── DESK-03: direct Start/Stop over IPC update desired_running mirror ──
+
+    /// Successful direct Start over IPC MUST set desired_running=true so a
+    /// subsequent disconnect synthesizes RecoveryPending (not Stopped).
+    #[tokio::test]
+    async fn desk03_start_updates_desired_running_mirror() {
+        let (path, shutdown, _event_tx) = setup_server();
+        let app = tauri::test::mock_app();
+        let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+        handle
+            .wait_for_connected(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        assert!(
+            !handle.desired_running_for_test(),
+            "precondition: mirror starts false"
+        );
+        handle
+            .start(crate::models::StartConfig::default())
+            .await
+            .expect("start over IPC should succeed");
+        assert!(
+            handle.desired_running_for_test(),
+            "DESK-03: successful direct Start must set desired_running=true"
+        );
+
+        shutdown.cancel();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Successful direct Stop over IPC MUST clear desired_running so a
+    /// subsequent disconnect synthesizes Stopped (not RecoveryPending).
+    #[tokio::test]
+    async fn desk03_stop_clears_desired_running_mirror() {
+        let (path, shutdown, _event_tx) = setup_server();
+        let app = tauri::test::mock_app();
+        let handle = PersistentIpcClientHandle::spawn(path.clone(), app.handle().clone());
+        handle
+            .wait_for_connected(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        // Start first (sets mirror=true), then stop (must clear mirror).
+        handle
+            .start(crate::models::StartConfig::default())
+            .await
+            .unwrap();
+        assert!(handle.desired_running_for_test());
+        handle.stop().await.expect("stop over IPC should succeed");
+        assert!(
+            !handle.desired_running_for_test(),
+            "DESK-03: successful direct Stop must clear desired_running"
+        );
+
+        shutdown.cancel();
+        let _ = std::fs::remove_file(&path);
+    }
+    /// A FAILED Start does not flip the mirror — pinned at the source level
+    /// rather than via a runtime test, because `start()` does not fast-fail
+    /// on disconnect (it queues and retries). The conditional store
+    /// (`if result.is_ok()`) is the contract; the source-grep test below
+    /// pins it.
+    #[test]
+    fn desk03_start_stop_guard_mirror_with_is_ok() {
+        let src = include_str!("ipc_client.rs");
+        let start_body = src
+            .split("pub async fn start(&self, config: StartConfig)")
+            .nth(1)
+            .and_then(|r| r.split("\n    }").next())
+            .expect("start body");
+        assert!(
+            start_body.contains("if result.is_ok()") && start_body.contains("store(true"),
+            "DESK-03: start must guard desired_running store behind result.is_ok()"
+        );
+        let stop_body = src
+            .split("pub async fn stop(&self)")
+            .nth(1)
+            .and_then(|r| r.split("\n    }").next())
+            .expect("stop body");
+        assert!(
+            stop_body.contains("if result.is_ok()") && stop_body.contains("store(false"),
+            "DESK-03: stop must guard desired_running clear behind result.is_ok()"
+        );
     }
 
     // -- AC2: start() does NOT fast-fail when disconnected --

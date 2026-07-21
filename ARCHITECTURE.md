@@ -21,14 +21,23 @@ tauri-plugin-background-service/src/
 ├── lib.rs              Plugin entry point, Tauri commands, iOS helpers
 ├── manager.rs          Actor loop, command handlers, MobileKeepalive trait
 ├── models.rs           StartConfig, PluginConfig, PluginEvent, ServiceContext, ServiceState, ServiceStatus
+├── desired_state.rs    DesiredState / FileDesiredStateBackend (transactional persistence)
+├── capabilities.rs     Per-platform capability descriptors
+├── validator.rs        Setup validation (errors/warnings/issues)
 ├── error.rs            ServiceError enum
 ├── service_trait.rs    BackgroundService<R> trait
 ├── notifier.rs         Notifier wrapper over tauri-plugin-notification
 ├── mobile.rs           MobileLifecycle: Rust→Kotlin/Swift bridge
-└── desktop/            Desktop OS service mode (behind desktop-service feature)
+└── desktop/            Desktop OS service mode (behind desktop-service feature; Unix-only daemon)
     ├── mod.rs          Desktop module entry point
-    ├── ipc.rs          IPC transport: length-prefixed JSON framing, client/server
-    └── service_manager.rs  OS service management via service-manager crate
+    ├── ipc.rs          IPC framing: big-endian length-prefixed JSON, encode/decode
+    ├── transport.rs    Transport-agnostic frame reader (length prefix + payload)
+    ├── transport_unix.rs   Unix domain socket transport (Linux/macOS)
+    ├── ipc_client.rs   Persistent GUI-side IPC client (bounded reconnect/mirror)
+    ├── ipc_server.rs   Sidecar IPC server (streams events to clients)
+    ├── service_manager.rs  OS service management via service-manager crate
+    ├── headless.rs     headless_main / headless_main_with_desired_state entry points
+    └── env_checks.rs   Desktop environment/sandbox detection
 ```
 
 ```mermaid
@@ -235,21 +244,20 @@ Events use a tagged JSON format (`#[serde(tag = "type")]`) with `camelCase` fiel
 
 ## IPC Transport Layer
 
-The `desktop-service` feature adds an IPC transport layer for communication between the GUI process and a sidecar daemon. The transport uses length-prefixed JSON frames over Unix domain sockets (Linux/macOS) or Windows named pipes.
+The `desktop-service` feature adds an IPC transport layer for communication between the GUI process and a sidecar daemon. The transport uses length-prefixed JSON frames over a **Unix domain socket** (Linux/macOS). There is no Windows transport — Windows is in-process only (the unsafe LocalSystem named-pipe daemon was removed).
 
 ### Protocol
 
-- **Framing:** 4-byte little-endian length prefix + UTF-8 JSON payload
+- **Framing:** 4-byte **big-endian** `u32` length prefix + UTF-8 JSON payload
 - **Max frame size:** 16 MB
-- **Transport:** Unix domain socket (Linux/macOS) or Windows named pipe
+- **Transport:** Unix domain socket only (Linux/macOS); no Windows transport
 
 ### Socket Paths
 
 | Platform | Path |
 |----------|------|
 | Linux | `$XDG_RUNTIME_DIR/{label}.sock` |
-| macOS | `/tmp/{label}.sock` |
-| Windows | `\\.\pipe\{label}` |
+| macOS | `/tmp/{label}.sock` (sandbox note: incompatible with App Sandbox) |
 
 ### Message Types
 
@@ -261,7 +269,7 @@ The `desktop-service` feature adds an IPC transport layer for communication betw
 
 ### Persistent Client
 
-The `IpcClient` maintains a persistent connection with exponential backoff reconnect using the `backon` crate. If the sidecar is temporarily unavailable, the client retries automatically without dropping pending requests.
+The `IpcClient` maintains a persistent connection with bounded reconnect backoff (via the `backon` crate). Reconnect is bounded — no infinite backoff, and pending requests are subject to a timeout. The local `desired_running` mirror updates only on successful `Start`/`Stop` replies.
 
 ## Desktop Service Mode
 
@@ -289,10 +297,11 @@ Sidecar process:
 Enabled via `Cargo.toml`:
 
 ```toml
-tauri-plugin-background-service = { version = "0.7", features = ["desktop-service"] }
+tauri-plugin-background-service = { version = "1.0", features = ["desktop-service"] }
 ```
 
-This pulls in `service-manager` 0.11 and `backon` ~1.5, and adds three Tauri commands: `install_service`, `uninstall_service`, and a desktop IPC client module.
+This pulls in `service-manager` 0.11 and `backon` ~1.6, and adds the OS-service
+Tauri commands plus a desktop IPC client module.
 
 ## Service State Query
 

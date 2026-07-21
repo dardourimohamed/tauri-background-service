@@ -1,7 +1,10 @@
 # Build artifacts
 target/
-Cargo.lock
 
+# Plugin binary lock is tracked at tauri-plugin-background-service/Cargo.lock
+# (binary crate). Do NOT ignore Cargo.lock globally — that hides binary locks
+# and broke the plugin's lock from the root .gitignore in past revisions.
+# Keep the test-app lock tracked at test-app/src-tauri/Cargo.lock.
 
 # Node
 node_modules/
@@ -12,11 +15,19 @@ dist-js/
 .idea/
 .vscode/
 *.swp
-*.swo
+*.swp
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Python (test-app/run-tests.py artifacts)
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+logs/
 
 # Agent/orchestration artifacts
 .agents/
@@ -24,4 +35,7 @@ Thumbs.db
 .worktrees/
 .eval-sandbox/
 
-test-app/.env
+# Local secrets — never commit. Rotate immediately if you ever suspect a leak.
+.env
+.env.*
+!.env.example

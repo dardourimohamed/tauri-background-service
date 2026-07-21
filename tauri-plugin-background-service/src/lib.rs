@@ -97,7 +97,7 @@ pub use models::{
 pub use notifier::{Notifier, NotifierPolicy, NotifySink};
 pub use service_trait::BackgroundService;
 
-#[cfg(all(feature = "desktop-service", any(unix, windows)))]
+#[cfg(all(feature = "desktop-service", unix))]
 pub use desktop::headless::{headless_main, headless_main_with_desired_state};
 
 // ─── Internal Imports ────────────────────────────────────────────────────────
@@ -682,7 +682,7 @@ async fn run_warm_start<R: Runtime>(
 #[tauri::command]
 async fn start<R: Runtime>(app: AppHandle<R>, config: StartConfig) -> Result<(), String> {
     // OS service mode: route through persistent IPC client.
-    #[cfg(all(feature = "desktop-service", any(unix, windows)))]
+    #[cfg(all(feature = "desktop-service", unix))]
     if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
         // Check if IPC is connected before sending the start request.
         if ipc_state.client.is_connected() {
@@ -766,7 +766,7 @@ async fn start<R: Runtime>(app: AppHandle<R>, config: StartConfig) -> Result<(),
 #[tauri::command]
 async fn stop<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     // OS service mode: route through persistent IPC client.
-    #[cfg(all(feature = "desktop-service", any(unix, windows)))]
+    #[cfg(all(feature = "desktop-service", unix))]
     if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
         return ipc_state.client.stop().await.map_err(|e| e.to_string());
     }
@@ -788,7 +788,7 @@ async fn stop<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
 #[tauri::command]
 async fn is_running<R: Runtime>(app: AppHandle<R>) -> bool {
     // OS service mode: route through persistent IPC client.
-    #[cfg(all(feature = "desktop-service", any(unix, windows)))]
+    #[cfg(all(feature = "desktop-service", unix))]
     if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
         return ipc_state.client.is_running().await.unwrap_or(false);
     }
@@ -810,7 +810,7 @@ async fn is_running<R: Runtime>(app: AppHandle<R>) -> bool {
 #[tauri::command]
 async fn get_service_state<R: Runtime>(app: AppHandle<R>) -> Result<models::ServiceStatus, String> {
     // OS service mode: route through persistent IPC client.
-    #[cfg(all(feature = "desktop-service", any(unix, windows)))]
+    #[cfg(all(feature = "desktop-service", unix))]
     if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
         return ipc_state
             .client
@@ -840,7 +840,7 @@ async fn get_platform_capabilities<R: Runtime>(
     let (platform, lifecycle_mode) =
         capabilities::CapabilityProvider::detect_platform(desktop_mode);
 
-    #[cfg(all(feature = "desktop-service", any(unix, windows)))]
+    #[cfg(all(feature = "desktop-service", unix))]
     let os_service_installed = if matches!(lifecycle_mode, models::LifecycleMode::DesktopOsService)
     {
         use desktop::service_manager::{derive_service_label, DesktopServiceManager};
@@ -853,7 +853,7 @@ async fn get_platform_capabilities<R: Runtime>(
         false
     };
 
-    #[cfg(not(all(feature = "desktop-service", any(unix, windows))))]
+    #[cfg(not(all(feature = "desktop-service", unix)))]
     let os_service_installed = false;
 
     Ok(capabilities::CapabilityProvider::capabilities(
@@ -977,13 +977,19 @@ async fn get_pending_bg_task<R: Runtime>(
 /// Android returns the current status (`granted` | `notDetermined` | `denied`)
 /// via the Kotlin `getNotificationPermissionStatus` command, which resolves
 /// immediately — so the mobile call is made directly (mirroring
-/// `get_scheduling_status`). Non-Android returns a default `{status: "granted"}`
-/// so the command is callable cross-platform. (The iOS UN-prompt half of NTF-09
-/// is Step 10c, not this command.)
+/// `get_scheduling_status`). Non-Android returns a default `"granted"` so the
+/// command is callable cross-platform. (The iOS UN-prompt half of NTF-09 is
+/// Step 10c, not this command.)
+///
+/// WIRE-01: the public JS contract is a SCALAR string union
+/// (`NotificationPermissionStatus = 'granted' | 'denied' | 'notDetermined'`),
+/// so the command returns the inner `String`, not the `{status}` object the
+/// Kotlin side emits. The struct stays internal to mobile.rs for
+/// deserialization.
 #[tauri::command]
 async fn get_notification_permission_status<R: Runtime>(
     app: AppHandle<R>,
-) -> Result<models::NotificationPermissionStatus, String> {
+) -> Result<String, String> {
     #[cfg(target_os = "android")]
     {
         let mobile = app.state::<Arc<MobileLifecycle<R>>>();
@@ -994,9 +1000,7 @@ async fn get_notification_permission_status<R: Runtime>(
     #[cfg(not(target_os = "android"))]
     {
         let _ = app;
-        Ok(models::NotificationPermissionStatus {
-            status: "granted".to_string(),
-        })
+        Ok("granted".to_string())
     }
 }
 
@@ -1007,11 +1011,14 @@ async fn get_notification_permission_status<R: Runtime>(
 /// `@PermissionCallback` (Step 10a). That call blocks `run_mobile_plugin`'s
 /// `rx.recv()` for the dialog duration, so it is wrapped in
 /// `tokio::task::spawn_blocking` to avoid blocking the async runtime (the
-/// `wait_for_cancel` class). Non-Android returns a default `{status: "granted"}`.
+/// `wait_for_cancel` class). Non-Android returns a default `"granted"`.
+///
+/// WIRE-01: the public JS contract is a SCALAR string union, so the command
+/// returns the inner `String`, not the `{status}` object. The requester now
+/// resolves with the same `NotificationPermissionStatus` type as the getter
+/// (previously it returned `Promise<void>` and discarded the result).
 #[tauri::command]
-async fn request_notification_permission<R: Runtime>(
-    app: AppHandle<R>,
-) -> Result<models::NotificationPermissionStatus, String> {
+async fn request_notification_permission<R: Runtime>(app: AppHandle<R>) -> Result<String, String> {
     #[cfg(target_os = "android")]
     {
         let mobile = app.state::<Arc<MobileLifecycle<R>>>().inner().clone();
@@ -1023,9 +1030,7 @@ async fn request_notification_permission<R: Runtime>(
     #[cfg(not(target_os = "android"))]
     {
         let _ = app;
-        Ok(models::NotificationPermissionStatus {
-            status: "granted".to_string(),
-        })
+        Ok("granted".to_string())
     }
 }
 
@@ -1101,7 +1106,7 @@ async fn enable_auto_restart<R: Runtime>(
     config: Option<StartConfig>,
 ) -> Result<(), String> {
     // OS service mode: route through persistent IPC client.
-    #[cfg(all(feature = "desktop-service", any(unix, windows)))]
+    #[cfg(all(feature = "desktop-service", unix))]
     if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
         return ipc_state
             .client
@@ -1131,7 +1136,7 @@ async fn enable_auto_restart<R: Runtime>(
 #[tauri::command]
 async fn disable_auto_restart<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     // OS service mode: route through persistent IPC client.
-    #[cfg(all(feature = "desktop-service", any(unix, windows)))]
+    #[cfg(all(feature = "desktop-service", unix))]
     if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
         return ipc_state
             .client
@@ -1161,7 +1166,7 @@ async fn get_desired_service_state<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<Option<desired_state::DesiredState>, String> {
     // OS service mode: route through persistent IPC client.
-    #[cfg(all(feature = "desktop-service", any(unix, windows)))]
+    #[cfg(all(feature = "desktop-service", unix))]
     if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
         return ipc_state
             .client
@@ -1215,7 +1220,7 @@ async fn validate_setup<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<models::SetupValidationReport, String> {
     // OS service mode: route through persistent IPC client.
-    #[cfg(all(feature = "desktop-service", any(unix, windows)))]
+    #[cfg(all(feature = "desktop-service", unix))]
     if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
         return ipc_state
             .client
@@ -1245,7 +1250,7 @@ async fn get_lifecycle_status<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<models::LifecycleStatus, String> {
     // OS service mode: route through persistent IPC client.
-    #[cfg(all(feature = "desktop-service", any(unix, windows)))]
+    #[cfg(all(feature = "desktop-service", unix))]
     if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
         return ipc_state
             .client
@@ -1300,7 +1305,7 @@ async fn configure_recovery<R: Runtime>(
 ///
 /// When present as managed state, the `start`/`stop`/`is_running` commands
 /// route through the persistent IPC client instead of the in-process actor loop.
-#[cfg(all(feature = "desktop-service", any(unix, windows)))]
+#[cfg(all(feature = "desktop-service", unix))]
 struct DesktopIpcState {
     client: desktop::ipc_client::PersistentIpcClientHandle,
 }
@@ -1311,7 +1316,7 @@ struct DesktopIpcState {
 /// Called from plugin setup when `desktopServiceMode` is `"osService"` on a
 /// desktop platform. After this returns, commands route through the IPC
 /// client (the in-process `cmd_rx` is intentionally unused in this mode).
-#[cfg(all(feature = "desktop-service", any(unix, windows), not(mobile)))]
+#[cfg(all(feature = "desktop-service", unix, not(mobile)))]
 fn setup_os_service_ipc<R: Runtime>(
     app: &AppHandle<R>,
     config: &PluginConfig,
@@ -1509,7 +1514,7 @@ async fn install_service_inner<R: Runtime>(app: &AppHandle<R>) -> Result<(), Str
 /// installed (idempotent) and started, then the persistent IPC client is
 /// nudged to reconnect. Failures are logged; the host app keeps whatever
 /// in-process fallback it set up.
-#[cfg(all(feature = "desktop-service", any(unix, windows), not(mobile)))]
+#[cfg(all(feature = "desktop-service", unix, not(mobile)))]
 fn spawn_os_service_auto_provision<R: Runtime>(app: &AppHandle<R>) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -1607,28 +1612,44 @@ async fn uninstall_service<R: Runtime>(app: AppHandle<R>) -> Result<(), String> 
 ///
 /// Gathers the service label, mode string, IPC connection state, socket path,
 /// and optional last error into a status snapshot.
-#[cfg(all(feature = "desktop-service", any(unix, windows)))]
+#[cfg(all(feature = "desktop-service", unix))]
 fn build_os_service_status(
     label: &str,
     ipc_connected: bool,
     socket_path: Option<String>,
     last_error: Option<String>,
+    native_status: Option<service_manager::ServiceStatus>,
 ) -> models::OsServiceStatus {
     let mode = if cfg!(target_os = "macos") {
         "launchd"
-    } else if cfg!(windows) {
-        "scm"
     } else {
+        // DESK-01: Windows daemon was removed; this fn is now Unix-only
+        // (cfg(all(feature = "desktop-service", unix))). The only other
+        // supported Unix target is Linux.
         "systemd"
     };
 
-    let installed = if ipc_connected {
-        models::OsServiceInstallState::Running
-    } else {
-        // If not running via IPC, we can't easily determine install state
-        // without calling external tools. Default to Installed if the manager
-        // was constructable (caller checks this before calling build).
-        models::OsServiceInstallState::Installed
+    // DESK-02: prefer the OS-native status when available so the caller can
+    // distinguish NotInstalled / Stopped / Running. Fall back to the
+    // IPC-derived signal when the daemon binary cannot be constructed or
+    // the status query itself failed — IPC connectivity remains a separate
+    // axis reported in `ipc_connected`.
+    let installed = match native_status {
+        Some(service_manager::ServiceStatus::Running) => models::OsServiceInstallState::Running,
+        Some(service_manager::ServiceStatus::Stopped(_)) => {
+            models::OsServiceInstallState::Installed
+        }
+        Some(service_manager::ServiceStatus::NotInstalled) => {
+            models::OsServiceInstallState::NotInstalled
+        }
+        None => {
+            // Native status unavailable — best-effort fallback from IPC.
+            if ipc_connected {
+                models::OsServiceInstallState::Running
+            } else {
+                models::OsServiceInstallState::Installed
+            }
+        }
     };
 
     models::OsServiceStatus {
@@ -1648,7 +1669,7 @@ fn build_os_service_status(
 #[cfg(feature = "desktop-service")]
 #[tauri::command]
 async fn start_os_service<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     {
         use desktop::service_manager::{derive_service_label, DesktopServiceManager};
         let plugin_config = app.state::<PluginConfig>();
@@ -1669,7 +1690,7 @@ async fn start_os_service<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
 
         Ok(())
     }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     {
         let _ = app;
         Err(os_service_unsupported_platform())
@@ -1683,7 +1704,7 @@ async fn start_os_service<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
 #[cfg(feature = "desktop-service")]
 #[tauri::command]
 async fn stop_os_service<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     {
         use desktop::service_manager::{derive_service_label, DesktopServiceManager};
         let plugin_config = app.state::<PluginConfig>();
@@ -1692,7 +1713,7 @@ async fn stop_os_service<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
         let mgr = DesktopServiceManager::new(&label, exec_path).map_err(|e| e.to_string())?;
         mgr.stop().map_err(|e| e.to_string())
     }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     {
         let _ = app;
         Err(os_service_unsupported_platform())
@@ -1705,17 +1726,55 @@ async fn stop_os_service<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
 #[cfg(feature = "desktop-service")]
 #[tauri::command]
 async fn restart_os_service<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     {
         use desktop::service_manager::{derive_service_label, DesktopServiceManager};
         let plugin_config = app.state::<PluginConfig>();
         let label = derive_service_label(&app, plugin_config.desktop_service_label.as_deref());
         let exec_path = std::env::current_exe().map_err(|e| e.to_string())?;
-        let mgr = DesktopServiceManager::new(&label, exec_path).map_err(|e| e.to_string())?;
-        mgr.stop().ok(); // Best-effort stop — service may not be running.
-        mgr.start().map_err(|e| e.to_string())
+
+        // DESK-05: the previous restart silently swallowed real stop errors
+        // stop errors and immediately raced start against the still-
+        // tearing-down previous instance. Propagate stop errors, then wait
+        // boundedly for the IPC client to observe a disconnect, before
+        // issuing start.
+        {
+            let mgr =
+                DesktopServiceManager::new(&label, exec_path.clone()).map_err(|e| e.to_string())?;
+            mgr.stop().map_err(|e| e.to_string())?;
+        }
+
+        // Bounded wait for the IPC client to observe the disconnect. The
+        // manager itself is not Send (Box<dyn ServiceManager>), so it is
+        // dropped above and we use only the Send-safe IPC client here.
+        let timeout =
+            std::time::Duration::from_millis(plugin_config.desktop_service_start_timeout_ms);
+        if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
+            ipc_state.client.nudge_reconnect();
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                if !ipc_state.client.is_connected() || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        // Now issue start (scoped so the non-Send manager is dropped before
+        // any subsequent await keeps the future Send).
+        {
+            let mgr = DesktopServiceManager::new(&label, exec_path).map_err(|e| e.to_string())?;
+            mgr.start().map_err(|e| e.to_string())?;
+        }
+        // Nudge the persistent client to skip backoff and reconnect.
+        if let Some(ipc_state) = app.try_state::<DesktopIpcState>() {
+            ipc_state.client.nudge_reconnect();
+            ipc_state.client.wait_for_connected(timeout).await.ok();
+        }
+
+        Ok(())
     }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     {
         let _ = app;
         Err(os_service_unsupported_platform())
@@ -1731,9 +1790,9 @@ async fn restart_os_service<R: Runtime>(app: AppHandle<R>) -> Result<(), String>
 async fn get_os_service_status<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<models::OsServiceStatus, String> {
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     {
-        use desktop::service_manager::derive_service_label;
+        use desktop::service_manager::{derive_service_label, DesktopServiceManager};
         let plugin_config = app.state::<PluginConfig>();
         let label = derive_service_label(&app, plugin_config.desktop_service_label.as_deref());
 
@@ -1746,14 +1805,30 @@ async fn get_os_service_status<R: Runtime>(
             .ok()
             .map(|p| p.to_string_lossy().to_string());
 
+        // DESK-02: query the OS-native install/run status instead of
+        // guessing `Installed` when IPC is disconnected. A status-query
+        // failure is non-fatal — fall back to the IPC-only signal so the
+        // command remains callable even if the daemon binary is gone.
+        let native_status = std::env::current_exe()
+            .and_then(|exec_path| {
+                DesktopServiceManager::new(&label, exec_path)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            })
+            .and_then(|mgr| {
+                mgr.status()
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            })
+            .ok();
+
         Ok(build_os_service_status(
             &label,
             ipc_connected,
             socket_path,
             None,
+            native_status,
         ))
     }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     {
         let _ = app;
         Err(os_service_unsupported_platform())
@@ -1762,7 +1837,7 @@ async fn get_os_service_status<R: Runtime>(
 
 /// Error string for OS-service commands on platforms with no IPC transport
 /// (neither Unix domain sockets nor Windows named pipes).
-#[cfg(all(feature = "desktop-service", not(any(unix, windows))))]
+#[cfg(all(feature = "desktop-service", not(unix)))]
 fn os_service_unsupported_platform() -> String {
     ServiceError::Platform("OS-service mode is not supported on this platform".into()).to_string()
 }
@@ -1821,6 +1896,15 @@ where
         ])
         .setup(move |app, api| {
             let config = api.config().clone();
+            // CORE-03: validate the config once before any consumer touches
+            // it. `mpsc::channel(0)` panics, and invalid Android ids / modes
+            // / iOS timers reach native setup and produce confusing late
+            // failures. The setup hook is the single chokepoint.
+            if let Err(e) = config.validate() {
+                let msg = e.to_string();
+                log::error!("invalid background-service plugin config: {msg}");
+                return Err(msg.into());
+            }
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(config.channel_capacity);
             #[cfg(mobile)]
             let mobile_cmd_tx = cmd_tx.clone();
@@ -1877,7 +1961,7 @@ where
             // desktop IPC path, never spawn the actor loop, drop `cmd_rx`, and
             // every ManagerCommand (including Start) would fail on a closed
             // channel — the native foreground service would never start.
-            #[cfg(all(feature = "desktop-service", any(unix, windows), not(mobile)))]
+            #[cfg(all(feature = "desktop-service", unix, not(mobile)))]
             if config.desktop_service_mode == "osService" {
                 // OS service mode: spawn persistent IPC client.
                 setup_os_service_ipc(app, &config)?;
@@ -1938,7 +2022,7 @@ where
 
             // Unknown desktop platform class (neither unix nor windows): no
             // IPC transport exists, so osService mode cannot be honored.
-            #[cfg(all(feature = "desktop-service", not(any(unix, windows))))]
+            #[cfg(all(feature = "desktop-service", not(unix)))]
             {
                 if config.desktop_service_mode == "osService" {
                     log::warn!(
@@ -2038,7 +2122,7 @@ where
                 #[cfg(not(target_os = "android"))]
                 {
                     // In OS service mode, the service runs in a separate process — skip.
-                    #[cfg(all(feature = "desktop-service", any(unix, windows)))]
+                    #[cfg(all(feature = "desktop-service", unix))]
                     if app.try_state::<DesktopIpcState>().is_some() {
                         return;
                     }
@@ -2062,6 +2146,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
@@ -2183,7 +2268,7 @@ mod tests {
     #[allow(dead_code)]
     async fn get_notification_permission_status_command_signature<R: Runtime>(
         app: AppHandle<R>,
-    ) -> Result<models::NotificationPermissionStatus, String> {
+    ) -> Result<String, String> {
         get_notification_permission_status(app).await
     }
 
@@ -2191,7 +2276,7 @@ mod tests {
     #[allow(dead_code)]
     async fn request_notification_permission_command_signature<R: Runtime>(
         app: AppHandle<R>,
-    ) -> Result<models::NotificationPermissionStatus, String> {
+    ) -> Result<String, String> {
         request_notification_permission(app).await
     }
 
@@ -2276,7 +2361,7 @@ mod tests {
     // ── Desktop IPC State Tests ─────────────────────────────────────────
 
     /// Verify PersistentIpcClientHandle can be constructed.
-    #[cfg(all(feature = "desktop-service", any(unix, windows)))]
+    #[cfg(all(feature = "desktop-service", unix))]
     #[tokio::test]
     async fn desktop_ipc_state_with_persistent_client() {
         use desktop::ipc_client::PersistentIpcClientHandle;
@@ -2291,7 +2376,7 @@ mod tests {
     /// AC2: a config with `desktopServiceMode: "osService"` on the current
     /// platform constructs the IPC-client state — `DesktopIpcState` is managed
     /// so commands route through IPC instead of failing on a closed channel.
-    #[cfg(all(feature = "desktop-service", any(unix, windows), not(mobile)))]
+    #[cfg(all(feature = "desktop-service", unix, not(mobile)))]
     #[tokio::test]
     async fn os_service_mode_constructs_ipc_state() {
         let app = tauri::test::mock_app();
@@ -2511,6 +2596,56 @@ mod tests {
             "permissions/autogenerated/commands/request_battery_exemption.toml must allow request_battery_exemption"
         );
     }
+    /// ACL-01: `get_desired_state_status` (iOS desired-state mirror) must be
+    /// reachable on all four production axes (mem-1783371281-d310): (1) declared
+    /// in build.rs COMMANDS, (2) registered in `generate_handler!`, (3) bridged
+    /// in mobile.rs via `run_mobile_plugin` with the EXACT camelCase Swift/Kotlin
+    /// `getDesiredStateStatus` name, and (4) covered by an
+    /// `allow-get-desired-state-status` permission token in both the
+    /// autogenerated command table and the default permission set. Dropping any
+    /// single axis silently ships a dead JS binding that fails at runtime.
+    #[test]
+    fn acl01_get_desired_state_status_reachable_on_all_four_axes() {
+        // (1) build.rs COMMANDS entry (cross-file ⇒ direct contains is safe).
+        let build_rs = include_str!("../build.rs");
+        assert!(
+            build_rs.contains("\"get_desired_state_status\""),
+            "get_desired_state_status must be listed in build.rs COMMANDS"
+        );
+
+        // (2) generate_handler! registration (SAME file ⇒ runtime concat so
+        // the asserted name+comma token does not appear verbatim here).
+        let src = include_str!("lib.rs");
+        let reg = ["get_desired_state_stat", "us,"].concat();
+        assert!(
+            src.contains(&reg[..]),
+            "get_desired_state_status must be registered in generate_handler!"
+        );
+
+        // (3) mobile.rs bridges via run_mobile_plugin with the exact camelCase
+        // name (cross-file ⇒ direct contains is safe).
+        let mobile_rs = include_str!("mobile.rs");
+        assert!(
+            mobile_rs.contains("\"getDesiredStateStatus\""),
+            "mobile.rs must bridge getDesiredStateStatus via run_mobile_plugin"
+        );
+
+        // (4) permission token: autogenerated allow-get-desired-state-status
+        // command token AND default permission entry (cross-file ⇒ direct
+        // contains is safe). Without both, the JS invoke is capability-denied
+        // at runtime even though the command compiles + is registered.
+        let default_toml = include_str!("../permissions/default.toml");
+        assert!(
+            default_toml.contains("\"allow-get-desired-state-status\""),
+            "allow-get-desired-state-status must be in permissions/default.toml"
+        );
+        let cmd_toml =
+            include_str!("../permissions/autogenerated/commands/get_desired_state_status.toml");
+        assert!(
+            cmd_toml.contains("\"get_desired_state_status\""),
+            "permissions/autogenerated/commands/get_desired_state_status.toml must allow get_desired_state_status"
+        );
+    }
 
     // ── Desktop Command Compile-time Tests ────────────────────────────────
 
@@ -2559,7 +2694,34 @@ mod tests {
         restart_os_service(app).await
     }
 
-    /// Verify `get_os_service_status` command signature is generic over `R: Runtime`.
+    // ── DESK-05: restart propagates stop errors and waits before start ──
+
+    #[cfg(all(feature = "desktop-service", unix))]
+    #[test]
+    fn desk05_restart_does_not_swallow_stop_error() {
+        // The old restart swallowed stop errors and raced start — both
+        // now. `stop()` must propagate via `?` and a bounded wait must
+        // separate stop from start.
+        let src = include_str!("lib.rs");
+        let restart_body = src
+            .split("async fn restart_os_service")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("restart_os_service body must be present");
+        assert!(
+            !restart_body.contains("mgr.stop().ok()"),
+            "DESK-05: restart must not swallow stop errors with .ok()"
+        );
+        assert!(
+            restart_body.contains("mgr.stop().map_err"),
+            "DESK-05: restart must propagate stop errors via ?"
+        );
+        assert!(
+            restart_body.contains("deadline") || restart_body.contains("wait_for_connected"),
+            "DESK-05: restart must wait boundedly between stop and start"
+        );
+    }
+
     #[cfg(feature = "desktop-service")]
     #[allow(dead_code)]
     async fn get_os_service_status_command_signature<R: Runtime>(
@@ -2572,13 +2734,14 @@ mod tests {
 
     /// Test that `build_os_service_status` produces a valid OsServiceStatus
     /// with the correct fields populated.
-    #[cfg(all(feature = "desktop-service", any(unix, windows)))]
+    #[cfg(all(feature = "desktop-service", unix))]
     #[test]
     fn build_os_service_status_populates_fields() {
         let status = build_os_service_status(
             "com.example.bg-service",
             true,
             Some("/tmp/test.sock".to_string()),
+            None,
             None,
         );
         assert_eq!(status.label, "com.example.bg-service");
@@ -2588,16 +2751,77 @@ mod tests {
     }
 
     /// Test that `build_os_service_status` includes the correct mode string.
-    #[cfg(all(feature = "desktop-service", any(unix, windows)))]
+    #[cfg(all(feature = "desktop-service", unix))]
     #[test]
     fn build_os_service_status_mode_is_correct() {
-        let status = build_os_service_status("test", false, None, None);
+        let status = build_os_service_status("test", false, None, None, None);
         #[cfg(target_os = "linux")]
         assert_eq!(status.mode, "systemd");
         #[cfg(target_os = "macos")]
         assert_eq!(status.mode, "launchd");
-        #[cfg(windows)]
-        assert_eq!(status.mode, "scm");
+        // DESK-01: no Windows mode branch anymore.
+    }
+
+    // ── DESK-02: native ServiceStatus mapped into OsServiceInstallState ──
+
+    #[cfg(all(feature = "desktop-service", unix))]
+    #[test]
+    fn desk02_native_running_maps_to_running() {
+        let status = build_os_service_status(
+            "test",
+            false,
+            None,
+            None,
+            Some(service_manager::ServiceStatus::Running),
+        );
+        assert_eq!(status.installed, models::OsServiceInstallState::Running);
+    }
+
+    #[cfg(all(feature = "desktop-service", unix))]
+    #[test]
+    fn desk02_native_stopped_maps_to_installed() {
+        // Installed but not running — the daemon binary is registered with
+        // the OS service manager but not currently executing. The caller
+        // can see ipc_connected=false to confirm it's not responding.
+        let status = build_os_service_status(
+            "test",
+            false,
+            None,
+            None,
+            Some(service_manager::ServiceStatus::Stopped(None)),
+        );
+        assert_eq!(status.installed, models::OsServiceInstallState::Installed);
+    }
+
+    #[cfg(all(feature = "desktop-service", unix))]
+    #[test]
+    fn desk02_native_not_installed_is_reachable() {
+        // DESK-02 headline: NotInstalled is no longer unreachable. Previously
+        // `build_os_service_status` always returned Installed/Running; now the
+        // native status is the source of truth when available.
+        let status = build_os_service_status(
+            "test",
+            false,
+            None,
+            None,
+            Some(service_manager::ServiceStatus::NotInstalled),
+        );
+        assert_eq!(
+            status.installed,
+            models::OsServiceInstallState::NotInstalled,
+            "NotInstalled must surface when the native manager reports it"
+        );
+    }
+
+    #[cfg(all(feature = "desktop-service", unix))]
+    #[test]
+    fn desk02_native_unavailable_falls_back_to_ipc_signal() {
+        // When the daemon binary cannot be constructed or the status query
+        // fails, fall back to the IPC-derived signal.
+        let running = build_os_service_status("test", true, None, None, None);
+        assert_eq!(running.installed, models::OsServiceInstallState::Running);
+        let stopped = build_os_service_status("test", false, None, None, None);
+        assert_eq!(stopped.installed, models::OsServiceInstallState::Installed);
     }
 
     // ── On-Event Shutdown Compile-time Test ─────────────────────────────────

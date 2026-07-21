@@ -3,7 +3,6 @@ package app.tauri.backgroundservice
 import android.app.*
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -35,7 +34,6 @@ class LifecycleService : Service() {
 
         @Volatile var isRunning = false
         @Volatile var isForeground = false
-        @Volatile var autoRestarting = false
 
         @VisibleForTesting
         internal var bridgeProvider: () -> CoreBridge = { HeadlessBridgeImpl() }
@@ -147,7 +145,7 @@ class LifecycleService : Service() {
             // Notify Rust actor that the user pressed stop on the notification.
             // The callback emits a JS event that the TypeScript layer forwards
             // to the Rust native_lifecycle_event command.
-            BackgroundServicePlugin.onNativeLifecycleEvent?.invoke(
+            BackgroundServicePlugin.emitNativeLifecycleEvent(
                 "androidNotificationStop", null
             )
             getSharedPreferences("bg_service", Context.MODE_PRIVATE).edit()
@@ -247,8 +245,12 @@ class LifecycleService : Service() {
                     .putString("bg_service_type", serviceType)
                     .apply()
 
-                // Persist DurableState
-                DurableState.save(this, buildStartState(label, serviceType, DurableState.load(this)))
+                // Persist DurableState. AND-07: a successful explicit start
+                // (manual or desired boot/package-replace recovery) resets the
+                // OS-restart attempt counter — the service is in a clean state.
+                DurableState.save(this, buildStartState(label, serviceType, DurableState.load(this)).copy(
+                    restartAttempt = 0,
+                ))
                 ServiceStartAckRegistry.complete(startAckId, true, coreResult.rawJson)
 
                 // Boot-recovery start ACCEPTED (BootReceiver routes through the
@@ -256,7 +258,7 @@ class LifecycleService : Service() {
                 // policy-gated bg-recovery notification (suppressed on Android
                 // per DEC-002; the emit still flows for observability).
                 if (startReason == "boot_completed" || startReason == "package_replaced") {
-                    BackgroundServicePlugin.onNativeLifecycleEvent?.invoke(
+                    BackgroundServicePlugin.emitNativeLifecycleEvent(
                         "androidBootRecoveryAccepted", null
                     )
                 }
@@ -274,7 +276,6 @@ class LifecycleService : Service() {
         }
         isRunning = false
         isForeground = false
-        autoRestarting = false
         super.onDestroy()
     }
 
@@ -296,7 +297,7 @@ class LifecycleService : Service() {
         // Notify Rust actor about the timeout.
         // The callback emits a JS event that the TypeScript layer forwards
         // to the Rust native_lifecycle_event command.
-        BackgroundServicePlugin.onNativeLifecycleEvent?.invoke(
+        BackgroundServicePlugin.emitNativeLifecycleEvent(
             "androidTimeout", serviceType
         )
 
@@ -314,9 +315,20 @@ class LifecycleService : Service() {
         }
 
         // Emit timeout event to JS layer via BackgroundServicePlugin
-        BackgroundServicePlugin.onTimeoutEvent?.invoke(
+        BackgroundServicePlugin.emitTimeoutEvent(
             "FGS timeout (type: $serviceType)"
         )
+
+        // AND-06: dispatch the off-main core stop (host flush + network
+        // teardown) with reason `android_timeout` BEFORE stopForeground/stopSelf.
+        // Previously handleTimeout tore down the FGS/process without bridge.stop,
+        // skipping the host's graceful shutdown. Mirrors the ACTION_STOP path's
+        // coreStopExecutor discipline (BGS-20): fire-and-forget onto the worker;
+        // the cheap main-thread teardown below runs immediately and does not
+        // block on the JNI hop.
+        coreStopExecutor("bg-core-stop") {
+            bridge.stop(this, "android_timeout")
+        }
 
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -336,11 +348,15 @@ class LifecycleService : Service() {
             return START_NOT_STICKY
         }
 
-        val serviceType = prefs.getString("bg_service_type", "dataSync")!!
+        val serviceType = prefs.getString("bg_service_type", "dataSync") ?: "dataSync"
 
-        // Persist recovery state
+        // Persist recovery state. AND-07: an OS (START_STICKY) restart is an
+        // involuntary restart attempt — increment the counter so callers can
+        // observe backoff pressure; it is reset to 0 on a successful explicit
+        // start (see the onStartCommand normal-start path).
         val previous = DurableState.load(this)
         DurableState.save(this, previous.copy(
+            restartAttempt = previous.restartAttempt + 1,
             recoveryPending = true,
             recoveryReason = "os_restart",
         ))
@@ -371,7 +387,6 @@ class LifecycleService : Service() {
                 stopSelf()
             } else {
                 isRunning = true
-                autoRestarting = true
                 registerConnectivityMonitor()
 
                 DurableState.save(this, buildStartState(label, serviceType, DurableState.load(this)).copy(
@@ -382,7 +397,7 @@ class LifecycleService : Service() {
                 // Recovery start ACCEPTED — tell the Rust actor so it can fire
                 // the policy-gated bg-recovery notification (suppressed on
                 // Android per DEC-002; the emit still flows for observability).
-                BackgroundServicePlugin.onNativeLifecycleEvent?.invoke(
+                BackgroundServicePlugin.emitNativeLifecycleEvent(
                     "androidOsRestartAccepted", null
                 )
             }
@@ -461,28 +476,13 @@ class LifecycleService : Service() {
         // self-stopping silently (spec-compliance W1 / R-W1.3, NFR-1). DurableState
         // is committed synchronously above, so the pushed error and a later
         // status poll agree.
-        BackgroundServicePlugin.onPlatformErrorEvent?.invoke("$code: $message")
+        BackgroundServicePlugin.emitPlatformErrorEvent("$code: $message")
     }
 
-    private fun mapServiceType(type: String): Int {
-        return when (type) {
-            "dataSync" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            "mediaPlayback" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
-            "phoneCall" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL
-            "location" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
-            "connectedDevice" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-            "mediaProjection" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            "camera" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
-            "microphone" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            "health" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_HEALTH
-            "remoteMessaging" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING
-            "systemExempted" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED
-            "shortService" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE
-            "specialUse" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            "mediaProcessing" -> ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
-            else -> throw IllegalArgumentException("Invalid foreground_service_type: $type")
-        }
-    }
+    // AND-01: the type→bit mapping now lives in the single source
+    // [ForegroundServiceTypes] shared with the plugin's merged-manifest
+    // preflight, so the dispatch and the preflight cannot drift.
+    private fun mapServiceType(type: String): Int = ForegroundServiceTypes.bitFor(type)
 
     private fun buildNotification(label: String): Notification {
         val pi = packageManager.getLaunchIntentForPackage(packageName)

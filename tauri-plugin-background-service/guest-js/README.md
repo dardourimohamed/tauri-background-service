@@ -27,7 +27,7 @@ Add the plugin to your app's `Cargo.toml`:
 [dependencies]
 tauri = { version = "2" }
 tauri-plugin-notification = "2"
-tauri-plugin-background-service = "0.7"
+tauri-plugin-background-service = "1.0"
 ```
 
 ### npm (TypeScript API)
@@ -178,7 +178,8 @@ The `foregroundServiceType` parameter in `StartConfig` accepts these values:
 
 | Type | Use Case |
 |------|----------|
-| `"dataSync"` (default) | Data synchronization, file uploads/downloads |
+| `"remoteMessaging"` (default) | Push messaging — Play-policy-safe long-lived keepalive |
+| `"dataSync"` | Data synchronization, file uploads/downloads (6h/24h cap on Android 15+) |
 | `"mediaPlayback"` | Audio/video playback |
 | `"phoneCall"` | Ongoing phone calls |
 | `"location"` | Location tracking |
@@ -187,8 +188,6 @@ The `foregroundServiceType` parameter in `StartConfig` accepts these values:
 | `"camera"` | Camera access |
 | `"microphone"` | Microphone access |
 | `"health"` | Health/fitness data |
-| `"remoteMessaging"` | Push messaging |
-| `"systemExempted"` | System-critical operations |
 | `"shortService"` | Short-lived tasks (< 3 minutes) |
 | `"specialUse"` | Custom use cases (requires Play Console justification) |
 | `"mediaProcessing"` | Media transcoding/processing |
@@ -221,9 +220,9 @@ For desktop service mode, also add:
 
 The plugin uses a Foreground Service with a persistent notification to keep the process alive. Required additions to your app's `AndroidManifest.xml` (the plugin's manifest already declares these):
 
-- `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_DATA_SYNC` permissions
-- `POST_NOTIFICATIONS` runtime permission (requested automatically on Android 13+)
-- `foregroundServiceType="dataSync"` on the service declaration (see [Android Guide](./docs/android.md) for all 14 valid types)
+- `FOREGROUND_SERVICE` and `FOREGROUND_SERVICE_REMOTE_MESSAGING` permissions (the default type is `remoteMessaging`)
+- `POST_NOTIFICATIONS` runtime permission (resolved lazily at the first `startService()`; not auto-requested at load by default)
+- `foregroundServiceType="dataSync|remoteMessaging|specialUse|phoneCall|microphone"` on the library service declaration (see [Android Guide](./docs/android.md) for all valid types and merged-manifest extension)
 - `stopWithTask="false"` ensures the service survives when the user swipes the app away
 - `START_STICKY` causes the OS to restart the service if killed under memory pressure
 
@@ -255,7 +254,7 @@ No special OS integration is needed. The service runs as a standard Tokio task a
 For OS-level daemon mode (systemd / launchd), enable the `desktop-service` Cargo feature:
 
 ```toml
-tauri-plugin-background-service = { version = "0.7", features = ["desktop-service"] }
+tauri-plugin-background-service = { version = "1.0", features = ["desktop-service"] }
 ```
 
 ## Links

@@ -6,6 +6,17 @@ on:
   pull_request:
     branches: [main]
 
+# CI-03: least-privilege default. The publish workflow keeps its scoped OIDC
+# grant on the npm job; CI itself only needs to read repo contents.
+permissions:
+  contents: read
+
+# CI-03: cancel superseded in-progress runs on the same branch/PR so the latest
+# push is what gates merge.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -18,6 +29,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri-plugin-background-service
       - run: cargo fmt --check
         working-directory: tauri-plugin-background-service
 
@@ -27,20 +41,60 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri-plugin-background-service
       - name: Install Tauri dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
-      - run: cargo check
+      # CI-02: --all-targets so examples/tests/benches are type-checked too.
+      - run: cargo check --all-targets
+        working-directory: tauri-plugin-background-service
+
+  # CI-02: MSRV gate. The crate declares rust-version = "1.77.2"; this job
+  # proves a clean 1.77.2 toolchain can still compile the desktop-service
+  # feature surface.
+  msrv:
+    name: cargo check (MSRV 1.77.2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.77.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri-plugin-background-service
+      - name: Install Tauri dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - run: cargo check --features desktop-service
         working-directory: tauri-plugin-background-service
 
   check-android:
-    name: cargo check (Android)
+    name: cargo check (Android aarch64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri-plugin-background-service
       - run: cargo check --target aarch64-linux-android
+        working-directory: tauri-plugin-background-service
+
+  # CI-02: second Android ABI. The plugin must build for x86_64 emulators too,
+  # not just aarch64 devices.
+  check-android-x86_64:
+    name: cargo check (Android x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri-plugin-background-service
+      - run: cargo check --target x86_64-linux-android
         working-directory: tauri-plugin-background-service
 
   check-ios:
@@ -51,6 +105,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri-plugin-background-service
       - run: cargo check --target aarch64-apple-ios
         working-directory: tauri-plugin-background-service
 
@@ -60,6 +117,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri-plugin-background-service
       - name: Install Tauri dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
       - run: cargo check --features desktop-service
@@ -71,9 +131,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri-plugin-background-service
       - name: Install Tauri dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
-      - run: cargo test --features desktop-service
+      # CI-02: --all-targets so integration tests / examples / benches run.
+      - run: cargo test --all-targets --features desktop-service
         working-directory: tauri-plugin-background-service
 
   clippy:
@@ -84,23 +148,49 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri-plugin-background-service
       - name: Install Tauri dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
-      - run: cargo clippy --features desktop-service -- -D warnings
+      # CI-02: --all-targets --all-features so every cfg combination is linted.
+      - run: cargo clippy --all-targets --all-features -- -D warnings
         working-directory: tauri-plugin-background-service
 
   ts:
-    name: TypeScript build
+    name: TypeScript build + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm install
+          cache: npm
+          cache-dependency-path: tauri-plugin-background-service/guest-js/package-lock.json
+      # CI-01: reproducible install (no lock drift) and Vitest actually runs.
+      - run: npm ci
         working-directory: tauri-plugin-background-service/guest-js
       - run: npm run build
         working-directory: tauri-plugin-background-service/guest-js
+      - run: npm test
+        working-directory: tauri-plugin-background-service/guest-js
+
+  # CI-02: the test-app frontend must build too — its index.html imports the
+  # plugin via a file: dep and a Vite break would ship silently otherwise.
+  test-app-frontend:
+    name: test-app frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: test-app/package-lock.json
+      - run: npm ci
+        working-directory: test-app
+      - run: npm run build
+        working-directory: test-app
 
   android-test:
     name: Android unit tests
@@ -108,12 +198,28 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - name: Fetch Tauri Android SDK
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri-plugin-background-service
+      # CI-03: cargo metadata package path lookup replaces the fragile
+      # filesystem `find` against ~/.cargo/registry/src. Empty/missing path
+      # fails the step loudly instead of substituting an empty env var.
+      - name: Resolve Tauri Android SDK path
         run: |
           cd tauri-plugin-background-service
           cargo fetch
-          TAURI_VERSION=$(grep -A1 'name = "tauri"' Cargo.lock | grep version | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
-          TAURI_ANDROID_PATH=$(find ~/.cargo/registry/src -path "*/tauri-${TAURI_VERSION}/mobile/android" -type d | head -1)
+          TAURI_MANIFEST=$(cargo metadata --format-version 1 \
+            | python3 -c "import sys,json; m=json.load(sys.stdin); print(next((p['manifest_path'] for p in m['packages'] if p['name']=='tauri'), ''))")
+          if [ -z "$TAURI_MANIFEST" ]; then
+            echo "::error::cargo metadata did not resolve the 'tauri' package. Did 'cargo fetch' run?"
+            exit 1
+          fi
+          TAURI_ANDROID_PATH="$(dirname "$TAURI_MANIFEST")/mobile/android"
+          if [ ! -d "$TAURI_ANDROID_PATH" ]; then
+            echo "::error::Tauri Android SDK directory not found at '$TAURI_ANDROID_PATH'."
+            exit 1
+          fi
+          echo "Resolved TAURI_ANDROID_PATH=$TAURI_ANDROID_PATH"
           echo "TAURI_ANDROID_PATH=${TAURI_ANDROID_PATH}" >> "$GITHUB_ENV"
       - uses: actions/setup-java@v4
         with:
@@ -163,12 +269,26 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - name: Fetch Tauri Android SDK
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri-plugin-background-service
+      # CI-03: cargo metadata package path lookup; fails loudly on missing path.
+      - name: Resolve Tauri Android SDK path
         run: |
           cd tauri-plugin-background-service
           cargo fetch
-          TAURI_VERSION=$(grep -A1 'name = "tauri"' Cargo.lock | grep version | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
-          TAURI_ANDROID_PATH=$(find ~/.cargo/registry/src -path "*/tauri-${TAURI_VERSION}/mobile/android" -type d | head -1)
+          TAURI_MANIFEST=$(cargo metadata --format-version 1 \
+            | python3 -c "import sys,json; m=json.load(sys.stdin); print(next((p['manifest_path'] for p in m['packages'] if p['name']=='tauri'), ''))")
+          if [ -z "$TAURI_MANIFEST" ]; then
+            echo "::error::cargo metadata did not resolve the 'tauri' package. Did 'cargo fetch' run?"
+            exit 1
+          fi
+          TAURI_ANDROID_PATH="$(dirname "$TAURI_MANIFEST")/mobile/android"
+          if [ ! -d "$TAURI_ANDROID_PATH" ]; then
+            echo "::error::Tauri Android SDK directory not found at '$TAURI_ANDROID_PATH'."
+            exit 1
+          fi
+          echo "Resolved TAURI_ANDROID_PATH=$TAURI_ANDROID_PATH"
           echo "TAURI_ANDROID_PATH=${TAURI_ANDROID_PATH}" >> "$GITHUB_ENV"
       - uses: actions/setup-java@v4
         with:
@@ -210,21 +330,36 @@ jobs:
           echo "android.useAndroidX=true" > ci-build/gradle.properties
       - name: Run lint
         working-directory: tauri-plugin-background-service/android/ci-build
+        # CI-01: lint is fatal. Removed `continue-on-error: true` so a real
+        # lint regression fails the build instead of being silently swallowed.
         run: gradle :plugin:lintDebug
-        continue-on-error: true
 
   ios-build:
-    name: iOS Swift compile
+    name: iOS Swift compile + test
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - name: Fetch Tauri iOS SDK
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri-plugin-background-service
+      # CI-03: cargo metadata package path lookup; fails loudly on missing path.
+      - name: Resolve Tauri iOS SDK path
         run: |
           cd tauri-plugin-background-service
           cargo fetch
-          TAURI_VERSION=$(grep -A1 'name = "tauri"' Cargo.lock | grep version | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
-          TAURI_IOS_PATH=$(find ~/.cargo/registry/src -path "*/tauri-${TAURI_VERSION}/mobile/ios-api" -type d | head -1)
+          TAURI_MANIFEST=$(cargo metadata --format-version 1 \
+            | python3 -c "import sys,json; m=json.load(sys.stdin); print(next((p['manifest_path'] for p in m['packages'] if p['name']=='tauri'), ''))")
+          if [ -z "$TAURI_MANIFEST" ]; then
+            echo "::error::cargo metadata did not resolve the 'tauri' package. Did 'cargo fetch' run?"
+            exit 1
+          fi
+          TAURI_IOS_PATH="$(dirname "$TAURI_MANIFEST")/mobile/ios-api"
+          if [ ! -d "$TAURI_IOS_PATH" ]; then
+            echo "::error::Tauri iOS SDK directory not found at '$TAURI_IOS_PATH'."
+            exit 1
+          fi
+          echo "Resolved TAURI_IOS_PATH=$TAURI_IOS_PATH"
           echo "TAURI_IOS_PATH=${TAURI_IOS_PATH}" >> "$GITHUB_ENV"
       - name: Generate Package.swift
         run: |
@@ -235,7 +370,9 @@ jobs:
 
           let package = Package(
             name: "TauriPluginBackgroundService",
-            platforms: [.iOS(.v13)],
+            // CI-03: align the generated manifest floor with ios/Package.swift
+            // (.iOS(.v14)) — v13 is no longer accurate for the plugin.
+            platforms: [.iOS(.v14)],
             dependencies: [
               .package(name: "Tauri", path: "${TAURI_IOS_PATH}")
             ],
@@ -253,10 +390,11 @@ jobs:
             ]
           )
           EOF
-      - name: Build
+      # CI-01: actually run the XCTest target, not just `xcodebuild build`.
+      - name: Test
         working-directory: tauri-plugin-background-service/ios
         run: |
-          xcodebuild build \
+          xcodebuild test \
             -scheme TauriPluginBackgroundService \
             -destination 'platform=iOS Simulator,name=iPhone 16'
 
@@ -266,7 +404,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri-plugin-background-service
       - name: Install Tauri dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      # CI-02: deny rustdoc warnings (broken intra-doc links etc.).
       - run: cargo doc --no-deps --features desktop-service
         working-directory: tauri-plugin-background-service
+        env:
+          RUSTDOCFLAGS: "-D warnings"

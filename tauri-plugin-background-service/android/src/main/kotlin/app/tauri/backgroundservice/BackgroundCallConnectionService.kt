@@ -6,7 +6,6 @@ import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.telecom.CallAudioState
@@ -102,10 +101,13 @@ class BackgroundCallConnectionService : ConnectionService() {
         // ── M-NATIVE-3 (Step 11): DRIVE the registered self-managed account ──
         //
         // Step 9 wired every Connection callback + the full audio-focus lifecycle,
-        // but nothing issued `addNewIncomingCall`/`placeCall`, so the OS never
-        // created a `BackgroundCallConnection` and the focus path was dead. Step 11
-        // issues them so the platform call pipeline (audio focus, MODE_IN_
-        // COMMUNICATION, BT routing) engages for a real call.
+        // but nothing issued `addNewIncomingCall`, so the OS never created a
+        // `BackgroundCallConnection` and the focus path was dead. Step 11 issues
+        // it so the platform call pipeline (audio focus, MODE_IN_COMMUNICATION,
+        // BT routing) engages for a real inbound call. (AND-02: the symmetric
+        // outbound `placeCall`/`onCreateOutgoingConnection` path was unreachable —
+        // outbound calls are core-initiated via `start_call` — and has been
+        // removed; inbound-only Telecom is retained.)
 
         /**
          * Issue [TelecomManager.addNewIncomingCall] for an inbound offer so the OS
@@ -136,41 +138,6 @@ class BackgroundCallConnectionService : ConnectionService() {
                 Log.i(TAG, "addNewIncomingCall: callId=$callId, video=$isVideo")
             } catch (e: SecurityException) {
                 Log.w(TAG, "Cannot add incoming call (MANAGE_OWN_CALLS?): ${e.message}")
-            }
-        }
-
-        /**
-         * Issue [TelecomManager.placeCall] for an outbound dial so the OS creates a
-         * [BackgroundCallConnection] through [onCreateOutgoingConnection] (which activates
-         * audio focus immediately). The address is a synthetic `bg-call:` URI (the real
-         * peer is the Iroh node; Telecom only needs a non-null address for routing).
-         *
-         * NOTE: there is no native outbound-dial hook today — outbound calls are
-         * core-initiated via `start_call` — so this companion is the symmetric
-         * capability (host-unit-tested); wiring it to a live dial event is a
-         * follow-on (DEC-058). The inbound [addNewIncomingCall] is the AC1-required
-         * driven path.
-         */
-        @JvmStatic
-        fun placeOutgoingCall(context: Context, callId: String) {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-            if (callId.isEmpty()) return
-            val tm = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
-            val handle = phoneAccountHandle(context)
-            val csExtras = Bundle().apply {
-                putString(IncomingCallNotifier.EXTRA_CALL_ID, callId)
-            }
-            val extras = Bundle().apply {
-                putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, handle)
-                putBundle(TelecomManager.EXTRA_OUTGOING_CALL_EXTRAS, csExtras)
-                putString(IncomingCallNotifier.EXTRA_CALL_ID, callId)
-            }
-            val address = Uri.fromParts("bg-call", callId, null)
-            try {
-                tm.placeCall(address, extras)
-                Log.i(TAG, "placeCall: callId=$callId")
-            } catch (e: SecurityException) {
-                Log.w(TAG, "Cannot place self-managed call (MANAGE_OWN_CALLS?): ${e.message}")
             }
         }
 
@@ -280,22 +247,6 @@ class BackgroundCallConnectionService : ConnectionService() {
         // and the route command (setCallAudioRoute) can reach it (Step 11).
         (connection as? BackgroundCallConnection)?.let { registerConnection(it.callId, it) }
         connection.setRinging()
-        return connection
-    }
-
-    override fun onCreateOutgoingConnection(
-        connectionManagerPhoneAccount: PhoneAccountHandle?,
-        request: ConnectionRequest,
-    ): Connection {
-        Log.i(TAG, "onCreateOutgoingConnection: ${request.address}")
-        val handle = connectionManagerPhoneAccount
-            ?: phoneAccountHandle(applicationContext)
-        val connection = connectionFactory(handle, request)
-        configureSelfManaged(connection)
-        (connection as? BackgroundCallConnection)?.let { registerConnection(it.callId, it) }
-        connection.setDialing()
-        // Outgoing calls activate audio focus immediately on Android.
-        connection.setActive()
         return connection
     }
 

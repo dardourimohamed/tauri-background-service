@@ -10,7 +10,8 @@ import Tauri
 // `BackgroundServicePlugin`); these fakes are injected per-test.
 
 /// Recording fake for the `BGTaskScheduling` seam: captures register/submit/cancel
-/// and can simulate `submit` failure (`schedulerUnavailable`).
+/// and can simulate `submit` failure (`schedulerUnavailable`) or `register`
+/// failure (IOS-SCHED-01).
 final class FakeBGTaskScheduler: BGTaskScheduling {
     private(set) var registered: [String] = []
     private(set) var submitted: [BGTaskRequest] = []
@@ -23,6 +24,15 @@ final class FakeBGTaskScheduler: BGTaskScheduling {
     /// Lets a test fail only one identifier (e.g. processing) to prove refresh vs
     /// processing scheduling errors are tracked independently (M2).
     var shouldFailSubmit: ((BGTaskRequest) -> Bool)?
+    /// IOS-SCHED-01: default `register` return value. The real
+    /// `BGTaskScheduler.register` returns false when the identifier is absent
+    /// from `BGTaskSchedulerPermittedIdentifiers`; flip this to false to prove
+    /// the plugin records the failure. Per-identifier overrides win over this
+    /// default via `registerResults`.
+    var registerResult: Bool = true
+    /// IOS-SCHED-01: per-identifier `register` return overrides. Keys are task
+    /// identifiers; absence falls back to `registerResult`.
+    var registerResults: [String: Bool] = [:]
 
     /// Net pending requests per identifier. `submit` *appends* and `cancel` clears
     /// an identifier's entries — deliberately NOT the real iOS replace-on-submit
@@ -43,7 +53,7 @@ final class FakeBGTaskScheduler: BGTaskScheduling {
         launchHandler: @escaping (BGTask) -> Void
     ) -> Bool {
         registered.append(identifier)
-        return true
+        return registerResults[identifier] ?? registerResult
     }
 
     func submit(_ request: BGTaskRequest) throws {
@@ -140,5 +150,97 @@ final class InvokeCapture {
             sendChannelData: { _, _ in },
             data: args
         )
+    }
+}
+
+// MARK: - FakeNotificationCenter (IOS-MSG-01)
+
+/// Recording fake for the `NotificationCenterScheduling` seam (IOS-MSG-01):
+/// captures the most recent `UNNotificationRequest` and registered categories,
+/// and can simulate a scheduling error so the handler's resolve/reject path is
+/// provable without a real system notification center.
+final class FakeNotificationCenter: NotificationCenterScheduling {
+    private(set) var addCount = 0
+    private(set) var lastRequest: UNNotificationRequest?
+    /// When set, `add` hands this error to the completion handler instead of
+    /// scheduling — simulates a real `UNUserNotificationCenter.add` failure.
+    var addError: Error?
+
+    private(set) var setCategoriesCount = 0
+    private(set) var lastCategories: Set<UNNotificationCategory>?
+
+    func add(
+        _ request: UNNotificationRequest,
+        withCompletionHandler completionHandler: @escaping (Error?) -> Void
+    ) {
+        addCount += 1
+        lastRequest = request
+        completionHandler(addError)
+    }
+
+    func setNotificationCategories(_ categories: Set<UNNotificationCategory>) {
+        setCategoriesCount += 1
+        lastCategories = categories
+    }
+}
+
+// MARK: - TestDefaults (IOS-CLEAN-01 centralization)
+
+/// Canonical list of every `ios_*` UserDefaults key the plugin persists, plus
+/// helpers to create an isolated suite and clear all keys. IOS-CLEAN-01
+/// replaces the per-class `clearKeys()` helpers (each of which cleared only a
+/// subset, leaking state between test classes) with this single source of
+/// truth so test order no longer affects outcomes. Production reads/writes
+/// through the plugin's `defaults` seam; tests inject an isolated suite built
+/// here so they cannot leak into `UserDefaults.standard` either.
+enum TestDefaults {
+    /// The complete canonical list of `ios_*` UserDefaults keys the plugin
+    /// persists (mirrors `BackgroundServicePlugin.DesiredStateKeys` +
+    /// `PendingTaskKeys`, which are private). Add new keys here when you add
+    /// one to the plugin so test cleanup stays total.
+    static let allKeys: [String] = [
+        // DesiredStateKeys
+        "ios_desired_running",
+        "ios_last_start_config",
+        "ios_last_schedule_error",
+        "ios_last_task_kind",
+        "ios_last_task_started_at",
+        "ios_last_task_completed_at",
+        "ios_last_refresh_scheduled",
+        "ios_last_processing_scheduled",
+        "ios_last_refresh_error",
+        "ios_last_processing_error",
+        "ios_last_task_outcome",
+        "ios_last_completion_reason",
+        "ios_notification_granted",
+        "ios_adaptive_processing_begin_minutes",
+        // PendingTaskKeys
+        "ios_pending_task_kind",
+        "ios_pending_task_identifier",
+        "ios_pending_task_received_at",
+        "ios_pending_task_consumed_at",
+        "ios_pending_task_last_failed_at",
+    ]
+
+    /// Remove every canonical key from the given defaults. Call this from
+    /// each test class's `setUp` / `tearDown` once the suite is wired up.
+    static func clearAll(on defaults: UserDefaults) {
+        for key in allKeys {
+            defaults.removeObject(forKey: key)
+        }
+    }
+
+    /// Create a fresh, fully-cleared isolated `UserDefaults` suite so a test
+    /// class's `plugin.defaults` cannot leak into `UserDefaults.standard` or
+    /// another class's suite. Each call mints a unique suite name to keep
+    /// concurrent / repeated runs isolated.
+    @discardableResult
+    static func makeIsolatedSuite(file: StaticString = #file, line: UInt = #line) -> UserDefaults {
+        let name = "tauri-bg-svc.test.\(UUID().uuidString)"
+        guard let suite = UserDefaults(suiteName: name) else {
+            fatalError("UserDefaults(suiteName:) returned nil for \(name) at \(file):\(line)")
+        }
+        clearAll(on: suite)
+        return suite
     }
 }

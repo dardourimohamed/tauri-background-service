@@ -33,9 +33,27 @@ git clone https://github.com/dardourimohamed/tauri-background-service.git
 cd tauri-background-service
 ```
 
+The Rust crate lives in `tauri-plugin-background-service/`. **All `cargo`
+commands below run from that directory**, not the repository root:
+
+```bash
+cd tauri-plugin-background-service
+```
+
+### Git Hooks (optional, recommended)
+
+This repo ships a `pre-commit` hook in [`.githooks/`](.githooks). Enable it once
+so `cargo fmt --check` (and other checks) run before each commit:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## Build Commands
 
-All commands run from the repository root unless noted.
+Run `cargo` commands from `tauri-plugin-background-service/` (see
+[Development Setup](#development-setup)). The `npm` commands below `cd` into
+the relevant directory themselves.
 
 | Command | Purpose |
 |---------|---------|

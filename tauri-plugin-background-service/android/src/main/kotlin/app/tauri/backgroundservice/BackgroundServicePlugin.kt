@@ -24,13 +24,6 @@ import java.util.UUID
     var foregroundServiceType: String = "dataSync"
 }
 
-@InvokeArg
-class GetAutoStartConfigResult {
-    var pending: Boolean = false
-    var label: String? = null
-    var serviceType: String? = null
-}
-
 // spec 08 C6 (Step 15): swap the running FGS type (remoteMessaging ↔ phoneCall)
 // without restarting the headless core.
 @InvokeArg
@@ -142,6 +135,12 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
             data.put("error", platformError)
             trigger("platform-error", data)
         }
+
+        // AND-05: the callbacks are now attached — drain any native
+        // lifecycle/platform events that LifecycleService enqueued before load()
+        // (boot / OS-restart / timeout paths that run with no webview), exactly
+        // once, in insertion order. Without this drain those events were dropped.
+        drainQueuedNativeEvents()
     }
 
     // tauri 2.x's Plugin base class is mid-migration to onDestroy(activity); it
@@ -233,6 +232,17 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
         )
         if (validationError != null) {
             invoke.reject(validationError)
+            return
+        }
+
+        // AND-01: also reject a type that passes the allowlist but is absent
+        // from the merged <service foregroundServiceType> — it would crash late
+        // at startForeground on Android 14+. Checked before any dispatch.
+        val declaredError = validateDeclaredForegroundServiceType(
+            args.foregroundServiceType, ForegroundServiceTypes.declaredBits(activity)
+        )
+        if (declaredError != null) {
+            invoke.reject(declaredError)
             return
         }
 
@@ -343,9 +353,6 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
         prefs().edit()
             .remove("bg_service_label")
             .remove("bg_service_type")
-            .remove("bg_auto_start_pending")
-            .remove("bg_auto_start_label")
-            .remove("bg_auto_start_type")
             .remove("bg_notif_channel_id")
             .remove("bg_notif_channel_name")
             .remove("bg_notif_id")
@@ -375,6 +382,16 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
         )
         if (validationError != null) {
             invoke.reject(validationError)
+            return
+        }
+
+        // AND-01: a type swap to an undeclared bit would crash late at the
+        // re-promotion startForeground; reject before dispatch.
+        val declaredError = validateDeclaredForegroundServiceType(
+            args.foregroundServiceType, ForegroundServiceTypes.declaredBits(activity)
+        )
+        if (declaredError != null) {
+            invoke.reject(declaredError)
             return
         }
         if (!LifecycleService.isRunning) {
@@ -468,26 +485,6 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
 
     private fun resolveSmallIcon(): Int {
         return NotificationIconResolver.resolve(activity, notificationSmallIcon)
-    }
-
-    @Command
-    fun getAutoStartConfig(invoke: Invoke) {
-        val p = prefs()
-        val result = GetAutoStartConfigResult()
-        result.pending = p.getBoolean("bg_auto_start_pending", false)
-        result.label = p.getString("bg_auto_start_label", null)
-        result.serviceType = p.getString("bg_auto_start_type", null)
-        invoke.resolveObject(result)
-    }
-
-    @Command
-    fun clearAutoStartConfig(invoke: Invoke) {
-        prefs().edit()
-            .remove("bg_auto_start_pending")
-            .remove("bg_auto_start_label")
-            .remove("bg_auto_start_type")
-            .apply()
-        invoke.resolve()
     }
 
     @Command
@@ -642,6 +639,62 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
         @Volatile
         internal var onPlatformErrorEvent: ((String) -> Unit)? = null
 
+        // ── AND-05: native event emit/drain seam ──────────────────────────
+        //
+        // Emitters used by LifecycleService: if the matching JS callback is
+        // attached, deliver immediately; otherwise enqueue into the bounded
+        // process queue so load() can replay the event once, in order. This
+        // replaces the old `callback?.invoke(...)` no-op that dropped every
+        // event emitted before the plugin loaded.
+
+        internal fun emitNativeLifecycleEvent(type: String, fgsType: String?) {
+            val cb = onNativeLifecycleEvent
+            if (cb != null) {
+                cb(type, fgsType)
+            } else {
+                NativeEventQueue.enqueue(QueuedNativeEvent.Lifecycle(type, fgsType))
+            }
+        }
+
+        internal fun emitTimeoutEvent(errorMessage: String) {
+            val cb = onTimeoutEvent
+            if (cb != null) {
+                cb(errorMessage)
+            } else {
+                NativeEventQueue.enqueue(QueuedNativeEvent.Timeout(errorMessage))
+            }
+        }
+
+        internal fun emitPlatformErrorEvent(error: String) {
+            val cb = onPlatformErrorEvent
+            if (cb != null) {
+                cb(error)
+            } else {
+                NativeEventQueue.enqueue(QueuedNativeEvent.PlatformError(error))
+            }
+        }
+
+        /**
+         * AND-05: replay every native event queued before load() attached the
+         * callbacks, exactly once, in insertion order. Called from [load] after
+         * all three callbacks are wired.
+         */
+        @VisibleForTesting
+        internal fun drainQueuedNativeEvents() {
+            val queued = NativeEventQueue.drainAndClear()
+            if (queued.isEmpty()) return
+            for (event in queued) {
+                when (event) {
+                    is QueuedNativeEvent.Lifecycle ->
+                        onNativeLifecycleEvent?.invoke(event.type, event.fgsType)
+                    is QueuedNativeEvent.Timeout ->
+                        onTimeoutEvent?.invoke(event.errorMessage)
+                    is QueuedNativeEvent.PlatformError ->
+                        onPlatformErrorEvent?.invoke(event.error)
+                }
+            }
+        }
+
         internal const val START_ACK_TIMEOUT_MS = 30_000L
 
         // spec-compliance W1 / R-W1.2: the start-ACK wait MUST run off the main
@@ -711,6 +764,40 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
             }.toString()
         }
 
+        /**
+         * AND-01: reject a requested FGS type whose bit is NOT present in the
+         * merged manifest's `<service foregroundServiceType>` — such a type
+         * would pass the config allowlist but crash late at startForeground on
+         * Android 14+. Returns a structured `fgs_type_not_declared` error, or
+         * null when the type is declared (or when no declaration is observable,
+         * e.g. API < 29 — the allowlist already gated the request). Pure over
+         * [declaredBits] so it is deterministically unit-testable.
+         */
+        fun validateDeclaredForegroundServiceType(
+            requestedType: String,
+            declaredBits: Int,
+        ): String? {
+            val requestedBit = try {
+                ForegroundServiceTypes.bitFor(requestedType)
+            } catch (_: IllegalArgumentException) {
+                // Unknown type — validateForegroundServiceType / mapServiceType reject it.
+                return null
+            }
+            if (declaredBits == 0) return null // pre-Q / undeclared — allowlist already gated
+            if (declaredBits and requestedBit == 0) {
+                return org.json.JSONObject().apply {
+                    put("code", "fgs_type_not_declared")
+                    put("message", "Foreground service type '$requestedType' is allowlisted but " +
+                        "not declared in the merged <service foregroundServiceType> " +
+                        "(declaredBits=$declaredBits). Declare it (and the matching " +
+                        "FOREGROUND_SERVICE_* permission) in the host manifest.")
+                    put("invalidType", requestedType)
+                    put("declaredBits", declaredBits)
+                }.toString()
+            }
+            return null
+        }
+
         /** Map a service-start exception to structured error JSON for reject. */
         fun mapServiceStartException(e: Exception, foregroundServiceType: String): String {
             val code = when (e) {
@@ -759,17 +846,41 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
  * remainder is bounded by `LifecycleService`'s `if (!isForeground)` guard and is
  * device-runbook only (Step 21) — not catchable at a call site.
  */
-internal fun startServiceGuarded(context: Context, intent: Intent, foreground: Boolean) {
-    try {
+internal fun startServiceGuarded(
+    context: Context,
+    intent: Intent,
+    foreground: Boolean,
+): ServiceStartOutcome {
+    return try {
         if (foreground && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             context.startForegroundService(intent)
         } else {
             context.startService(intent)
         }
+        ServiceStartOutcome.Started
     } catch (e: Throwable) {
         Log.w(
             "BackgroundServicePlugin",
             "Guarded service start failed (action=${intent.action}, foreground=$foreground): ${e.message}",
         )
+        ServiceStartOutcome.Rejected(e)
     }
+}
+
+/**
+ * AND-04: structured outcome for [startServiceGuarded]. The previous `Unit`
+ * return swallowed every OS start-restriction silently; callers that need to
+ * react (notably [BootReceiver.startRecoveryService]) now branch on the result.
+ * `Rejected` carries the cause so a recovery path can persist a typed reason
+ * and post a notification for ANY restriction (the boot blocked-type static set
+ * on API 35+ is only an optimization for the KNOWN fast-path cases; a newer
+ * `ForegroundServiceStartNotAllowedException` reason must not silently miss
+ * recovery).
+ */
+sealed class ServiceStartOutcome {
+    /** The start call returned without throwing. */
+    object Started : ServiceStartOutcome()
+
+    /** The platform rejected the start (caught `Throwable`). */
+    data class Rejected(val cause: Throwable) : ServiceStartOutcome()
 }

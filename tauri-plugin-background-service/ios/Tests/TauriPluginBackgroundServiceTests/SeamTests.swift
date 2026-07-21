@@ -10,6 +10,7 @@ final class SeamTests: XCTestCase {
 
     private var plugin: BackgroundServicePlugin!
     private var scheduler: FakeBGTaskScheduler!
+    private var suite: UserDefaults!
 
     override func setUp() {
         super.setUp()
@@ -20,25 +21,18 @@ final class SeamTests: XCTestCase {
         // fake so the real `UNUserNotificationCenter.current()` isn't touched in the
         // test host (which has no app bundle).
         plugin.notificationAuthorizer = FakeNotificationAuthorizer()
-        clearKeys()
+        // IOS-CLEAN-01: isolated suite so this class cannot leak state.
+        suite = TestDefaults.makeIsolatedSuite()
+        plugin.defaults = suite
+        TestDefaults.clearAll(on: suite)
     }
 
     override func tearDown() {
-        clearKeys()
+        TestDefaults.clearAll(on: suite)
         plugin = nil
         scheduler = nil
+        suite = nil
         super.tearDown()
-    }
-
-    private func clearKeys() {
-        let d = UserDefaults.standard
-        for key in [
-            "ios_desired_running", "ios_last_schedule_error", "ios_last_start_config",
-            "ios_last_task_completed_at", "ios_adaptive_processing_begin_minutes",
-            "ios_pending_task_consumed_at",
-        ] {
-            d.removeObject(forKey: key)
-        }
     }
 
     // MARK: - BGTaskScheduler seam + Invoke capture
@@ -62,7 +56,7 @@ final class SeamTests: XCTestCase {
         XCTAssertEqual(capture.resolveCount, 1)
         XCTAssertEqual(capture.rejectCount, 0)
         XCTAssertEqual(
-            UserDefaults.standard.bool(forKey: "ios_desired_running"), true,
+            suite.bool(forKey: "ios_desired_running"), true,
             "desired state is persisted on a successful start")
     }
 
@@ -90,7 +84,7 @@ final class SeamTests: XCTestCase {
         plugin.stopKeepalive(capture.makeInvoke())
 
         XCTAssertEqual(
-            UserDefaults.standard.double(forKey: "ios_last_task_completed_at"), 4242.0,
+            suite.double(forKey: "ios_last_task_completed_at"), 4242.0,
             accuracy: 0.0001, "lastTaskCompletedAt comes from the injected clock, not Date()")
         XCTAssertEqual(capture.resolveCount, 1)
     }

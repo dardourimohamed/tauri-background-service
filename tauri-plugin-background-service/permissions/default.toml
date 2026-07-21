@@ -11,6 +11,7 @@ permissions = [
     "allow-enable-auto-restart",
     "allow-disable-auto-restart",
     "allow-get-desired-service-state",
+    "allow-get-desired-state-status",
     "allow-validate-setup",
     "allow-get-lifecycle-status",
     "allow-configure-recovery",

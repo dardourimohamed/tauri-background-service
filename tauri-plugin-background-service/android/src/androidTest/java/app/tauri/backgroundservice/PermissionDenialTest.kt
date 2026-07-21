@@ -10,7 +10,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.After
 import org.junit.Assert.*
 import org.junit.Before
-import org.junit.Ignore
+import org.junit.Assume
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -24,10 +24,11 @@ import org.junit.runner.RunWith
  * On API < 33, POST_NOTIFICATIONS does not exist — these tests still pass because
  * the permission grant/revoke is skipped.
  *
- * @Ignore'd because Waydroid kills the instrumentation process when pm revoke is
- * executed via uiAutomation.executeShellCommand. Passes on real devices/emulators.
+ * @Ignored ONLY on Waydroid at runtime: Waydroid kills the instrumentation
+ * process when `pm revoke` is executed via uiAutomation.executeShellCommand.
+ * A runtime `Assume.assumeFalse(isWaydroid())` (see [setup]) lets the suite run
+ * on real devices/emulators while skipping cleanly under Waydroid.
  */
-@Ignore("Waydroid kills instrumentation on pm revoke — passes on real devices/emulators")
 @RunWith(AndroidJUnit4::class)
 class PermissionDenialTest {
 
@@ -36,6 +37,11 @@ class PermissionDenialTest {
 
     @Before
     fun setup() {
+        // AND-10: skip on Waydroid (it kills the instrumentation process on
+        // `pm revoke`) instead of class-wide @Ignore, so this suite RUNS on real
+        // devices/emulators. Mirrors LifecycleServiceInstrumentedTest.isWaydroid.
+        Assume.assumeFalse("Waydroid kills instrumentation on pm revoke", isWaydroid())
+
         context = InstrumentationRegistry.getInstrumentation().targetContext
         prefs = context.getSharedPreferences("bg_service", Context.MODE_PRIVATE)
 
@@ -44,9 +50,12 @@ class PermissionDenialTest {
 
         // Reset state
         LifecycleService.isRunning = false
-        LifecycleService.autoRestarting = false
         prefs.edit().clear().apply()
     }
+
+    private fun isWaydroid(): Boolean =
+        Build.FINGERPRINT.contains("waydroid", ignoreCase = true) ||
+            Build.MODEL.contains("waydroid", ignoreCase = true)
 
     @After
     fun tearDown() {
@@ -63,7 +72,6 @@ class PermissionDenialTest {
         } catch (_: Exception) { /* service may not be running */ }
 
         LifecycleService.isRunning = false
-        LifecycleService.autoRestarting = false
         prefs.edit().clear().apply()
     }
 

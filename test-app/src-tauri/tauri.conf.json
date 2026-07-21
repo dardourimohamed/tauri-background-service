@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/nicehash/tauri/dev/crates/tauri-cli/schema.json",
+  "$schema": "https://schema.tauri.app/config/2",
   "productName": "Background Service Test",
   "version": "0.1.0",
   "identifier": "com.test.backgroundservice",
