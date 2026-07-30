@@ -97,6 +97,12 @@ jobs:
         with:
           workspaces: tauri-plugin-background-service
 
+      # REL-fix: cargo publish verifies the tarball by building default
+      # features, which pull gtk/glib-sys on Linux — those build scripts need
+      # the GLib/GTK dev libs (pkg-config). Without this the verify step fails
+      # ("failed to verify package tarball") and crates.io never publishes.
+      - name: Install Tauri dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
       - name: Publish crate
         working-directory: tauri-plugin-background-service
         # REL-01: removed --no-verify. cargo publish now compiles the crate
