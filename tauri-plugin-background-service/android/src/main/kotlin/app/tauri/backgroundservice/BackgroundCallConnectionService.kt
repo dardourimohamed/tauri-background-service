@@ -198,8 +198,16 @@ class BackgroundCallConnectionService : ConnectionService() {
                 return
             }
             try {
-                connection.setAudioRoute(routeInt)
-                Log.i(TAG, "setCallAudioRoute: callId=$callId, route=$route")
+                // setAudioRoute requires API 26; the self-managed ConnectionService
+                // is itself only registered on O+ (registerPhoneAccount API guard),
+                // so this branch is always taken on supported devices. The guard
+                // satisfies lint's NewApi check (minSdk 24) without changing runtime.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    connection.setAudioRoute(routeInt)
+                    Log.i(TAG, "setCallAudioRoute: callId=$callId, route=$route")
+                } else {
+                    Log.i(TAG, "setCallAudioRoute: skipped, API ${Build.VERSION.SDK_INT} < O")
+                }
             } catch (e: Exception) {
                 Log.w(TAG, "setCallAudioRoute failed: ${e.message}")
             }

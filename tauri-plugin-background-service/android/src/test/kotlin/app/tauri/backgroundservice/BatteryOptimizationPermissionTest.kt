@@ -27,7 +27,7 @@ import java.util.Properties
  * that DOES declare the permission is detectable by the same text scan, so a
  * host opt-in (merged on top of this library) remains observable.
  */
-@RunWith(Robolectric::class)
+@RunWith(RobolectricTestRunner::class)
 class BatteryOptimizationPermissionTest {
 
     private val permission = "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"

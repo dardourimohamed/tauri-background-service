@@ -187,6 +187,13 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: test-app/package-lock.json
+      # The test-app imports the plugin through a `file:` dep whose package.json
+      # `exports` resolve to dist-js/ — a gitignored build artifact absent from a
+      # fresh checkout. Build the plugin first so Vite can resolve its entry.
+      - run: npm ci
+        working-directory: tauri-plugin-background-service/guest-js
+      - run: npm run build
+        working-directory: tauri-plugin-background-service/guest-js
       - run: npm ci
         working-directory: test-app
       - run: npm run build
@@ -365,28 +372,42 @@ jobs:
         run: |
           cd tauri-plugin-background-service/ios
           cat > Package.swift <<EOF
-          // swift-tools-version:5.9
+          // swift-tools-version:5.5
           import PackageDescription
 
+          // CI: this manifest mirrors the committed ios/Package.swift (proven to
+          // resolve by the `cargo check (iOS)` job) exactly, swapping only the
+          // Tauri dependency path for the cargo-registry checkout. Crucially it
+          // declares an explicit `products:` entry — without it xcodebuild derives
+          // no scheme from a SwiftPM package and fails with "does not contain a
+          // scheme named ...". Names match the crate (swift-rs CARGO_PKG_NAME).
           let package = Package(
-            name: "TauriPluginBackgroundService",
-            // CI-03: align the generated manifest floor with ios/Package.swift
-            // (.iOS(.v14)) — v13 is no longer accurate for the plugin.
-            platforms: [.iOS(.v14)],
+            name: "tauri-plugin-background-service",
+            platforms: [
+              .iOS(.v14),
+            ],
+            products: [
+              .library(
+                name: "tauri-plugin-background-service",
+                type: .static,
+                targets: ["tauri-plugin-background-service"])
+            ],
             dependencies: [
               .package(name: "Tauri", path: "${TAURI_IOS_PATH}")
             ],
             targets: [
               .target(
-                name: "TauriPluginBackgroundService",
-                dependencies: ["Tauri"],
-                path: "Sources"
-              ),
+                name: "tauri-plugin-background-service",
+                dependencies: [
+                  .byName(name: "Tauri")
+                ],
+                path: "Sources/TauriPluginBackgroundService"),
               .testTarget(
-                name: "TauriPluginBackgroundServiceTests",
-                dependencies: ["TauriPluginBackgroundService"],
-                path: "Tests"
-              )
+                name: "tauri-plugin-background-serviceTests",
+                dependencies: [
+                  .byName(name: "tauri-plugin-background-service")
+                ],
+                path: "Tests/TauriPluginBackgroundServiceTests")
             ]
           )
           EOF
@@ -395,7 +416,7 @@ jobs:
         working-directory: tauri-plugin-background-service/ios
         run: |
           xcodebuild test \
-            -scheme TauriPluginBackgroundService \
+            -scheme tauri-plugin-background-service \
             -destination 'platform=iOS Simulator,name=iPhone 16'
 
   docs:

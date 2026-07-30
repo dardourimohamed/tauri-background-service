@@ -27,7 +27,7 @@ import org.robolectric.annotation.Config
  * manifest (the LifecycleService declares phoneCall), proving the runtime query
  * the preflight uses is populated from the manifest.
  */
-@RunWith(Robolectric::class)
+@RunWith(RobolectricTestRunner::class)
 class ForegroundServiceTypesTest {
 
     private val declared = ForegroundServiceTypes.bitFor("dataSync") or

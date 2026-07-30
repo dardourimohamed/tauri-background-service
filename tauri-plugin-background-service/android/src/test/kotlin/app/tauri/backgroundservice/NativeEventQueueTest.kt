@@ -22,7 +22,7 @@ import org.robolectric.RobolectricTestRunner
  * - the [BackgroundServicePlugin.drainQueuedNativeEvents] replay through the
  *   now-attached callbacks in insertion order.
  */
-@RunWith(Robolectric::class)
+@RunWith(RobolectricTestRunner::class)
 class NativeEventQueueTest {
 
     @Before

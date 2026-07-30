@@ -26,7 +26,7 @@ import java.io.File
  * - `HeadlessBridge.dataDir` falls back to `filesDir` when
  *   `applicationInfo.dataDir` is null.
  */
-@RunWith(Robolectric::class)
+@RunWith(RobolectricTestRunner::class)
 class And08EdgeFixesTest {
 
     private lateinit var context: Context
