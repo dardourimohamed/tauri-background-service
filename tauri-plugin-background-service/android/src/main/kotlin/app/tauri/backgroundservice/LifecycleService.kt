@@ -452,15 +452,26 @@ class LifecycleService : Service() {
                 startForeground(notifId, notification)
             }
             return true
-        } catch (e: android.app.ForegroundServiceStartNotAllowedException) {
-            persistStartForegroundError("fgs_restricted",
-                "Foreground service start not allowed by OS: ${e.message}")
-        } catch (e: SecurityException) {
-            persistStartForegroundError("missing_permission",
-                "Missing foreground service permission: ${e.message}")
         } catch (e: Exception) {
-            persistStartForegroundError("start_failed",
-                "Failed to start foreground service: ${e.message}")
+            // ForegroundServiceStartNotAllowedException requires API 31; collapse
+            // the typed catches into one Exception catch and branch on a guarded
+            // instanceof so lint's NewApi check (minSdk 24) is satisfied. The
+            // mapping is unchanged on supported (S+) devices.
+            val code: String
+            val message: String
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                e is android.app.ForegroundServiceStartNotAllowedException
+            ) {
+                code = "fgs_restricted"
+                message = "Foreground service start not allowed by OS: ${e.message}"
+            } else if (e is SecurityException) {
+                code = "missing_permission"
+                message = "Missing foreground service permission: ${e.message}"
+            } else {
+                code = "start_failed"
+                message = "Failed to start foreground service: ${e.message}"
+            }
+            persistStartForegroundError(code, message)
         }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()

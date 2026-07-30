@@ -1068,6 +1068,7 @@ class BackgroundServicePluginTest {
     // ── AC2: FGS_NOT_ALLOWED maps to structured error JSON ────────────────
 
     @Test
+    @Config(sdk = [33]) // API-31 exception mapping: run at S+ so the guard holds
     fun mapServiceStartException_fgsNotAllowed_returnsStructuredError() {
         val exception = android.app.ForegroundServiceStartNotAllowedException("test")
         val result = BackgroundServicePlugin.mapServiceStartException(

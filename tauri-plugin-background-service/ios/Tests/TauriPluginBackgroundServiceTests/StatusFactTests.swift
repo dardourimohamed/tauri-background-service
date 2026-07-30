@@ -43,7 +43,7 @@ final class StatusFactTests: XCTestCase {
     func testPersistTaskOutcome_writesBothConsumableOutcomeAndDurableReason() {
         plugin.persistTaskOutcome("expired")
 
-        let d = suite
+        let d = suite!
         XCTAssertEqual(d.string(forKey: outcomeKey), "expired",
                        "the consumable adaptation outcome is written")
         XCTAssertEqual(d.string(forKey: completionReasonKey), "expired",
@@ -60,7 +60,7 @@ final class StatusFactTests: XCTestCase {
 
         plugin.appDidEnterBackground()
 
-        let d = suite
+        let d = suite!
         XCTAssertNil(d.string(forKey: outcomeKey),
                      "scheduleNext() consumes the one-shot adaptation outcome")
         XCTAssertEqual(d.string(forKey: completionReasonKey), "completed",

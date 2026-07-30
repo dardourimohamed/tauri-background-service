@@ -83,7 +83,7 @@ final class CompletionHygieneTests: XCTestCase {
 
         plugin.appDidEnterBackground()
 
-        let d = suite
+        let d = suite!
         XCTAssertNil(d.string(forKey: "ios_last_refresh_error"),
                      "refresh succeeded → no refresh error")
         XCTAssertNotNil(d.string(forKey: "ios_last_processing_error"),

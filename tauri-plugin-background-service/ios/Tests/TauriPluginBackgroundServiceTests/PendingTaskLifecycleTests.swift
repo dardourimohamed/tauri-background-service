@@ -70,7 +70,7 @@ final class PendingTaskLifecycleTests: XCTestCase {
         XCTAssertTrue(payload.contains("\"taskKind\":null"),
                       "pending must be None after clear: \(payload)")
 
-        let d = suite
+        let d = suite!
         XCTAssertNil(d.object(forKey: kindKey), "kind key must be deleted")
         XCTAssertNil(d.object(forKey: identifierKey), "identifier key must be deleted")
         XCTAssertNil(d.object(forKey: receivedAtKey), "receivedAt key must be deleted")
