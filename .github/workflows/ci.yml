@@ -50,15 +50,17 @@ jobs:
       - run: cargo check --all-targets
         working-directory: tauri-plugin-background-service
 
-  # CI-02: MSRV gate. The crate declares rust-version = "1.77.2"; this job
-  # proves a clean 1.77.2 toolchain can still compile the desktop-service
-  # feature surface.
+  # CI-02: MSRV gate. Bumped to 1.88.0 to track the dependency floor: the
+  # v1.0.1 lock resolves transitive deps (time/serde_with/zvariant/zbus etc.)
+  # whose declared rust-version reaches 1.88, and several edition2024 deps
+  # need cargo >= 1.85. Pinning them back to 1.77.2 is an unmaintainable
+  # treadmill, so the gate now reflects the effective dependency MSRV.
   msrv:
-    name: cargo check (MSRV 1.77.2)
+    name: cargo check (MSRV 1.88.0)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.77.2
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: tauri-plugin-background-service
@@ -417,7 +419,7 @@ jobs:
         run: |
           xcodebuild test \
             -scheme tauri-plugin-background-service \
-            -destination 'platform=iOS Simulator,name=iPhone 16'
+            -destination 'platform=iOS Simulator,name=iPhone 17'
 
   docs:
     name: cargo doc

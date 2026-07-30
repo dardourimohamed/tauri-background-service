@@ -9,7 +9,7 @@ repository = "https://github.com/dardourimohamed/tauri-background-service"
 readme = "README.md"
 keywords = ["tauri", "background", "service", "android", "ios"]
 categories = ["gui", "asynchronous", "os", "api-bindings"]
-rust-version = "1.77.2"
+rust-version = "1.88.0"
 authors = ["Mohamed Dardouri <med@dardouri.com>"]
 exclude = ["test-app/", "docs/", ".*", "examples/"]
 

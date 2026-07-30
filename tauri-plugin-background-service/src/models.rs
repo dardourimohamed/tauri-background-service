@@ -973,10 +973,7 @@ impl PendingTaskInfo {
     pub fn from_pending_payload(
         value: &serde_json::Value,
     ) -> Result<Option<Self>, serde_json::Error> {
-        if value
-            .get("taskKind")
-            .map_or(true, serde_json::Value::is_null)
-        {
+        if value.get("taskKind").is_none_or(serde_json::Value::is_null) {
             return Ok(None);
         }
         let info: Self = serde_json::from_value(value.clone())?;

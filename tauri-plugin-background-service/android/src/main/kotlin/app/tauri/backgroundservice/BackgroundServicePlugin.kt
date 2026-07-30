@@ -800,8 +800,11 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
 
         /** Map a service-start exception to structured error JSON for reject. */
         fun mapServiceStartException(e: Exception, foregroundServiceType: String): String {
-            val code = when (e) {
-                is android.app.ForegroundServiceStartNotAllowedException -> "FGS_NOT_ALLOWED"
+            val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                e is android.app.ForegroundServiceStartNotAllowedException
+            ) {
+                "FGS_NOT_ALLOWED"
+            } else when (e) {
                 is SecurityException -> "SECURITY"
                 else -> "UNKNOWN"
             }
