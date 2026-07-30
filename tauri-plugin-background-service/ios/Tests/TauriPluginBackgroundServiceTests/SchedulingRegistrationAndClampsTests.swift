@@ -172,7 +172,7 @@ final class SchedulingRegistrationAndClampsTests: XCTestCase {
         XCTAssertEqual(capture.resolveCount, 1)
         let processingReq = scheduler.submitted.first { $0.identifier.hasSuffix(".bg-processing") }
         XCTAssertNotNil(processingReq?.earliestBeginDate)
-        XCTAssertTrue(processingReq!.earliestBeginDate!.isFinite,
+        XCTAssertTrue(processingReq!.earliestBeginDate! < .distantFuture,
                       "processing earliestBeginDate must be finite (multiplier clamped)")
     }
 }
