@@ -27,9 +27,9 @@ final class MessageNotificationTests: XCTestCase {
         routeUri: String = "myapp://chat/chat-7/msg-9"
     ) -> String {
         return """
-        {"notification_id":\(notificationId),"chat_id":\(chatId),\
-        "message_id":\(messageId),"title":\(title),"body":\(body),\
-        "route_uri":\(routeUri)}
+        {"notification_id":\(notificationId),"chat_id":"\(chatId)",\
+        "message_id":"\(messageId)","title":"\(title)","body":"\(body)",\
+        "route_uri":"\(routeUri)"}
         """
     }
 
