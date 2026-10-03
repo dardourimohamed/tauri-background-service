@@ -407,9 +407,14 @@ replaced by the desired-state recovery machinery.
   HeadlessBridge.nativeLibName = "app_core"
   ```
 
-  A missing library yields a typed `native_library_load_failed` result (no crash);
-  the lifecycle-only path (foreground service + Rust `BackgroundService<R>` task)
-  is unaffected.
+  A missing library never crashes. A start made by the plugin itself
+  (`startService` from Rust/JS) runs lifecycle-only — the foreground service
+  plus the Rust `BackgroundService<R>` task, reported with
+  `state: "lifecycle_only"`. Starts Android makes on its own (boot /
+  package-replace recovery, sticky restart) and the core-only entry points
+  (call actions, notification actions, network nudge) return a typed
+  `native_library_load_failed` result, so those starts take the normal
+  start-failure path (the sticky restart posts the recovery notification).
 
 ### Breaking: iOS `SilaNativeFFI` removed
 

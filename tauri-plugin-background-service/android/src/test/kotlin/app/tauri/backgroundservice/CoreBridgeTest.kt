@@ -103,8 +103,8 @@ class CoreBridgeTest {
 
     @Test
     fun `HeadlessBridge networkChanged fails gracefully without native lib`() {
-        // On the JVM there is no native core library, so ensureLoaded() fails; the wrapper
-        // must return the same load-failure shape as start/stop, never throw.
+        // On the JVM there is no native core library, so ensureLoaded() fails; the
+        // core-only wrapper must return the typed load failure, never throw.
         val result = HeadlessBridge.networkChanged()
         assertFalse(result.ok)
         assertEquals("failed", result.state)
@@ -112,6 +112,35 @@ class CoreBridgeTest {
             "Should report native_library_load_failed, got: ${result.rawJson}",
             result.rawJson.contains("native_library_load_failed"),
         )
+    }
+
+    // ── No native core library: lifecycle start/stop ────────────────────
+
+    @Test
+    fun `HeadlessBridge manual start without native lib is accepted as lifecycle_only`() {
+        val result = HeadlessBridge.start(context, LifecycleService.START_REASON_MANUAL)
+        assertTrue("got: ${result.rawJson}", result.accepted)
+        assertEquals(HeadlessBridgeResult.LIFECYCLE_ONLY_STATE, result.state)
+        assertEquals("lifecycle_only", HeadlessBridgeResult.fromJson(result.rawJson).state)
+    }
+
+    @Test
+    fun `HeadlessBridge OS-initiated starts without native lib still fail`() {
+        for (reason in listOf("boot_completed", "package_replaced", "sticky_restart")) {
+            val result = HeadlessBridge.start(context, reason)
+            assertFalse("$reason must not be accepted", result.accepted)
+            assertTrue(
+                "$reason should report native_library_load_failed, got: ${result.rawJson}",
+                result.rawJson.contains("native_library_load_failed"),
+            )
+        }
+    }
+
+    @Test
+    fun `HeadlessBridge stop without native lib is accepted as lifecycle_only`() {
+        val result = HeadlessBridge.stop(context, "android_service_stop")
+        assertTrue("got: ${result.rawJson}", result.accepted)
+        assertEquals(HeadlessBridgeResult.LIFECYCLE_ONLY_STATE, result.state)
     }
 
     // ── AND-03: `ok` is the accept discriminator; `state` is opaque ────

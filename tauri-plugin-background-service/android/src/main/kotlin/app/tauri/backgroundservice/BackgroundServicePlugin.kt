@@ -275,7 +275,7 @@ class BackgroundServicePlugin(private val activity: Activity) : Plugin(activity)
                 putExtra(LifecycleService.EXTRA_LABEL, args.label)
                 putExtra(LifecycleService.EXTRA_SERVICE_TYPE, args.foregroundServiceType)
                 putExtra(LifecycleService.EXTRA_START_ACK_ID, startAckId)
-                putExtra(LifecycleService.EXTRA_START_REASON, "manual_start")
+                putExtra(LifecycleService.EXTRA_START_REASON, LifecycleService.START_REASON_MANUAL)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                 activity.startForegroundService(intent)

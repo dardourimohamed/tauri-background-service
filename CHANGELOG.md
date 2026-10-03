@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Android:** the foreground service now runs without a host native core.
+  When `HeadlessBridge.nativeLibName` cannot be loaded, a start made by the
+  plugin itself (`manual_start`) is accepted as lifecycle-only
+  (`state: "lifecycle_only"`, logged) instead of failing with
+  `native_library_load_failed` and stopping the service, and a stop no longer
+  reports the missing library as an error. Starts Android makes on its own
+  (boot / package-replace recovery, sticky restart) — where the process may
+  hold no Rust runtime — still fail as before, as do call actions,
+  notification actions and the network nudge. A core that loads but reports
+  `ok=false` still fails the start.
+
 ## [1.0.1] - 2026-07-21
 
 Audit remediation release. 44 findings addressed across Rust, Android,

@@ -22,6 +22,10 @@ class LifecycleService : Service() {
         const val EXTRA_SERVICE_TYPE = "foregroundServiceType"
         const val EXTRA_START_ACK_ID = "startAckId"
         const val EXTRA_START_REASON = "startReason"
+        // Start reason the plugin's own `startKeepalive` passes: the Rust
+        // `BackgroundService<R>` is in-process. Any other reason is a start
+        // Android made on its own (boot recovery, sticky restart).
+        const val START_REASON_MANUAL = "manual_start"
         const val ACTION_START = "START"
         const val ACTION_STOP  = "STOP"
         // spec 08 C6 (Step 15): swap the foreground service type of an

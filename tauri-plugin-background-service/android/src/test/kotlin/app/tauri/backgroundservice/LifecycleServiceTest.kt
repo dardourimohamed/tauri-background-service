@@ -22,6 +22,7 @@ import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowNotificationManager
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Unit tests for LifecycleService logic:
@@ -2498,5 +2499,146 @@ class LifecycleServiceTest {
         // Cleanup
         service.onDestroy()
         LifecycleService.isRunning = false
+    }
+
+    // ── No native core library: lifecycle-only starts ──────────────────
+    // The real HeadlessBridgeImpl is injected; under Robolectric the default
+    // `app_core` library is absent, so HeadlessBridge.ensureLoaded() fails.
+
+    /**
+     * Start the service with [intent] and return its start ACK. The waiter must
+     * be parked inside `await` before onStartCommand completes the ACK
+     * (`complete` removes the future, so completing first yields ack_missing).
+     */
+    private fun startAndAwaitAck(
+        service: LifecycleService,
+        intent: Intent,
+        ackId: String,
+    ): ServiceStartAckRegistry.Ack {
+        ServiceStartAckRegistry.register(ackId)
+        val ack = AtomicReference<ServiceStartAckRegistry.Ack>()
+        val waiter = Thread({ ack.set(ServiceStartAckRegistry.await(ackId, 5_000)) }, "lc-ack-wait")
+        waiter.start()
+        val deadline = System.currentTimeMillis() + 3_000
+        while (waiter.state != Thread.State.TIMED_WAITING && System.currentTimeMillis() < deadline) {
+            Thread.sleep(5)
+        }
+        service.onStartCommand(intent, 0, 0)
+        waiter.join(5_000)
+        return checkNotNull(ack.get()) { "start ACK never resolved" }
+    }
+
+    private fun startIntent(reason: String, ackId: String) =
+        Intent(context, LifecycleService::class.java).apply {
+            action = LifecycleService.ACTION_START
+            putExtra(LifecycleService.EXTRA_LABEL, "Test")
+            putExtra(LifecycleService.EXTRA_SERVICE_TYPE, "dataSync")
+            putExtra(LifecycleService.EXTRA_START_ACK_ID, ackId)
+            putExtra(LifecycleService.EXTRA_START_REASON, reason)
+        }
+
+    @Test
+    @Config(sdk = [33])
+    fun manualStart_withoutNativeLibrary_runsLifecycleOnly() {
+        prefs.edit().clear().apply()
+        LifecycleService.bridgeProvider = { HeadlessBridgeImpl() }
+
+        val intent = startIntent(LifecycleService.START_REASON_MANUAL, "ack-lifecycle-only")
+        val service = Robolectric.buildService(LifecycleService::class.java)
+            .withIntent(intent)
+            .create()
+            .get()
+
+        val ack = startAndAwaitAck(service, intent, "ack-lifecycle-only")
+
+        assertTrue("Start ACK must succeed without a native core, got: ${ack.payload}", ack.success)
+        assertTrue("ACK payload must mark lifecycle_only", ack.payload.contains("lifecycle_only"))
+        assertTrue("Service must be running", LifecycleService.isRunning)
+        assertTrue("Service must stay foreground", LifecycleService.isForeground)
+        assertEquals("running", DurableState.load(context).lastNativeState)
+
+        // Cleanup
+        service.onDestroy()
+    }
+
+    @Test
+    @Config(sdk = [33])
+    fun bootStart_withoutNativeLibrary_stillFails() {
+        // A start Android makes on its own may have no Rust runtime in the
+        // process — it must not show a "running" notification with nothing behind it.
+        prefs.edit().clear().apply()
+        LifecycleService.bridgeProvider = { HeadlessBridgeImpl() }
+
+        val intent = startIntent("boot_completed", "ack-boot-no-core")
+        val service = Robolectric.buildService(LifecycleService::class.java)
+            .withIntent(intent)
+            .create()
+            .get()
+
+        val ack = startAndAwaitAck(service, intent, "ack-boot-no-core")
+
+        assertFalse("Boot start without a native core must fail", ack.success)
+        assertTrue(
+            "ACK must report native_library_load_failed, got: ${ack.payload}",
+            ack.payload.contains("native_library_load_failed"),
+        )
+        assertFalse(LifecycleService.isRunning)
+        assertFalse(LifecycleService.isForeground)
+        assertEquals("core_start_failed", DurableState.load(context).lastNativeState)
+    }
+
+    @Test
+    @Config(sdk = [33])
+    fun stickyRestart_withoutNativeLibrary_stillFailsWithRecoveryNotification() {
+        prefs.edit()
+            .putString("bg_service_label", "Syncing")
+            .putString("bg_service_type", "dataSync")
+            .apply()
+        LifecycleService.bridgeProvider = { HeadlessBridgeImpl() }
+
+        val service = Robolectric.buildService(LifecycleService::class.java)
+            .withIntent(Intent(context, LifecycleService::class.java).apply {
+                action = LifecycleService.ACTION_START
+            })
+            .create()
+            .get()
+
+        service.onStartCommand(null, 0, 0)
+
+        val state = DurableState.load(context)
+        assertEquals("core_start_failed", state.recoveryReason)
+        assertTrue(
+            "lastPlatformError must carry native_library_load_failed, got: ${state.lastPlatformError}",
+            state.lastPlatformError?.contains("native_library_load_failed") == true,
+        )
+        assertFalse(LifecycleService.isRunning)
+        assertFalse(LifecycleService.isForeground)
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        assertNotNull(
+            "Should post recovery notification",
+            nm.activeNotifications.find { it.id == BootReceiver.RECOVERY_NOTIFICATION_ID },
+        )
+    }
+
+    @Test
+    @Config(sdk = [33])
+    fun manualStart_coreLoadsButFails_stillFails() {
+        // Only a missing library is absorbed; a core that reports ok=false
+        // must still fail the start.
+        prefs.edit().clear().apply()
+        LifecycleService.bridgeProvider = { FakeCoreBridge(result = "failed") }
+
+        val intent = startIntent(LifecycleService.START_REASON_MANUAL, "ack-core-failed")
+        val service = Robolectric.buildService(LifecycleService::class.java)
+            .withIntent(intent)
+            .create()
+            .get()
+
+        val ack = startAndAwaitAck(service, intent, "ack-core-failed")
+
+        assertFalse("A failing core must fail the start", ack.success)
+        assertFalse(LifecycleService.isRunning)
+        assertFalse(LifecycleService.isForeground)
+        assertEquals("core_start_failed", DurableState.load(context).lastNativeState)
     }
 }

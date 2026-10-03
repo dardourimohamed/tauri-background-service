@@ -56,6 +56,24 @@ data class HeadlessBridgeResult(
             }.toString()
             return HeadlessBridgeResult(false, "failed", message, true, json)
         }
+
+        /**
+         * Accepted result for a lifecycle start/stop when no native core is
+         * bridged (the library failed to load). The foreground service and the
+         * Rust `BackgroundService<R>` task run without a core; `state` keeps the
+         * case distinguishable from a real core report in diagnostics.
+         */
+        fun lifecycleOnly(message: String): HeadlessBridgeResult {
+            val json = JSONObject().apply {
+                put("ok", true)
+                put("state", LIFECYCLE_ONLY_STATE)
+                put("message", message)
+                put("recoverable", true)
+            }.toString()
+            return HeadlessBridgeResult(true, LIFECYCLE_ONLY_STATE, message, true, json)
+        }
+
+        const val LIFECYCLE_ONLY_STATE = "lifecycle_only"
     }
 }
 
@@ -72,9 +90,19 @@ object HeadlessBridge {
      * (`startCore`/`stopCore`/`notifyNetworkChanged`/`callAction`/`notificationAction`).
      *
      * When the library is absent — the default for consumers that don't bridge
-     * to a native core — [ensureLoaded] fails gracefully and every entry point
-     * returns a typed `native_library_load_failed` result; the lifecycle-only
-     * path (foreground service + Rust `BackgroundService<R>` task) is unaffected.
+     * to a native core — [ensureLoaded] fails gracefully and never crashes:
+     * - [start] for the plugin's own in-process start
+     *   ([LifecycleService.START_REASON_MANUAL]) returns an accepted
+     *   `lifecycle_only` result, so the foreground service runs alongside the
+     *   Rust `BackgroundService<R>` task without a core.
+     * - [start] for a start Android makes on its own (boot / package-replace
+     *   recovery, sticky restart) returns `native_library_load_failed`: the
+     *   process may hold no Tauri host or Rust runtime, so nothing would run
+     *   behind the notification, and the normal start-failure handling
+     *   (recovery notification, service stopped) applies instead.
+     * - [stop] returns an accepted `lifecycle_only` result (no core to stop).
+     * - The core-only entry points ([networkChanged], [performCallAction],
+     *   [performNotificationAction]) return `native_library_load_failed`.
      */
     @Volatile var nativeLibName: String = "app_core"
 
@@ -105,7 +133,14 @@ object HeadlessBridge {
     ): String
 
     fun start(context: Context, reason: String): HeadlessBridgeResult {
-        ensureLoaded()?.let { return HeadlessBridgeResult.failure("native_library_load_failed", it) }
+        ensureLoaded()?.let { loadError ->
+            // Only the plugin's in-process start runs lifecycle-only; see [nativeLibName].
+            return if (reason == LifecycleService.START_REASON_MANUAL) {
+                lifecycleOnly("start", reason, loadError)
+            } else {
+                HeadlessBridgeResult.failure("native_library_load_failed", loadError)
+            }
+        }
         val dataDir = dataDir(context)
         if (!ensureDataDir(dataDir)) {
             return HeadlessBridgeResult.failure(
@@ -117,7 +152,7 @@ object HeadlessBridge {
     }
 
     fun stop(context: Context, reason: String): HeadlessBridgeResult {
-        ensureLoaded()?.let { return HeadlessBridgeResult.failure("native_library_load_failed", it) }
+        ensureLoaded()?.let { return lifecycleOnly("stop", reason, it) }
         return HeadlessBridgeResult.fromJson(stopCore(dataDir(context).absolutePath, reason))
     }
 
@@ -298,6 +333,22 @@ object HeadlessBridge {
         activityThread.getMethod("currentApplication").invoke(null) as? Context
     } catch (e: Throwable) {
         null
+    }
+
+    /**
+     * No native core is bridged, so a lifecycle start/stop has nothing to
+     * drive: accept it so the foreground service runs lifecycle-only rather
+     * than failing the start (which would stop the service and fail the Rust
+     * keepalive). Only the load failure is absorbed here — a core that loads
+     * but reports `ok=false` still fails the start. See [nativeLibName] for
+     * which starts qualify.
+     */
+    private fun lifecycleOnly(op: String, reason: String, loadError: String): HeadlessBridgeResult {
+        android.util.Log.i(
+            "HeadlessBridge",
+            "$op(reason=$reason): native core '$nativeLibName' not loaded ($loadError); lifecycle-only",
+        )
+        return HeadlessBridgeResult.lifecycleOnly("Native core '$nativeLibName' not loaded: $loadError")
     }
 
     private fun ensureLoaded(): String? {
